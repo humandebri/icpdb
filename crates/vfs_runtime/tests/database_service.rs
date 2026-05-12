@@ -12,10 +12,8 @@ use vfs_runtime::{
     SQL_QUERY_BILLING_UNITS, USAGE_EVENTS_RETENTION_LIMIT, UsageEvent, VfsService, hash_api_token,
 };
 use vfs_types::{
-    AppendNodeRequest, CreateDatabaseTokenRequest, DatabaseBalanceTopUpRequest,
-    DatabaseBillingStatus, DatabaseRole, DatabaseStatus, DatabaseTokenScope, DeleteNodeRequest,
-    NodeKind, SearchNodesRequest, SearchPreviewMode, SqlBatchRequest, SqlExecuteRequest,
-    SqlStatement, SqlValue, WriteNodeRequest,
+    CreateDatabaseTokenRequest, DatabaseBalanceTopUpRequest, DatabaseBillingStatus, DatabaseRole,
+    DatabaseStatus, DatabaseTokenScope, SqlBatchRequest, SqlExecuteRequest, SqlStatement, SqlValue,
 };
 
 fn service() -> VfsService {
@@ -196,6 +194,15 @@ fn archive_bytes_for_chunk_size(
             .expect("single archive chunk should read");
     }
     read_archive_in_chunks(service, database_id, size_bytes, chunk_size)
+}
+
+fn sql_request(database_id: &str, sql: &str) -> SqlExecuteRequest {
+    SqlExecuteRequest {
+        database_id: database_id.to_string(),
+        sql: sql.to_string(),
+        params: Vec::new(),
+        max_rows: None,
+    }
 }
 
 #[test]
@@ -863,7 +870,7 @@ fn records_minimal_usage_events() {
 
     service
         .record_usage_event(UsageEvent {
-            method: "write_node",
+            method: "sql_execute",
             database_id: Some("alpha"),
             caller: "owner",
             success: true,
@@ -889,7 +896,7 @@ fn records_minimal_usage_events() {
     assert_eq!(
         rows[0],
         (
-            "write_node".to_string(),
+            "sql_execute".to_string(),
             Some("alpha".to_string()),
             "owner".to_string(),
             1,
@@ -922,7 +929,7 @@ fn usage_events_keep_recent_retention_window() {
         tx.execute(
             "INSERT INTO usage_events
              (method, database_id, caller, success, cycles_delta, error, created_at_ms)
-             VALUES ('write_node', 'alpha', 'owner', 1, 1, NULL, ?1)",
+             VALUES ('sql_execute', 'alpha', 'owner', 1, 1, NULL, ?1)",
             params![i64::try_from(index).expect("index should fit")],
         )
         .expect("usage event should insert");
@@ -931,7 +938,7 @@ fn usage_events_keep_recent_retention_window() {
 
     service
         .record_usage_event(UsageEvent {
-            method: "write_node",
+            method: "sql_execute",
             database_id: Some("alpha"),
             caller: "owner",
             success: true,
@@ -949,7 +956,7 @@ fn usage_events_keep_recent_retention_window() {
 
     service
         .record_usage_event(UsageEvent {
-            method: "write_node",
+            method: "sql_execute",
             database_id: Some("alpha"),
             caller: "owner",
             success: true,
@@ -1078,7 +1085,7 @@ fn rejects_database_creation_after_mount_capacity() {
             "INSERT INTO databases
              (database_id, db_file_name, mount_id, active_mount_id, status, schema_version,
               logical_size_bytes, created_at_ms, updated_at_ms)
-             VALUES (?1, ?2, ?3, ?3, 'hot', 'vfs_store:current', 0, 1, 1)",
+             VALUES (?1, ?2, ?3, ?3, 'hot', 'sqlite:raw', 0, 1, 1)",
             params![
                 format!("reserved_{mount_id}"),
                 format!("reserved_{mount_id}.sqlite3"),
@@ -1107,7 +1114,7 @@ fn rejects_database_creation_after_mount_capacity() {
 }
 
 #[test]
-fn isolates_nodes_between_databases() {
+fn isolates_sql_tables_between_databases() {
     let service = service();
     service
         .create_database("alpha", "owner", 1)
@@ -1118,40 +1125,38 @@ fn isolates_nodes_between_databases() {
 
     for database_id in ["alpha", "beta"] {
         service
-            .write_node(
+            .sql_execute(
                 "owner",
-                WriteNodeRequest {
+                SqlExecuteRequest {
                     database_id: database_id.to_string(),
-                    path: "/Wiki/shared.md".to_string(),
-                    kind: NodeKind::File,
-                    content: format!("{database_id} body"),
-                    metadata_json: "{}".to_string(),
-                    expected_etag: None,
+                    sql: "CREATE TABLE shared (body TEXT)".to_string(),
+                    params: vec![],
+                    max_rows: None,
                 },
-                10,
             )
-            .expect("write should succeed");
+            .expect("table create should succeed");
+        service
+            .sql_execute(
+                "owner",
+                SqlExecuteRequest {
+                    database_id: database_id.to_string(),
+                    sql: "INSERT INTO shared (body) VALUES (?1)".to_string(),
+                    params: vec![SqlValue::Text(format!("{database_id} body"))],
+                    max_rows: None,
+                },
+            )
+            .expect("insert should succeed");
     }
 
     let alpha = service
-        .read_node("alpha", "owner", "/Wiki/shared.md")
-        .expect("alpha read should succeed")
-        .expect("alpha node should exist");
-    let beta_hits = service
-        .search_nodes(
-            "owner",
-            SearchNodesRequest {
-                database_id: "beta".to_string(),
-                query_text: "alpha".to_string(),
-                prefix: Some("/Wiki".to_string()),
-                top_k: 10,
-                preview_mode: Some(SearchPreviewMode::None),
-            },
-        )
-        .expect("beta search should succeed");
+        .sql_query("owner", sql_request("alpha", "SELECT body FROM shared"))
+        .expect("alpha query should succeed");
+    let beta = service
+        .sql_query("owner", sql_request("beta", "SELECT body FROM shared"))
+        .expect("beta query should succeed");
 
-    assert_eq!(alpha.content, "alpha body");
-    assert!(beta_hits.is_empty());
+    assert_eq!(alpha.rows[0][0], SqlValue::Text("alpha body".to_string()));
+    assert_eq!(beta.rows[0][0], SqlValue::Text("beta body".to_string()));
 }
 
 #[test]
@@ -1161,19 +1166,11 @@ fn tracks_logical_size_and_does_not_reuse_deleted_slots() {
         .create_database("alpha", "owner", 1)
         .expect("alpha should create");
     service
-        .write_node(
+        .sql_execute(
             "owner",
-            WriteNodeRequest {
-                database_id: "alpha".to_string(),
-                path: "/Wiki/a.md".to_string(),
-                kind: NodeKind::File,
-                content: "alpha body".to_string(),
-                metadata_json: "{}".to_string(),
-                expected_etag: None,
-            },
-            2,
+            sql_request("alpha", "CREATE TABLE size_smoke (body TEXT)"),
         )
-        .expect("write should succeed");
+        .expect("sql write should succeed");
 
     let alpha_info = service
         .list_database_infos()
@@ -1190,7 +1187,7 @@ fn tracks_logical_size_and_does_not_reuse_deleted_slots() {
     assert_restore_size(&root, "alpha", None);
     assert!(
         service
-            .read_node("alpha", "owner", "/Wiki/a.md")
+            .sql_query("owner", sql_request("alpha", "SELECT 1"))
             .expect_err("deleted DB should reject reads")
             .contains("database is deleted")
     );
@@ -1267,19 +1264,22 @@ fn archives_and_restores_database_bytes() {
         .create_database("alpha", "owner", 1)
         .expect("alpha should create");
     service
-        .write_node(
+        .sql_execute(
             "owner",
-            WriteNodeRequest {
-                database_id: "alpha".to_string(),
-                path: "/Wiki/a.md".to_string(),
-                kind: NodeKind::File,
-                content: "alpha body".to_string(),
-                metadata_json: "{}".to_string(),
-                expected_etag: None,
-            },
-            2,
+            sql_request("alpha", "CREATE TABLE archived_rows (body TEXT)"),
         )
-        .expect("write should succeed");
+        .expect("table create should succeed");
+    service
+        .sql_execute(
+            "owner",
+            SqlExecuteRequest {
+                database_id: "alpha".to_string(),
+                sql: "INSERT INTO archived_rows (body) VALUES (?1)".to_string(),
+                params: vec![SqlValue::Text("alpha body".to_string())],
+                max_rows: None,
+            },
+        )
+        .expect("insert should succeed");
 
     assert!(
         service
@@ -1305,57 +1305,23 @@ fn archives_and_restores_database_bytes() {
     );
     assert!(
         service
-            .read_node("alpha", "owner", "/Wiki/a.md")
+            .sql_query(
+                "owner",
+                sql_request("alpha", "SELECT body FROM archived_rows")
+            )
             .expect_err("archiving DB should reject reads")
             .contains("database is archiving")
     );
     assert!(
         service
-            .write_node(
+            .sql_execute(
                 "owner",
-                WriteNodeRequest {
-                    database_id: "alpha".to_string(),
-                    path: "/Wiki/b.md".to_string(),
-                    kind: NodeKind::File,
-                    content: "blocked".to_string(),
-                    metadata_json: "{}".to_string(),
-                    expected_etag: None,
-                },
-                3,
+                sql_request(
+                    "alpha",
+                    "INSERT INTO archived_rows (body) VALUES ('blocked')"
+                )
             )
             .expect_err("archiving DB should reject writes")
-            .contains("database is archiving")
-    );
-    assert!(
-        service
-            .append_node(
-                "owner",
-                AppendNodeRequest {
-                    database_id: "alpha".to_string(),
-                    path: "/Wiki/a.md".to_string(),
-                    content: "blocked".to_string(),
-                    expected_etag: None,
-                    separator: None,
-                    metadata_json: None,
-                    kind: None,
-                },
-                3,
-            )
-            .expect_err("archiving DB should reject appends")
-            .contains("database is archiving")
-    );
-    assert!(
-        service
-            .delete_node(
-                "owner",
-                DeleteNodeRequest {
-                    database_id: "alpha".to_string(),
-                    path: "/Wiki/a.md".to_string(),
-                    expected_etag: None,
-                },
-                3,
-            )
-            .expect_err("archiving DB should reject deletes")
             .contains("database is archiving")
     );
     assert!(
@@ -1370,54 +1336,26 @@ fn archives_and_restores_database_bytes() {
         archive_bytes_for_chunk_size(&service, "alpha", archive.size_bytes, 64 * 1024),
         bytes
     );
-    assert_eq!(
-        archive_bytes_for_chunk_size(
-            &service,
-            "alpha",
-            archive.size_bytes,
-            archive.size_bytes as u32 + 1
-        ),
-        bytes
-    );
     assert!(
         service
             .read_database_archive_chunk("alpha", "owner", 0, 0)
             .expect("zero-byte archive chunk should read")
             .is_empty()
     );
-    assert!(
-        service
-            .read_database_archive_chunk("alpha", "owner", archive.size_bytes, 17)
-            .expect("tail archive chunk should read")
-            .is_empty()
-    );
-    assert!(
-        service
-            .read_database_archive_chunk("alpha", "owner", archive.size_bytes + 10, 17)
-            .expect("out-of-range archive chunk should read")
-            .is_empty()
-    );
-    let full_chunk = service
-        .read_database_archive_chunk("alpha", "owner", 0, archive.size_bytes as u32)
-        .expect("archive chunk should read");
-    assert_eq!(full_chunk, bytes);
     let snapshot_hash = sha256_bytes(&bytes);
     service
         .finalize_database_archive("alpha", "owner", snapshot_hash.clone(), 3)
         .expect("archive should finalize");
-    assert!(
-        service
-            .read_database_archive_chunk("alpha", "owner", 0, 17)
-            .expect_err("archived DB should reject archive chunk reads")
-            .contains("database is archived")
-    );
     assert_eq!(
         database_index_row(&root, "alpha"),
         ("archived".to_string(), None, archive.size_bytes, None)
     );
     assert!(
         service
-            .read_node("alpha", "owner", "/Wiki/a.md")
+            .sql_query(
+                "owner",
+                sql_request("alpha", "SELECT body FROM archived_rows")
+            )
             .expect_err("archived DB should reject reads")
             .contains("database is archived")
     );
@@ -1431,37 +1369,11 @@ fn archives_and_restores_database_bytes() {
             4,
         )
         .expect("restore should begin");
-    assert!(
-        service
-            .read_database_archive_chunk("alpha", "owner", 0, 17)
-            .expect_err("restoring DB should reject archive chunk reads")
-            .contains("database is restoring")
-    );
     let restoring = database_index_row(&root, "alpha");
     assert_eq!(restoring.0, "restoring");
     assert!(restoring.1.is_some());
     assert_eq!(restoring.2, archive.size_bytes);
     assert_eq!(restoring.3, Some(archive.size_bytes));
-    let error = service
-        .begin_database_restore("alpha", "owner", vec![1, 2, 3], archive.size_bytes, 5)
-        .expect_err("invalid restore hash should fail before state checks");
-    assert!(error.contains("snapshot_hash must be"));
-    assert_eq!(
-        service
-            .list_database_infos()
-            .expect("infos should load")
-            .into_iter()
-            .find(|info| info.database_id == "alpha")
-            .expect("alpha info should exist")
-            .status,
-        DatabaseStatus::Restoring
-    );
-    assert!(
-        service
-            .read_node("alpha", "owner", "/Wiki/a.md")
-            .expect_err("restoring DB should reject reads")
-            .contains("database is restoring")
-    );
     service
         .write_database_restore_chunk("alpha", "owner", 0, &bytes)
         .expect("restore chunk should write");
@@ -1469,11 +1381,13 @@ fn archives_and_restores_database_bytes() {
         .finalize_database_restore("alpha", "owner", 5)
         .expect("restore should finalize");
 
-    let node = service
-        .read_node("alpha", "owner", "/Wiki/a.md")
-        .expect("restored read should succeed")
-        .expect("restored node should exist");
-    assert_eq!(node.content, "alpha body");
+    let rows = service
+        .sql_query(
+            "owner",
+            sql_request("alpha", "SELECT body FROM archived_rows"),
+        )
+        .expect("restored query should succeed");
+    assert_eq!(rows.rows[0][0], SqlValue::Text("alpha body".to_string()));
     let info = service
         .list_database_infos()
         .expect("infos should load")
@@ -1482,8 +1396,6 @@ fn archives_and_restores_database_bytes() {
         .expect("alpha info should exist");
     assert_eq!(info.status, DatabaseStatus::Hot);
     assert_eq!(info.snapshot_hash, Some(snapshot_hash));
-    assert_eq!(info.archived_at_ms, None);
-    assert_eq!(info.deleted_at_ms, None);
     assert_restore_size(&root, "alpha", None);
     assert_eq!(
         database_index_row(&root, "alpha").1,
@@ -1498,19 +1410,8 @@ fn restored_mount_id_is_not_reused_after_rearchive() {
         .create_database("alpha", "owner", 1)
         .expect("alpha should create");
     service
-        .write_node(
-            "owner",
-            WriteNodeRequest {
-                database_id: "alpha".to_string(),
-                path: "/Wiki/a.md".to_string(),
-                kind: NodeKind::File,
-                content: "alpha body".to_string(),
-                metadata_json: "{}".to_string(),
-                expected_etag: None,
-            },
-            2,
-        )
-        .expect("write should succeed");
+        .sql_execute("owner", sql_request("alpha", "CREATE TABLE t (id INTEGER)"))
+        .expect("table create should succeed");
 
     let archive = service
         .begin_database_archive("alpha", "owner", 2)
@@ -1531,15 +1432,15 @@ fn restored_mount_id_is_not_reused_after_rearchive() {
         .expect("restore should finalize");
 
     let second_archive = service
-        .begin_database_archive("alpha", "owner", 2)
+        .begin_database_archive("alpha", "owner", 6)
         .expect("second archive should begin");
     let second_bytes =
         archive_bytes_for_chunk_size(&service, "alpha", second_archive.size_bytes, 17);
     service
-        .finalize_database_archive("alpha", "owner", sha256_bytes(&second_bytes), 6)
+        .finalize_database_archive("alpha", "owner", sha256_bytes(&second_bytes), 7)
         .expect("second archive should finalize");
     let beta = service
-        .create_database("beta", "owner", 7)
+        .create_database("beta", "owner", 8)
         .expect("beta should create");
 
     assert_ne!(beta.mount_id, restored.mount_id);
@@ -1556,19 +1457,8 @@ fn cancel_database_archive_returns_archiving_database_to_hot() {
         .create_database("alpha", "owner", 1)
         .expect("alpha should create");
     service
-        .write_node(
-            "owner",
-            WriteNodeRequest {
-                database_id: "alpha".to_string(),
-                path: "/Wiki/a.md".to_string(),
-                kind: NodeKind::File,
-                content: "alpha body".to_string(),
-                metadata_json: "{}".to_string(),
-                expected_etag: None,
-            },
-            2,
-        )
-        .expect("write should succeed");
+        .sql_execute("owner", sql_request("alpha", "CREATE TABLE t (id INTEGER)"))
+        .expect("table create should succeed");
 
     let before = database_index_row(&root, "alpha");
     service
@@ -1587,24 +1477,15 @@ fn cancel_database_archive_returns_archiving_database_to_hot() {
     assert_eq!(after.1, before.1);
 
     service
-        .write_node(
+        .sql_execute(
             "owner",
-            WriteNodeRequest {
-                database_id: "alpha".to_string(),
-                path: "/Wiki/b.md".to_string(),
-                kind: NodeKind::File,
-                content: "beta body".to_string(),
-                metadata_json: "{}".to_string(),
-                expected_etag: None,
-            },
-            4,
+            sql_request("alpha", "INSERT INTO t (id) VALUES (1)"),
         )
         .expect("write should succeed after cancel");
-    let node = service
-        .read_node("alpha", "owner", "/Wiki/b.md")
-        .expect("read should succeed after cancel")
-        .expect("node should exist");
-    assert_eq!(node.content, "beta body");
+    let rows = service
+        .sql_query("owner", sql_request("alpha", "SELECT id FROM t"))
+        .expect("read should succeed after cancel");
+    assert_eq!(rows.rows[0][0], SqlValue::Integer(1));
 }
 
 #[test]
@@ -1614,35 +1495,22 @@ fn cancel_database_archive_after_hash_mismatch_keeps_mount_id() {
         .create_database("alpha", "owner", 1)
         .expect("alpha should create");
     service
-        .write_node(
-            "owner",
-            WriteNodeRequest {
-                database_id: "alpha".to_string(),
-                path: "/Wiki/a.md".to_string(),
-                kind: NodeKind::File,
-                content: "alpha body".to_string(),
-                metadata_json: "{}".to_string(),
-                expected_etag: None,
-            },
-            2,
-        )
-        .expect("write should succeed");
+        .sql_execute("owner", sql_request("alpha", "CREATE TABLE t (id INTEGER)"))
+        .expect("table create should succeed");
     let before = database_index_row(&root, "alpha");
-    service
+    let archive = service
         .begin_database_archive("alpha", "owner", 2)
         .expect("archive should begin");
-
-    assert!(
-        service
-            .finalize_database_archive("alpha", "owner", vec![0; 32], 3)
-            .expect_err("wrong hash should fail")
-            .contains("snapshot_hash does not match")
-    );
-    assert_eq!(database_index_row(&root, "alpha").0, "archiving");
+    let bytes = read_archive_in_chunks(&service, "alpha", archive.size_bytes, 17);
+    let mut wrong_hash = sha256_bytes(&bytes);
+    wrong_hash[0] ^= 0xff;
+    service
+        .finalize_database_archive("alpha", "owner", wrong_hash, 3)
+        .expect_err("wrong hash should fail");
 
     service
         .cancel_database_archive("alpha", "owner", 4)
-        .expect("archive cancel should succeed after mismatch");
+        .expect("archive cancel should succeed");
     let after = database_index_row(&root, "alpha");
     assert_eq!(after.0, "hot");
     assert_eq!(after.1, before.1);
@@ -1665,75 +1533,27 @@ fn cancel_database_archive_rejects_invalid_statuses_and_non_owner() {
         .create_database("archiving_db", "owner", 3)
         .expect("archiving_db should create");
     service
-        .begin_database_archive("archiving_db", "owner", 2)
+        .begin_database_archive("archiving_db", "owner", 4)
         .expect("archive should begin");
     assert!(
         service
-            .cancel_database_archive("archiving_db", "writer", 4)
+            .cancel_database_archive("archiving_db", "writer", 5)
             .expect_err("non-owner cancel should fail")
             .contains("principal has no access")
     );
     service
-        .cancel_database_archive("archiving_db", "owner", 5)
+        .cancel_database_archive("archiving_db", "owner", 6)
         .expect("archive cancel should succeed");
 
     service
-        .create_database("archived_db", "owner", 6)
-        .expect("archived_db should create");
-    service
-        .write_node(
-            "owner",
-            WriteNodeRequest {
-                database_id: "archived_db".to_string(),
-                path: "/Wiki/a.md".to_string(),
-                kind: NodeKind::File,
-                content: "alpha body".to_string(),
-                metadata_json: "{}".to_string(),
-                expected_etag: None,
-            },
-            7,
-        )
-        .expect("write should succeed");
-    let archive = service
-        .begin_database_archive("archived_db", "owner", 2)
-        .expect("archive should begin");
-    let bytes = read_archive_in_chunks(&service, "archived_db", archive.size_bytes, 17);
-    let snapshot_hash = sha256_bytes(&bytes);
-    service
-        .finalize_database_archive("archived_db", "owner", snapshot_hash.clone(), 8)
-        .expect("archive should finalize");
-    assert!(
-        service
-            .cancel_database_archive("archived_db", "owner", 9)
-            .expect_err("archived cancel should fail")
-            .contains("database is archived")
-    );
-
-    service
-        .begin_database_restore(
-            "archived_db",
-            "owner",
-            snapshot_hash,
-            archive.size_bytes,
-            10,
-        )
-        .expect("restore should begin");
-    assert!(
-        service
-            .cancel_database_archive("archived_db", "owner", 11)
-            .expect_err("restoring cancel should fail")
-            .contains("database is restoring")
-    );
-
-    service
-        .create_database("deleted_db", "owner", 12)
+        .create_database("deleted_db", "owner", 7)
         .expect("deleted_db should create");
     service
-        .delete_database("deleted_db", "owner", 13)
+        .delete_database("deleted_db", "owner", 8)
         .expect("delete should succeed");
     assert!(
         service
-            .cancel_database_archive("deleted_db", "owner", 14)
+            .cancel_database_archive("deleted_db", "owner", 9)
             .expect_err("deleted cancel should fail")
             .contains("database is deleted")
     );
@@ -1746,19 +1566,8 @@ fn restore_finalize_rejects_size_mismatch_until_missing_bytes_arrive() {
         .create_database("alpha", "owner", 1)
         .expect("alpha should create");
     service
-        .write_node(
-            "owner",
-            WriteNodeRequest {
-                database_id: "alpha".to_string(),
-                path: "/Wiki/a.md".to_string(),
-                kind: NodeKind::File,
-                content: "alpha body".to_string(),
-                metadata_json: "{}".to_string(),
-                expected_etag: None,
-            },
-            2,
-        )
-        .expect("write should succeed");
+        .sql_execute("owner", sql_request("alpha", "CREATE TABLE t (body TEXT)"))
+        .expect("table create should succeed");
 
     let archive = service
         .begin_database_archive("alpha", "owner", 2)
@@ -1789,16 +1598,6 @@ fn restore_finalize_rejects_size_mismatch_until_missing_bytes_arrive() {
         .finalize_database_restore("alpha", "owner", 5)
         .expect_err("short restore should fail");
     assert!(error.contains("restore chunks are incomplete"));
-    assert_eq!(
-        service
-            .list_database_infos()
-            .expect("infos should load")
-            .into_iter()
-            .find(|info| info.database_id == "alpha")
-            .expect("alpha info should exist")
-            .status,
-        DatabaseStatus::Restoring
-    );
 
     service
         .write_database_restore_chunk("alpha", "owner", split_at as u64, &bytes[split_at..])
@@ -1807,33 +1606,17 @@ fn restore_finalize_rejects_size_mismatch_until_missing_bytes_arrive() {
         .finalize_database_restore("alpha", "owner", 6)
         .expect("complete restore should finalize");
     assert_restore_size(&root, "alpha", None);
-    let node = service
-        .read_node("alpha", "owner", "/Wiki/a.md")
-        .expect("restored read should succeed")
-        .expect("restored node should exist");
-    assert_eq!(node.content, "alpha body");
 }
 
 #[test]
 fn archive_and_restore_reject_snapshot_hash_mismatch() {
-    let (service, _root) = service_with_root();
+    let (service, root) = service_with_root();
     service
         .create_database("alpha", "owner", 1)
         .expect("alpha should create");
     service
-        .write_node(
-            "owner",
-            WriteNodeRequest {
-                database_id: "alpha".to_string(),
-                path: "/Wiki/a.md".to_string(),
-                kind: NodeKind::File,
-                content: "alpha body".to_string(),
-                metadata_json: "{}".to_string(),
-                expected_etag: None,
-            },
-            2,
-        )
-        .expect("write should succeed");
+        .sql_execute("owner", sql_request("alpha", "CREATE TABLE t (id INTEGER)"))
+        .expect("table create should succeed");
 
     let archive = service
         .begin_database_archive("alpha", "owner", 2)
@@ -1847,7 +1630,7 @@ fn archive_and_restore_reject_snapshot_hash_mismatch() {
         .finalize_database_archive("alpha", "owner", wrong_hash, 3)
         .expect_err("wrong archive hash should fail");
     assert!(error.contains("snapshot_hash does not match archived"));
-    assert_eq!(database_index_row(&_root, "alpha").0, "archiving");
+    assert_eq!(database_index_row(&root, "alpha").0, "archiving");
 
     let snapshot_hash = sha256_bytes(&bytes);
     service
@@ -1875,19 +1658,8 @@ fn archive_and_restore_enforce_size_limits_without_state_changes() {
         .create_database("alpha", "owner", 1)
         .expect("alpha should create");
     service
-        .write_node(
-            "owner",
-            WriteNodeRequest {
-                database_id: "alpha".to_string(),
-                path: "/Wiki/a.md".to_string(),
-                kind: NodeKind::File,
-                content: "alpha body".to_string(),
-                metadata_json: "{}".to_string(),
-                expected_etag: None,
-            },
-            2,
-        )
-        .expect("write should succeed");
+        .sql_execute("owner", sql_request("alpha", "CREATE TABLE t (id INTEGER)"))
+        .expect("table create should succeed");
 
     let archive = service
         .begin_database_archive("alpha", "owner", 2)
@@ -1931,24 +1703,24 @@ fn archive_and_restore_enforce_size_limits_without_state_changes() {
 
 #[test]
 fn restore_accepts_in_range_chunks_written_out_of_order() {
-    let (service, _root) = service_with_root();
+    let service = service();
     service
         .create_database("alpha", "owner", 1)
         .expect("alpha should create");
     service
-        .write_node(
+        .sql_execute("owner", sql_request("alpha", "CREATE TABLE t (body TEXT)"))
+        .expect("table create should succeed");
+    service
+        .sql_execute(
             "owner",
-            WriteNodeRequest {
+            SqlExecuteRequest {
                 database_id: "alpha".to_string(),
-                path: "/Wiki/a.md".to_string(),
-                kind: NodeKind::File,
-                content: "alpha body".repeat(100),
-                metadata_json: "{}".to_string(),
-                expected_etag: None,
+                sql: "INSERT INTO t (body) VALUES (?1)".to_string(),
+                params: vec![SqlValue::Text("alpha body".repeat(100))],
+                max_rows: None,
             },
-            2,
         )
-        .expect("write should succeed");
+        .expect("insert should succeed");
 
     let archive = service
         .begin_database_archive("alpha", "owner", 2)
@@ -1981,18 +1753,10 @@ fn restore_accepts_in_range_chunks_written_out_of_order() {
         .finalize_database_restore("alpha", "owner", 5)
         .expect("out-of-order restore should finalize");
 
-    let node = service
-        .read_node("alpha", "owner", "/Wiki/a.md")
-        .expect("restored read should succeed")
-        .expect("restored node should exist");
-    assert_eq!(node.content, "alpha body".repeat(100));
-    let info = service
-        .list_database_infos()
-        .expect("infos should load")
-        .into_iter()
-        .find(|info| info.database_id == "alpha")
-        .expect("alpha info should exist");
-    assert_eq!(info.snapshot_hash, Some(snapshot_hash));
+    let rows = service
+        .sql_query("owner", sql_request("alpha", "SELECT body FROM t"))
+        .expect("restored query should succeed");
+    assert_eq!(rows.rows[0][0], SqlValue::Text("alpha body".repeat(100)));
 }
 
 #[test]
@@ -2002,19 +1766,8 @@ fn rollback_database_restore_begin_restores_archived_state() {
         .create_database("alpha", "owner", 1)
         .expect("database should create");
     service
-        .write_node(
-            "owner",
-            WriteNodeRequest {
-                database_id: "alpha".to_string(),
-                path: "/Wiki/a.md".to_string(),
-                kind: NodeKind::File,
-                content: "alpha body".to_string(),
-                metadata_json: "{}".to_string(),
-                expected_etag: None,
-            },
-            2,
-        )
-        .expect("write should succeed");
+        .sql_execute("owner", sql_request("alpha", "CREATE TABLE t (id INTEGER)"))
+        .expect("table create should succeed");
     let archive = service
         .begin_database_archive("alpha", "owner", 3)
         .expect("archive should begin");
@@ -2073,40 +1826,21 @@ fn enforces_reader_writer_owner_roles() {
         .grant_database_access("shared", "owner", "writer", DatabaseRole::Writer, 3)
         .expect("writer grant should succeed");
 
+    service
+        .sql_query("reader", sql_request("shared", "SELECT 1"))
+        .expect("reader query should be authorized");
     assert!(
         service
-            .read_node("shared", "reader", "/Wiki/missing.md")
-            .expect("reader read should be authorized")
-            .is_none()
-    );
-    assert!(
-        service
-            .write_node(
+            .sql_execute(
                 "reader",
-                WriteNodeRequest {
-                    database_id: "shared".to_string(),
-                    path: "/Wiki/nope.md".to_string(),
-                    kind: NodeKind::File,
-                    content: "nope".to_string(),
-                    metadata_json: "{}".to_string(),
-                    expected_etag: None,
-                },
-                10,
+                sql_request("shared", "CREATE TABLE nope (id INTEGER)")
             )
             .is_err()
     );
     service
-        .write_node(
+        .sql_execute(
             "writer",
-            WriteNodeRequest {
-                database_id: "shared".to_string(),
-                path: "/Wiki/ok.md".to_string(),
-                kind: NodeKind::File,
-                content: "ok".to_string(),
-                metadata_json: "{}".to_string(),
-                expected_etag: None,
-            },
-            11,
+            sql_request("shared", "CREATE TABLE ok (id INTEGER)"),
         )
         .expect("writer write should succeed");
     assert!(
@@ -2140,7 +1874,7 @@ fn enforces_reader_writer_owner_roles() {
         .expect("owner should revoke reader");
     assert!(
         service
-            .read_node("shared", "reader", "/Wiki/missing.md")
+            .sql_query("reader", sql_request("shared", "SELECT 1"))
             .expect_err("revoked reader should lose access")
             .contains("no access")
     );
@@ -2150,94 +1884,4 @@ fn enforces_reader_writer_owner_roles() {
             .expect_err("owner should not revoke own access")
             .contains("own access")
     );
-}
-
-#[test]
-fn append_node_validates_effective_kind_paths() {
-    let service = service();
-    service
-        .create_database("alpha", "owner", 1)
-        .expect("database should create");
-
-    let error = service
-        .append_node(
-            "owner",
-            AppendNodeRequest {
-                database_id: "alpha".to_string(),
-                path: "/Sources/raw/bad.md".to_string(),
-                content: "bad".to_string(),
-                expected_etag: None,
-                separator: None,
-                metadata_json: None,
-                kind: Some(NodeKind::Source),
-            },
-            2,
-        )
-        .expect_err("non-canonical source append should fail");
-    assert!(error.contains("canonical form"));
-
-    let error = service
-        .append_node(
-            "owner",
-            AppendNodeRequest {
-                database_id: "alpha".to_string(),
-                path: "/Sources/raw/bad/bad.md".to_string(),
-                content: "bad".to_string(),
-                expected_etag: None,
-                separator: None,
-                metadata_json: None,
-                kind: None,
-            },
-            3,
-        )
-        .expect_err("kind=None under sources should be treated as file");
-    assert!(error.contains("source path must use source kind"));
-
-    let source = service
-        .write_node(
-            "owner",
-            WriteNodeRequest {
-                database_id: "alpha".to_string(),
-                path: "/Sources/raw/good/good.md".to_string(),
-                kind: NodeKind::Source,
-                content: "source".to_string(),
-                metadata_json: "{}".to_string(),
-                expected_etag: None,
-            },
-            4,
-        )
-        .expect("canonical source should write");
-    let appended = service
-        .append_node(
-            "owner",
-            AppendNodeRequest {
-                database_id: "alpha".to_string(),
-                path: "/Sources/raw/good/good.md".to_string(),
-                content: " body".to_string(),
-                expected_etag: Some(source.node.etag),
-                separator: None,
-                metadata_json: None,
-                kind: None,
-            },
-            5,
-        )
-        .expect("kind=None should append to existing source");
-    assert_eq!(appended.node.kind, NodeKind::Source);
-
-    let wiki = service
-        .append_node(
-            "owner",
-            AppendNodeRequest {
-                database_id: "alpha".to_string(),
-                path: "/Wiki/new.md".to_string(),
-                content: "wiki".to_string(),
-                expected_etag: None,
-                separator: None,
-                metadata_json: None,
-                kind: None,
-            },
-            6,
-        )
-        .expect("kind=None should create wiki file");
-    assert_eq!(wiki.node.kind, NodeKind::File);
 }

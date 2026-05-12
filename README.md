@@ -10,16 +10,14 @@ The current product surface is intentionally small:
 - payment history, usage, dump, restore, and token management APIs
 - Next.js console at `/icpdb`
 
-Phase 1 cleanup keeps the existing backend API names where they are still needed by the runtime, but removes the old CLI, wiki browser, admin UI, extension, benchmark, and ingest tooling from the repository surface.
+Phase 2 cleanup removes the old node/search/graph API and keeps the repository focused on the ICPDB SQL hosting surface.
 
 ## Repository
 
 ```text
 crates/vfs_canister   Rust canister entrypoints and Candid API
 crates/vfs_runtime    SQLite runtime, billing, quota, payments
-crates/vfs_types      Shared SQL and filesystem-compatible types
-crates/vfs_store      SQLite-backed store used by runtime internals
-crates/wiki_domain    Domain types still used by the runtime
+crates/vfs_types      Shared SQL, lifecycle, billing, and deposit types
 wikibrowser           ICPDB web console
 scripts               Canister build helpers
 ```
@@ -56,7 +54,7 @@ pnpm dev
 Required browser env:
 
 ```bash
-NEXT_PUBLIC_WIKI_IC_HOST=http://127.0.0.1:8001
+NEXT_PUBLIC_ICPDB_IC_HOST=http://127.0.0.1:8001
 NEXT_PUBLIC_II_PROVIDER_URL=http://id.ai.localhost:8001
 NEXT_PUBLIC_ICPDB_CANISTER_ID=<local-icpdb-canister-id>
 ```

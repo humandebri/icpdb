@@ -19,7 +19,7 @@ http://localhost:3000/icpdb
 Required env:
 
 ```bash
-NEXT_PUBLIC_WIKI_IC_HOST=http://127.0.0.1:8001
+NEXT_PUBLIC_ICPDB_IC_HOST=http://127.0.0.1:8001
 NEXT_PUBLIC_II_PROVIDER_URL=http://id.ai.localhost:8001
 NEXT_PUBLIC_ICPDB_CANISTER_ID=<local-icpdb-canister-id>
 ```
@@ -64,7 +64,7 @@ pnpm deploy
 Set build variables for browser-side values:
 
 ```bash
-NEXT_PUBLIC_WIKI_IC_HOST=https://icp-api.io
+NEXT_PUBLIC_ICPDB_IC_HOST=https://icp-api.io
 NEXT_PUBLIC_II_PROVIDER_URL=https://identity.ic0.app
 NEXT_PUBLIC_ICPDB_CANISTER_ID=<mainnet-icpdb-canister-id>
 NEXT_PUBLIC_ICPDB_WALLET_SIGNER_URL=https://oisy.com/sign

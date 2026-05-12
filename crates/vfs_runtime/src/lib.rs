@@ -1,6 +1,6 @@
 // Where: crates/vfs_runtime/src/lib.rs
-// What: Service orchestration for multiple SQLite-backed VFS databases.
-// Why: One canister can host isolated databases while sharing one VFS store implementation.
+// What: Service orchestration for multiple hosted SQLite databases.
+// Why: One canister can host isolated SQL databases with shared lifecycle, quota, and billing.
 mod sql;
 
 use std::fs::{File, OpenOptions, create_dir_all, metadata, remove_file};
@@ -9,23 +9,12 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
-use vfs_store::FsStore;
 use vfs_types::{
-    AppendNodeRequest, ChildNode, DatabaseArchiveInfo, DatabaseBalanceTopUpRequest,
-    DatabaseBilling, DatabaseBillingStatus, DatabaseInfo, DatabaseMember, DatabaseQuotaRequest,
-    DatabaseRole, DatabaseStatus, DatabaseSummary, DatabaseTokenInfo, DatabaseTokenScope,
-    DatabaseUsage, DeleteNodeRequest, DeleteNodeResult, DepositQuote, DepositResult,
-    EditNodeRequest, EditNodeResult, ExportSnapshotRequest, ExportSnapshotResponse,
-    FetchUpdatesRequest, FetchUpdatesResponse, GlobNodeHit, GlobNodesRequest, GraphLinksRequest,
-    GraphNeighborhoodRequest, IncomingLinksRequest, LinkEdge, ListChildrenRequest,
-    ListNodesRequest, MkdirNodeRequest, MkdirNodeResult, MoveNodeRequest, MoveNodeResult,
-    MultiEditNodeRequest, MultiEditNodeResult, Node, NodeContext, NodeContextRequest, NodeEntry,
-    NodeKind, OutgoingLinksRequest, PaymentRecord, QueryContext, QueryContextRequest,
-    RecentNodeHit, RecentNodesRequest, SearchNodeHit, SearchNodePathsRequest, SearchNodesRequest,
-    SourceEvidence, SourceEvidenceRequest, SqlBatchRequest, SqlExecuteRequest, SqlExecuteResponse,
-    Status, WriteNodeRequest, WriteNodeResult,
+    DatabaseArchiveInfo, DatabaseBalanceTopUpRequest, DatabaseBilling, DatabaseBillingStatus,
+    DatabaseInfo, DatabaseMember, DatabaseQuotaRequest, DatabaseRole, DatabaseStatus,
+    DatabaseSummary, DatabaseTokenInfo, DatabaseTokenScope, DatabaseUsage, DepositQuote,
+    DepositResult, PaymentRecord, SqlBatchRequest, SqlExecuteRequest, SqlExecuteResponse,
 };
-use wiki_domain::validate_source_path_for_kind;
 
 const INDEX_SCHEMA_VERSION_INITIAL: &str = "database_index:000_initial";
 const INDEX_SCHEMA_VERSION_LIFECYCLE: &str = "database_index:001_lifecycle";
@@ -38,7 +27,7 @@ const INDEX_SCHEMA_VERSION_BILLING: &str = "database_index:007_billing";
 const INDEX_SCHEMA_VERSION_TOKENS: &str = "database_index:008_tokens";
 const INDEX_SCHEMA_VERSION_PAYMENTS: &str = "database_index:009_payments";
 const INDEX_SCHEMA_VERSION_BILLING_CONFIG: &str = "database_index:010_billing_config";
-const DATABASE_SCHEMA_VERSION: &str = "vfs_store:current";
+const DATABASE_SCHEMA_VERSION: &str = "sqlite:raw";
 const MIN_DATABASE_MOUNT_ID: u16 = 11;
 const MAX_DATABASE_MOUNT_ID: u16 = 32767;
 pub const MAX_ARCHIVE_CHUNK_BYTES: u32 = 1024 * 1024;
@@ -705,11 +694,12 @@ impl VfsService {
         if let Some(parent) = Path::new(&meta.db_file_name).parent() {
             create_dir_all(parent).map_err(|error| error.to_string())?;
         }
-        let result = FsStore::new(PathBuf::from(&meta.db_file_name)).run_fs_migrations();
+        let result = Connection::open(&meta.db_file_name)
+            .and_then(|conn| conn.execute_batch("PRAGMA application_id = 0x49435044;"));
         if result.is_ok() {
             self.refresh_logical_size(database_id)?;
         }
-        result
+        result.map_err(|error| error.to_string())
     }
 
     pub fn delete_database(&self, database_id: &str, caller: &str, now: i64) -> Result<(), String> {
@@ -1041,7 +1031,9 @@ impl VfsService {
         if actual_hash != expected_hash {
             return Err("snapshot_hash does not match restored database bytes".to_string());
         }
-        FsStore::new(PathBuf::from(&meta.db_file_name)).run_fs_migrations()?;
+        Connection::open(&meta.db_file_name)
+            .and_then(|conn| conn.execute_batch("PRAGMA application_id = 0x49435044;"))
+            .map_err(|error| error.to_string())?;
         let mut conn = self.open_index()?;
         let tx = conn.transaction().map_err(|error| error.to_string())?;
         tx.execute(
@@ -1137,316 +1129,6 @@ impl VfsService {
         .map_err(|error| error.to_string())?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| error.to_string())
-    }
-
-    pub fn status(&self, database_id: &str, caller: &str) -> Result<Status, String> {
-        self.with_database_store(database_id, caller, RequiredRole::Reader, |store| {
-            store.status()
-        })
-    }
-
-    pub fn read_node(
-        &self,
-        database_id: &str,
-        caller: &str,
-        path: &str,
-    ) -> Result<Option<Node>, String> {
-        self.with_database_store(database_id, caller, RequiredRole::Reader, |store| {
-            store.read_node(path)
-        })
-    }
-
-    pub fn list_nodes(
-        &self,
-        caller: &str,
-        request: ListNodesRequest,
-    ) -> Result<Vec<NodeEntry>, String> {
-        let database_id = request.database_id.clone();
-        self.with_database_store(&database_id, caller, RequiredRole::Reader, |store| {
-            store.list_nodes(request)
-        })
-    }
-
-    pub fn list_children(
-        &self,
-        caller: &str,
-        request: ListChildrenRequest,
-    ) -> Result<Vec<ChildNode>, String> {
-        let database_id = request.database_id.clone();
-        self.with_database_store(&database_id, caller, RequiredRole::Reader, |store| {
-            store.list_children(request)
-        })
-    }
-
-    pub fn write_node(
-        &self,
-        caller: &str,
-        request: WriteNodeRequest,
-        now: i64,
-    ) -> Result<WriteNodeResult, String> {
-        validate_source_path_for_kind(&request.path, &request.kind)?;
-        let database_id = request.database_id.clone();
-        let result =
-            self.with_database_store(&database_id, caller, RequiredRole::Writer, |store| {
-                store.write_node(request, now)
-            });
-        if result.is_ok() {
-            self.refresh_logical_size(&database_id)?;
-        }
-        result
-    }
-
-    pub fn delete_node(
-        &self,
-        caller: &str,
-        request: DeleteNodeRequest,
-        now: i64,
-    ) -> Result<DeleteNodeResult, String> {
-        let database_id = request.database_id.clone();
-        let result =
-            self.with_database_store(&database_id, caller, RequiredRole::Writer, |store| {
-                store.delete_node(request, now)
-            });
-        if result.is_ok() {
-            self.refresh_logical_size(&database_id)?;
-        }
-        result
-    }
-
-    pub fn append_node(
-        &self,
-        caller: &str,
-        request: AppendNodeRequest,
-        now: i64,
-    ) -> Result<WriteNodeResult, String> {
-        let database_id = request.database_id.clone();
-        let result =
-            self.with_database_store(&database_id, caller, RequiredRole::Writer, |store| {
-                let kind = store
-                    .read_node(&request.path)?
-                    .map(|node| node.kind)
-                    .or_else(|| request.kind.clone())
-                    .unwrap_or(NodeKind::File);
-                validate_source_path_for_kind(&request.path, &kind)?;
-                store.append_node(request, now)
-            });
-        if result.is_ok() {
-            self.refresh_logical_size(&database_id)?;
-        }
-        result
-    }
-
-    pub fn edit_node(
-        &self,
-        caller: &str,
-        request: EditNodeRequest,
-        now: i64,
-    ) -> Result<EditNodeResult, String> {
-        let database_id = request.database_id.clone();
-        let result =
-            self.with_database_store(&database_id, caller, RequiredRole::Writer, |store| {
-                store.edit_node(request, now)
-            });
-        if result.is_ok() {
-            self.refresh_logical_size(&database_id)?;
-        }
-        result
-    }
-
-    pub fn mkdir_node(
-        &self,
-        caller: &str,
-        request: MkdirNodeRequest,
-    ) -> Result<MkdirNodeResult, String> {
-        let database_id = request.database_id.clone();
-        let result =
-            self.with_database_store(&database_id, caller, RequiredRole::Writer, |store| {
-                store.mkdir_node(request)
-            });
-        if result.is_ok() {
-            self.refresh_logical_size(&database_id)?;
-        }
-        result
-    }
-
-    pub fn move_node(
-        &self,
-        caller: &str,
-        request: MoveNodeRequest,
-        now: i64,
-    ) -> Result<MoveNodeResult, String> {
-        let database_id = request.database_id.clone();
-        let result =
-            self.with_database_store(&database_id, caller, RequiredRole::Writer, |store| {
-                if let Some(node) = store.read_node(&request.from_path)? {
-                    validate_source_path_for_kind(&request.to_path, &node.kind)?;
-                }
-                store.move_node(request, now)
-            });
-        if result.is_ok() {
-            self.refresh_logical_size(&database_id)?;
-        }
-        result
-    }
-
-    pub fn glob_nodes(
-        &self,
-        caller: &str,
-        request: GlobNodesRequest,
-    ) -> Result<Vec<GlobNodeHit>, String> {
-        let database_id = request.database_id.clone();
-        self.with_database_store(&database_id, caller, RequiredRole::Reader, |store| {
-            store.glob_nodes(request)
-        })
-    }
-
-    pub fn recent_nodes(
-        &self,
-        caller: &str,
-        request: RecentNodesRequest,
-    ) -> Result<Vec<RecentNodeHit>, String> {
-        let database_id = request.database_id.clone();
-        self.with_database_store(&database_id, caller, RequiredRole::Reader, |store| {
-            store.recent_nodes(request)
-        })
-    }
-
-    pub fn incoming_links(
-        &self,
-        caller: &str,
-        request: IncomingLinksRequest,
-    ) -> Result<Vec<LinkEdge>, String> {
-        let database_id = request.database_id.clone();
-        self.with_database_store(&database_id, caller, RequiredRole::Reader, |store| {
-            store.incoming_links(request)
-        })
-    }
-
-    pub fn outgoing_links(
-        &self,
-        caller: &str,
-        request: OutgoingLinksRequest,
-    ) -> Result<Vec<LinkEdge>, String> {
-        let database_id = request.database_id.clone();
-        self.with_database_store(&database_id, caller, RequiredRole::Reader, |store| {
-            store.outgoing_links(request)
-        })
-    }
-
-    pub fn graph_links(
-        &self,
-        caller: &str,
-        request: GraphLinksRequest,
-    ) -> Result<Vec<LinkEdge>, String> {
-        let database_id = request.database_id.clone();
-        self.with_database_store(&database_id, caller, RequiredRole::Reader, |store| {
-            store.graph_links(request)
-        })
-    }
-
-    pub fn graph_neighborhood(
-        &self,
-        caller: &str,
-        request: GraphNeighborhoodRequest,
-    ) -> Result<Vec<LinkEdge>, String> {
-        let database_id = request.database_id.clone();
-        self.with_database_store(&database_id, caller, RequiredRole::Reader, |store| {
-            store.graph_neighborhood(request)
-        })
-    }
-
-    pub fn read_node_context(
-        &self,
-        caller: &str,
-        request: NodeContextRequest,
-    ) -> Result<Option<NodeContext>, String> {
-        let database_id = request.database_id.clone();
-        self.with_database_store(&database_id, caller, RequiredRole::Reader, |store| {
-            store.read_node_context(request)
-        })
-    }
-
-    pub fn query_context(
-        &self,
-        caller: &str,
-        request: QueryContextRequest,
-    ) -> Result<QueryContext, String> {
-        let database_id = request.database_id.clone();
-        self.with_database_store(&database_id, caller, RequiredRole::Reader, |store| {
-            store.query_context(request)
-        })
-    }
-
-    pub fn source_evidence(
-        &self,
-        caller: &str,
-        request: SourceEvidenceRequest,
-    ) -> Result<SourceEvidence, String> {
-        let database_id = request.database_id.clone();
-        self.with_database_store(&database_id, caller, RequiredRole::Reader, |store| {
-            store.source_evidence(request)
-        })
-    }
-
-    pub fn multi_edit_node(
-        &self,
-        caller: &str,
-        request: MultiEditNodeRequest,
-        now: i64,
-    ) -> Result<MultiEditNodeResult, String> {
-        let database_id = request.database_id.clone();
-        let result =
-            self.with_database_store(&database_id, caller, RequiredRole::Writer, |store| {
-                store.multi_edit_node(request, now)
-            });
-        if result.is_ok() {
-            self.refresh_logical_size(&database_id)?;
-        }
-        result
-    }
-
-    pub fn search_nodes(
-        &self,
-        caller: &str,
-        request: SearchNodesRequest,
-    ) -> Result<Vec<SearchNodeHit>, String> {
-        let database_id = request.database_id.clone();
-        self.with_database_store(&database_id, caller, RequiredRole::Reader, |store| {
-            store.search_nodes(request)
-        })
-    }
-
-    pub fn search_node_paths(
-        &self,
-        caller: &str,
-        request: SearchNodePathsRequest,
-    ) -> Result<Vec<SearchNodeHit>, String> {
-        let database_id = request.database_id.clone();
-        self.with_database_store(&database_id, caller, RequiredRole::Reader, |store| {
-            store.search_node_paths(request)
-        })
-    }
-
-    pub fn export_fs_snapshot(
-        &self,
-        caller: &str,
-        request: ExportSnapshotRequest,
-    ) -> Result<ExportSnapshotResponse, String> {
-        let database_id = request.database_id.clone();
-        self.with_database_store(&database_id, caller, RequiredRole::Reader, |store| {
-            store.export_snapshot(request)
-        })
-    }
-
-    pub fn fetch_fs_updates(
-        &self,
-        caller: &str,
-        request: FetchUpdatesRequest,
-    ) -> Result<FetchUpdatesResponse, String> {
-        let database_id = request.database_id.clone();
-        self.with_database_store(&database_id, caller, RequiredRole::Reader, |store| {
-            store.fetch_updates(request)
-        })
     }
 
     pub fn sql_query(
@@ -1586,19 +1268,6 @@ impl VfsService {
             self.refresh_logical_size(&auth.database_id)?;
         }
         result
-    }
-
-    fn with_database_store<T>(
-        &self,
-        database_id: &str,
-        caller: &str,
-        required_role: RequiredRole,
-        f: impl FnOnce(&FsStore) -> Result<T, String>,
-    ) -> Result<T, String> {
-        self.require_role(database_id, caller, required_role)?;
-        let meta = self.database_meta(database_id)?;
-        let store = FsStore::new(PathBuf::from(meta.db_file_name));
-        f(&store)
     }
 
     fn with_database_path<T>(

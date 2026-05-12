@@ -13,7 +13,7 @@ assert.equal(
   "ic_host_unreachable"
 );
 assert.equal(
-  classifyApiError(new Error("Canister has no query method search_nodes"), "https://icp0.io").code,
+  classifyApiError(new Error("Canister has no query method sql_query"), "https://icp0.io").code,
   "icpdb_api_missing"
 );
 assert.equal(classifyApiError(new Error("replica rejected request"), "https://icp0.io").error, "ICPDB request failed");

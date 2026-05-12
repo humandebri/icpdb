@@ -186,29 +186,17 @@ function normalizeShape(value) {
 
 function normalizeResultAlias(value) {
   const normalized = normalizeShape(value);
-  if (normalized === "Result_10") return "ResultBilling";
-  if (normalized === "Result_11") return "ResultDepositQuote";
-  if (normalized === "Result_12") return "ResultUsage";
-  if (normalized === "Result_14") return "ResultLinks";
-  if (normalized === "Result_15") return "ResultChildren";
-  if (normalized === "Result_16") return "ResultMembers";
-  if (normalized === "Result_17") return "ResultTokens";
-  if (normalized === "Result_18") return "ResultDatabases";
-  if (normalized === "Result_2") return "ResultUnit";
-  if (normalized === "Result_3") return "ResultCreateDatabase";
-  if (normalized === "Result_4") return "ResultCreateToken";
-  if (normalized === "Result_6") return "ResultDeposit";
-  if (normalized === "Result_20") return "ResultPayments";
-  if (normalized === "Result_23") return "ResultQueryContext";
-  if (normalized === "Result_25") return "ResultNode";
-  if (normalized === "Result_26") return "ResultNodeContext";
-  if (normalized === "Result_27") return "ResultRecent";
-  if (normalized === "Result_28") return "ResultToken";
-  if (normalized === "Result_29") return "ResultSearch";
-  if (normalized === "Result_30") return "ResultSourceEvidence";
-  if (normalized === "Result_31") return "ResultSqlBatch";
-  if (normalized === "Result_32") return "ResultSql";
-  if (normalized === "Result") return "ResultWriteNode";
+  if (normalized === "Result_2") return "ResultCreateDatabase";
+  if (normalized === "Result_3") return "ResultCreateToken";
+  if (normalized === "Result_4") return "ResultDeposit";
+  if (normalized === "Result_5") return "ResultBilling";
+  if (normalized === "Result_6") return "ResultDepositQuote";
+  if (normalized === "Result_7") return "ResultUsage";
+  if (normalized === "Result_9") return "ResultTokens";
+  if (normalized === "Result_10") return "ResultDatabases";
+  if (normalized === "Result_11") return "ResultPayments";
+  if (normalized === "Result_14") return "ResultSqlBatch";
+  if (normalized === "Result_15") return "ResultSql";
   return normalized;
 }
 

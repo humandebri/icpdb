@@ -1,6 +1,6 @@
 # DB Lifecycle
 
-This document describes the operational model for multiple SQLite databases in one VFS canister.
+This document describes the operational model for multiple SQLite databases in one ICPDB canister.
 
 ## Identity Model
 
@@ -8,12 +8,12 @@ The database unit is `database_id`.
 
 Principals are attached through `database_members`:
 
-- `owner`: all operations, including grant, revoke, delete, archive, and restore
-- `writer`: read and write VFS nodes
-- `reader`: read VFS nodes and query/search/list
+- `owner`: all operations, including grant, revoke, delete, archive, restore, quota, and billing reads
+- `writer`: SQL reads and SQL writes
+- `reader`: SQL reads
 
 One database can have multiple principals. One principal can belong to multiple databases.
-Public browser reads use the normal member model. Grant anonymous reader access with principal `2vxsx-fae` when a DB should be publicly readable.
+Grant anonymous reader access with principal `2vxsx-fae` only when public SQL reads are intended.
 
 ## Memory Layout
 
@@ -24,8 +24,8 @@ Stable-memory mount IDs are partitioned by purpose:
 - `11..=32767`: user DB slots
 - `32768..=65534`: reserved
 
-The index DB tracks database metadata and membership. User DBs hold VFS node data, search data, and link data.
-The index DB also stores an internal `usage_events` ledger for update calls.
+The index DB tracks database metadata, membership, quota, billing, tokens, payments, and usage events.
+Each user DB is a raw SQLite file owned by one mount slot.
 
 Hot, archiving, or restoring DBs consume one active user DB slot. Archived and deleted DBs release their active mount, but v1 does not recycle stable-memory mount IDs for another database.
 
@@ -33,29 +33,29 @@ Hot, archiving, or restoring DBs consume one active user DB slot. Archived and d
 
 Databases move through five statuses:
 
-- `hot`: mounted and usable for VFS read/write/search/list
-- `archiving`: mounted for chunk export, VFS operations rejected until finalize succeeds
+- `hot`: mounted and usable for SQL read/write according to role and billing state
+- `archiving`: mounted for chunk export; SQL operations rejected until finalize or cancel succeeds
 - `archived`: not mounted, active mount released, snapshot metadata retained
 - `deleted`: not mounted, active mount released, not restorable unless an external archive was taken first
-- `restoring`: mounted for chunk import, VFS operations rejected until finalize succeeds
+- `restoring`: mounted for chunk import; SQL operations rejected until finalize succeeds
 
-Only `hot` DBs are available to normal VFS APIs.
+Only `hot` DBs are available to normal SQL APIs.
 
 ## Size Tracking
 
 `logical_size_bytes` tracks the SQLite file size for a database.
 
-It is updated after VFS mutations and restore finalization. It is useful for visibility and planning, but it is not a stable-memory billing or shrink metric.
+It is updated after SQL writes and restore finalization. It is useful for visibility and quota checks, but it is not a stable-memory shrink metric.
 
 Deleting or archiving a DB releases the active mount. It does not imply that canister stable memory shrinks or that the stable-memory mount ID is reused.
 
 ## Usage Ledger
 
-`usage_events` records update calls only. Query calls are not recorded.
+`usage_events` records update calls and charged SQL query calls.
 
 Each event stores method, database ID when present, caller principal, success flag, observed cycle delta, error text, and timestamp.
-The cycle delta is an operational observation from canister balance before and after the update, not a guaranteed one-to-one IC billing statement.
-Only the latest 100,000 events are retained. The ledger is internal operational material, not a guaranteed billing statement.
+The cycle delta is an operational observation from canister balance before and after the call, not a guaranteed one-to-one IC billing statement.
+Only the latest 100,000 events are retained.
 
 ## Delete
 
@@ -85,7 +85,7 @@ The canister does not persist archive bytes. The caller owns external storage an
 If hash verification fails, the DB stays `archiving`; the caller can reread bytes and retry finalize or call `cancel_database_archive(database_id)` to return the DB to `hot`.
 `cancel_database_archive` is owner-only and only valid while the DB is `archiving`.
 Archive reads reject chunks larger than 1 MiB.
-Finalize computes the digest by reading the whole SQLite file in one update. Large DBs can increase instruction and cycle cost; a future archive flow can move this to incremental chunk hashing.
+Finalize computes the digest by reading the whole SQLite file in one update. Large DBs can increase instruction and cycle cost.
 
 ## Restore
 
@@ -93,20 +93,14 @@ Restore is a low-level snapshot byte import flow:
 
 1. `begin_database_restore(database_id, snapshot_hash, size_bytes)` moves an archived or deleted DB to `restoring` and allocates a new slot.
 2. `write_database_restore_chunk(database_id, offset, bytes)` writes imported bytes.
-3. `finalize_database_restore(database_id)` checks file size and SHA-256 digest, runs DB migrations, and returns the DB to `hot`.
+3. `finalize_database_restore(database_id)` checks file size and SHA-256 digest, verifies the SQLite file opens, and returns the DB to `hot`.
 
 Restore can only begin from `archived` or `deleted`. It cannot begin from `hot` or while already `restoring`.
 If the canister cannot mount the newly allocated DB file during begin, the DB rolls back to its previous `archived` or `deleted` state. The failed mount ID remains in mount history and is not reused.
 
 If finalize fails because the file size is wrong, the DB stays `restoring`. The caller can write missing bytes and retry finalize.
 Restore rejects chunks larger than 1 MiB and declared DB sizes larger than `i64::MAX`.
-Restore finalize also hashes the whole restored SQLite file in one update, so large imports have the same instruction and cycle-cost concern as archive finalize.
-
-## Snapshot Sync Retry
-
-Paged snapshot sync uses `snapshot_revision` plus cursor instead of canister-side snapshot sessions.
-If a DB changes during a multi-page snapshot, later pages can fail with `snapshot_revision is no longer current`.
-Busy DBs may require caller retry; the CLI reports this as a resync condition and expects `pull --resync`.
+Restore finalize also hashes the whole restored SQLite file in one update.
 
 ## Current Limits
 
@@ -114,9 +108,3 @@ Busy DBs may require caller retry; the CLI reports this as a resync condition an
 - Archive export and restore import chunks are limited to 1 MiB.
 - Declared restore DB size must fit the runtime database size limit, currently `i64::MAX`.
 - v1 does not treat archived or deleted slots as reusable concurrent capacity.
-
-## Follow-ups
-
-- `delete_database` currently deletes the SQLite file before marking the DB `deleted`. A later lifecycle change should add a `deleting` state or equivalent two-phase flow before reordering this safely.
-- Archive/restore APIs are canister-level primitives. The CLI does not yet provide archive export/import commands.
-- Caffeine or external object storage integration is out of scope for v1.

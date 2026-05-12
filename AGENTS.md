@@ -25,12 +25,6 @@
 - ユーザー向けの説明は日本語で簡潔に書く。
 - 互換を切る場合は、その理由と影響範囲を明示する。
 
-## レビュー規約
-
-- このリポジトリをレビューするときは、まず [`kinic-rust-review`](/Users/0xhude/Desktop/MyCLI/checker/skills/kinic-rust-review/SKILL.md) を読むこと。
-- レビューでコマンドによる確認が必要な場合は、次に [`kinic-rust-verify`](/Users/0xhude/Desktop/MyCLI/checker/skills/kinic-rust-verify/SKILL.md) を使うこと。
-- ローカルの lint、テスト、日常的なチェック手順が必要な場合は、[`kinic-dev-checks`](/Users/0xhude/Desktop/MyCLI/checker/skills/kinic-dev-checks/SKILL.md) を参照すること。
-
 ## ローカル補助
 
 - ローカル専用の確認コマンドには [`lint.sh`](/Users/0xhude/Desktop/MyCLI/checker/lint.sh) と [`check.sh`](/Users/0xhude/Desktop/MyCLI/checker/check.sh) を使うこと。

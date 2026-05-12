@@ -41,7 +41,7 @@ export default function HomePage() {
           <section className="max-w-3xl">
             <p className="text-lg leading-8 text-muted">
               ICPDB is a focused MVP for serverless SQLite hosting on the Internet Computer. It keeps SQL execution,
-              quota, billing, deposit, and the canister console in this repository while leaving legacy wiki tooling out
+              quota, billing, deposit, and the canister console in this repository while leaving legacy tooling out
               of the product surface.
             </p>
           </section>

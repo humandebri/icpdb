@@ -1,6 +1,6 @@
 // Where: crates/vfs_types/src/lib.rs
-// What: FS-first shared contracts exposed as the reusable VFS public boundary.
-// Why: VFS consumers should depend on stable node contracts without importing wiki-specific crates.
+// What: Shared contracts for the ICPDB canister, runtime, and frontend bindings.
+// Why: SQL hosting clients need stable database, billing, deposit, and SQL transport types.
 mod fs;
 mod sql;
 
@@ -9,12 +9,6 @@ use serde::{Deserialize, Serialize};
 
 pub use fs::*;
 pub use sql::*;
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, CandidType)]
-pub struct Status {
-    pub file_count: u64,
-    pub source_count: u64,
-}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, CandidType)]
 pub struct CanisterHealth {

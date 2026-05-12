@@ -1,6 +1,6 @@
 # Dependency Forks
 
-This project patches selected IC stable-memory crates while multi-database canister storage depends on widened mount IDs.
+This project patches selected IC stable-memory crates while ICPDB canister storage depends on widened mount IDs.
 
 ## Current patches
 
@@ -10,7 +10,7 @@ This project patches selected IC stable-memory crates while multi-database canis
 
 ## Reason
 
-The multi-database VFS canister needs one index DB plus many per-database SQLite files. The upstream mount ID shape is too small for the target layout. These forks widen mount IDs from `u8` to `u16`, allowing user DB mount IDs `11..=32767`.
+The ICPDB canister needs one index DB plus many per-database SQLite files. The upstream mount ID shape is too small for the target layout. These forks widen mount IDs from `u8` to `u16`, allowing user DB mount IDs `11..=32767`.
 
 ## Mainline requirement
 

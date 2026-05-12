@@ -2,9 +2,7 @@
 members = [
     "crates/vfs_runtime",
     "crates/vfs_types",
-    "crates/wiki_domain",
     "crates/vfs_canister",
-    "crates/vfs_store",
 ]
 resolver = "2"
 

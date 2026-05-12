@@ -1,6 +1,6 @@
 // Where: crates/vfs_canister/src/lib.rs
-// What: ICP canister entrypoints backed by VfsService with an FS-first public API.
-// Why: The canister now exposes node-oriented operations directly and keeps the runtime boundary thin.
+// What: ICP canister entrypoints backed by VfsService for ICPDB SQL hosting.
+// Why: The canister exposes database lifecycle, SQL, billing, deposit, and token APIs.
 use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::fs::create_dir_all;
@@ -23,21 +23,11 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use vfs_runtime::{DatabaseMeta, UsageEvent, VfsService, hash_api_token};
 use vfs_types::{
-    AppendNodeRequest, CanisterHealth, CanonicalRole, ChildNode, CreateDatabaseTokenRequest,
-    CreateDatabaseTokenResponse, DatabaseArchiveChunk, DatabaseArchiveInfo,
-    DatabaseBalanceTopUpRequest, DatabaseBilling, DatabaseMember, DatabaseQuotaRequest,
-    DatabaseRestoreChunkRequest, DatabaseRole, DatabaseSummary, DatabaseTokenInfo, DatabaseUsage,
-    DeleteNodeRequest, DeleteNodeResult, DepositQuote, DepositResult, EditNodeRequest,
-    EditNodeResult, ExportSnapshotRequest, ExportSnapshotResponse, FetchUpdatesRequest,
-    FetchUpdatesResponse, GlobNodeHit, GlobNodesRequest, GraphLinksRequest,
-    GraphNeighborhoodRequest, IncomingLinksRequest, LinkEdge, ListChildrenRequest,
-    ListNodesRequest, MemoryCapability, MemoryManifest, MemoryRoot, MkdirNodeRequest,
-    MkdirNodeResult, MoveNodeRequest, MoveNodeResult, MultiEditNodeRequest, MultiEditNodeResult,
-    Node, NodeContext, NodeContextRequest, NodeEntry, OutgoingLinksRequest, PaymentRecord,
-    QueryContext, QueryContextRequest, RecentNodeHit, RecentNodesRequest, SearchNodeHit,
-    SearchNodePathsRequest, SearchNodesRequest, SourceEvidence, SourceEvidenceRequest,
-    SqlBatchRequest, SqlExecuteRequest, SqlExecuteResponse, Status, WriteNodeRequest,
-    WriteNodeResult,
+    CanisterHealth, CreateDatabaseTokenRequest, CreateDatabaseTokenResponse, DatabaseArchiveChunk,
+    DatabaseArchiveInfo, DatabaseBalanceTopUpRequest, DatabaseBilling, DatabaseMember,
+    DatabaseQuotaRequest, DatabaseRestoreChunkRequest, DatabaseRole, DatabaseSummary,
+    DatabaseTokenInfo, DatabaseUsage, DepositQuote, DepositResult, PaymentRecord, SqlBatchRequest,
+    SqlExecuteRequest, SqlExecuteResponse,
 };
 
 const INDEX_DB_PATH: &str = "./DB/index.sqlite3";
@@ -126,56 +116,10 @@ fn post_upgrade_hook() {
 }
 
 #[query]
-fn status(database_id: String) -> Status {
-    with_service(|service| service.status(&database_id, &caller_text()))
-        .unwrap_or_else(|error| ic_cdk::trap(&error))
-}
-
-#[query]
 fn canister_health() -> CanisterHealth {
     CanisterHealth {
         cycles_balance: ic_cdk::api::canister_cycle_balance(),
     }
-}
-
-#[query]
-fn memory_manifest() -> MemoryManifest {
-    MemoryManifest {
-        api_version: "agent-memory-v1".to_string(),
-        purpose: "Canister-backed long-term wiki memory for agents".to_string(),
-        roots: vec![
-            MemoryRoot {
-                path: "/Wiki".to_string(),
-                kind: "wiki".to_string(),
-            },
-            MemoryRoot {
-                path: "/Sources".to_string(),
-                kind: "raw_sources".to_string(),
-            },
-        ],
-        capabilities: memory_capabilities(),
-        canonical_roles: canonical_roles(),
-        write_policy: "agent_memory_read_only".to_string(),
-        recommended_entrypoint: "query_context".to_string(),
-        max_depth: 2,
-        max_query_limit: 100,
-        budget_unit: "approx_chars_from_tokens".to_string(),
-    }
-}
-
-#[query]
-fn read_node(database_id: String, path: String) -> Result<Option<Node>, String> {
-    with_service(|service| service.read_node(&database_id, &caller_text(), &path))
-}
-
-#[query]
-fn list_nodes(request: ListNodesRequest) -> Result<Vec<NodeEntry>, String> {
-    with_service(|service| service.list_nodes(&caller_text(), request))
-}
-
-#[query]
-fn list_children(request: ListChildrenRequest) -> Result<Vec<ChildNode>, String> {
-    with_service(|service| service.list_children(&caller_text(), request))
 }
 
 #[update]
@@ -524,129 +468,6 @@ fn finalize_database_restore(database_id: String) -> Result<(), String> {
     )
 }
 
-#[update]
-fn write_node(request: WriteNodeRequest) -> Result<WriteNodeResult, String> {
-    let database_id = request.database_id.clone();
-    with_usage("write_node", Some(database_id), |service, caller, now| {
-        service.write_node(caller, request, now)
-    })
-}
-
-#[update]
-fn append_node(request: AppendNodeRequest) -> Result<WriteNodeResult, String> {
-    let database_id = request.database_id.clone();
-    with_usage("append_node", Some(database_id), |service, caller, now| {
-        service.append_node(caller, request, now)
-    })
-}
-
-#[update]
-fn edit_node(request: EditNodeRequest) -> Result<EditNodeResult, String> {
-    let database_id = request.database_id.clone();
-    with_usage("edit_node", Some(database_id), |service, caller, now| {
-        service.edit_node(caller, request, now)
-    })
-}
-
-#[update]
-fn delete_node(request: DeleteNodeRequest) -> Result<DeleteNodeResult, String> {
-    let database_id = request.database_id.clone();
-    with_usage("delete_node", Some(database_id), |service, caller, now| {
-        service.delete_node(caller, request, now)
-    })
-}
-
-#[update]
-fn move_node(request: MoveNodeRequest) -> Result<MoveNodeResult, String> {
-    let database_id = request.database_id.clone();
-    with_usage("move_node", Some(database_id), |service, caller, now| {
-        service.move_node(caller, request, now)
-    })
-}
-
-#[update]
-fn mkdir_node(request: MkdirNodeRequest) -> Result<MkdirNodeResult, String> {
-    let database_id = request.database_id.clone();
-    with_usage("mkdir_node", Some(database_id), |service, caller, _now| {
-        service.mkdir_node(caller, request)
-    })
-}
-
-#[query]
-fn glob_nodes(request: GlobNodesRequest) -> Result<Vec<GlobNodeHit>, String> {
-    with_service(|service| service.glob_nodes(&caller_text(), request))
-}
-
-#[query]
-fn recent_nodes(request: RecentNodesRequest) -> Result<Vec<RecentNodeHit>, String> {
-    with_service(|service| service.recent_nodes(&caller_text(), request))
-}
-
-#[query]
-fn incoming_links(request: IncomingLinksRequest) -> Result<Vec<LinkEdge>, String> {
-    with_service(|service| service.incoming_links(&caller_text(), request))
-}
-
-#[query]
-fn outgoing_links(request: OutgoingLinksRequest) -> Result<Vec<LinkEdge>, String> {
-    with_service(|service| service.outgoing_links(&caller_text(), request))
-}
-
-#[query]
-fn graph_links(request: GraphLinksRequest) -> Result<Vec<LinkEdge>, String> {
-    with_service(|service| service.graph_links(&caller_text(), request))
-}
-
-#[query]
-fn graph_neighborhood(request: GraphNeighborhoodRequest) -> Result<Vec<LinkEdge>, String> {
-    with_service(|service| service.graph_neighborhood(&caller_text(), request))
-}
-
-#[query]
-fn read_node_context(request: NodeContextRequest) -> Result<Option<NodeContext>, String> {
-    with_service(|service| service.read_node_context(&caller_text(), request))
-}
-
-#[query]
-fn query_context(request: QueryContextRequest) -> Result<QueryContext, String> {
-    with_service(|service| service.query_context(&caller_text(), request))
-}
-
-#[query]
-fn source_evidence(request: SourceEvidenceRequest) -> Result<SourceEvidence, String> {
-    with_service(|service| service.source_evidence(&caller_text(), request))
-}
-
-#[update]
-fn multi_edit_node(request: MultiEditNodeRequest) -> Result<MultiEditNodeResult, String> {
-    let database_id = request.database_id.clone();
-    with_usage(
-        "multi_edit_node",
-        Some(database_id),
-        |service, caller, now| service.multi_edit_node(caller, request, now),
-    )
-}
-
-#[query]
-fn search_nodes(request: SearchNodesRequest) -> Result<Vec<SearchNodeHit>, String> {
-    with_service(|service| service.search_nodes(&caller_text(), request))
-}
-
-#[query]
-fn search_node_paths(request: SearchNodePathsRequest) -> Result<Vec<SearchNodeHit>, String> {
-    with_service(|service| service.search_node_paths(&caller_text(), request))
-}
-
-#[query]
-fn export_snapshot(request: ExportSnapshotRequest) -> Result<ExportSnapshotResponse, String> {
-    with_service(|service| service.export_fs_snapshot(&caller_text(), request))
-}
-
-#[query]
-fn fetch_updates(request: FetchUpdatesRequest) -> Result<FetchUpdatesResponse, String> {
-    with_service(|service| service.fetch_fs_updates(&caller_text(), request))
-}
-
 #[query]
 fn sql_query(request: SqlExecuteRequest) -> Result<SqlExecuteResponse, String> {
     with_service(|service| service.sql_query(&caller_text(), request))
@@ -847,7 +668,7 @@ async fn icp_transfer_from(
 ) -> Result<u64, TransferFromError> {
     #[cfg(test)]
     {
-        return TEST_ICP_TRANSFER_FROM.with(|result| result.borrow().clone().unwrap_or(Ok(1)));
+        TEST_ICP_TRANSFER_FROM.with(|result| result.borrow().clone().unwrap_or(Ok(1)))
     }
     #[cfg(not(test))]
     {
@@ -1124,7 +945,7 @@ where
         let borrowed = slot.borrow();
         let service = borrowed
             .as_ref()
-            .ok_or_else(|| "wiki service is not initialized".to_string())?;
+            .ok_or_else(|| "icpdb service is not initialized".to_string())?;
         let result = f(service, &caller, now);
         let after_cycles = cycle_balance();
         let cycles_delta = before_cycles.saturating_sub(after_cycles);
@@ -1150,127 +971,15 @@ where
         let borrowed = slot.borrow();
         let service = borrowed
             .as_ref()
-            .ok_or_else(|| "wiki service is not initialized".to_string())?;
+            .ok_or_else(|| "icpdb service is not initialized".to_string())?;
         f(service)
     })
-}
-
-fn memory_capabilities() -> Vec<MemoryCapability> {
-    [
-        (
-            "query_context",
-            "Primary agent-memory entrypoint for task-scoped context bundles",
-        ),
-        ("source_evidence", "Read source-path evidence for one node"),
-        (
-            "memory_manifest",
-            "Discover memory API shape, limits, and policy",
-        ),
-        (
-            "read_node_context",
-            "Auxiliary node read with incoming and outgoing links",
-        ),
-        ("search_nodes", "Auxiliary search with lightweight previews"),
-        (
-            "graph_neighborhood",
-            "Auxiliary local link graph around one node",
-        ),
-        ("recent_nodes", "Auxiliary recent live-node listing"),
-    ]
-    .into_iter()
-    .map(|(name, description)| MemoryCapability {
-        name: name.to_string(),
-        description: description.to_string(),
-    })
-    .collect()
-}
-
-fn canonical_roles() -> Vec<CanonicalRole> {
-    [
-        (
-            "index",
-            "index.md",
-            "Content-oriented catalog of pages in a scope",
-        ),
-        (
-            "overview",
-            "overview.md",
-            "Corpus-level synthesis maintained by agents",
-        ),
-        ("log", "log.md", "Append-only chronological mutation log"),
-        (
-            "schema",
-            "schema.md",
-            "Scope-local conventions and write rules",
-        ),
-        ("topics", "topics/*.md", "Topic-level synthesis pages"),
-        (
-            "provenance",
-            "provenance.md",
-            "Source-path provenance for a scope or node",
-        ),
-    ]
-    .into_iter()
-    .map(|(name, path_pattern, purpose)| CanonicalRole {
-        name: name.to_string(),
-        path_pattern: path_pattern.to_string(),
-        purpose: purpose.to_string(),
-    })
-    .collect()
 }
 
 export_service!();
 
 pub fn candid_interface() -> String {
-    normalize_candid_interface(__export_service())
-}
-
-fn normalize_candid_interface(interface: String) -> String {
-    let normalized = normalize_candid_method_input(
-        &interface,
-        "outgoing_links",
-        "IncomingLinksRequest",
-        "OutgoingLinksRequest",
-    );
-    ensure_outgoing_links_request(normalized)
-}
-
-fn normalize_candid_method_input(
-    interface: &str,
-    method: &str,
-    exported_input: &str,
-    public_input: &str,
-) -> String {
-    let mut normalized = interface
-        .lines()
-        .map(|line| {
-            let prefix = format!("  {method} : ({exported_input}) -> (");
-            if line.starts_with(&prefix) && line.ends_with(" query;") {
-                line.replacen(
-                    &format!("{method} : ({exported_input})"),
-                    &format!("{method} : ({public_input})"),
-                    1,
-                )
-            } else {
-                line.to_string()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    if interface.ends_with('\n') {
-        normalized.push('\n');
-    }
-    normalized
-}
-
-fn ensure_outgoing_links_request(interface: String) -> String {
-    if interface.contains("type OutgoingLinksRequest = record {") {
-        return interface;
-    }
-    interface.replace(
-        "type LinkEdge = record {",
-        "type OutgoingLinksRequest = record { path : text; limit : nat32; database_id : text };\ntype LinkEdge = record {",
-    )
+    __export_service()
 }
 
 #[cfg(test)]

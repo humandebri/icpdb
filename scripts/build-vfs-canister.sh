@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Where: scripts/build-vfs-canister.sh
-# What: Build the release wasm artifact used by the canister CI job and deployment flow.
+# What: Build the release wasm artifact used by the ICPDB canister deployment flow.
 # Why: The canister target pulls in bundled sqlite C code, so wasm32-wasip1 builds need a WASI sysroot when running on Linux.
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -20,19 +20,6 @@ ICP_WASM_OUTPUT_PATH="${ICP_WASM_OUTPUT_PATH:-${OUTPUT_WASM}}"
 source "${SCRIPT_DIR}/wasi-env.sh"
 configure_wasi_cc_env
 
-EXTRA_FEATURES=""
-case "${VFS_CANISTER_DIAGNOSTIC_PROFILE:-baseline}" in
-  baseline)
-    ;;
-  fts_disabled_for_bench)
-    EXTRA_FEATURES="bench-disable-fts"
-    ;;
-  *)
-    echo "unknown VFS_CANISTER_DIAGNOSTIC_PROFILE: ${VFS_CANISTER_DIAGNOSTIC_PROFILE}" >&2
-    exit 1
-    ;;
-esac
-
 build_cmd=(
   cargo build
   --manifest-path "${REPO_ROOT}/Cargo.toml"
@@ -42,14 +29,10 @@ build_cmd=(
   --target wasm32-wasip1
 )
 
-if [[ -n "${EXTRA_FEATURES}" ]]; then
-  build_cmd+=(--features "${EXTRA_FEATURES}")
-fi
-
 maybe_dump_wasm_sections() {
   local label="$1"
   local wasm_path="$2"
-  if [[ "${VFS_CANISTER_WASM_DEBUG_SECTIONS:-0}" != "1" ]]; then
+  if [[ "${ICPDB_CANISTER_WASM_DEBUG_SECTIONS:-0}" != "1" ]]; then
     return
   fi
   if ! command -v wasm-tools >/dev/null 2>&1; then
@@ -64,7 +47,7 @@ maybe_dump_wasm_sections() {
 # `wasi2ic` currently emits walrus warnings for data-name indices while parsing
 # Rust-produced name sections. The converted module still retains a name section
 # and remains usable. If the warning changes, set
-# `VFS_CANISTER_WASM_DEBUG_SECTIONS=1` to dump pre/post conversion section
+# `ICPDB_CANISTER_WASM_DEBUG_SECTIONS=1` to dump pre/post conversion section
 # layouts without changing the emitted artifact.
 maybe_dump_wasm_sections "cargo-build output" "${INPUT_WASM}"
 wasi2ic "${INPUT_WASM}" "${OUTPUT_WASM}"

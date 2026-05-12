@@ -6,9 +6,6 @@ edition = "2024"
 [lib]
 crate-type = ["cdylib", "rlib"]
 
-[features]
-bench-disable-fts = ["vfs-runtime/bench-disable-fts"]
-
 [dependencies]
 candid = "0.10.26"
 ic-cdk = "0.20.0"
@@ -20,7 +17,6 @@ serde = { version = "1.0.228", features = ["derive"] }
 sha2 = "0.10.9"
 vfs-runtime = { path = "../vfs_runtime" }
 vfs-types = { path = "../vfs_types" }
-wiki-domain = { path = "../wiki_domain" }
 
 [dev-dependencies]
 tempfile = "3.23.0"
