@@ -1,4 +1,0 @@
-build_cmd:
-  bash ./scripts/build-vfs-canister-canbench.sh
-wasm_path:
-  ./target/canbench/vfs_canister_canbench.wasm

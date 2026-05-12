@@ -1,15 +1,22 @@
 export type ApiErrorCode =
   | "canister_not_found"
   | "ic_host_unreachable"
-  | "wiki_api_missing"
+  | "icpdb_api_missing"
   | "invalid_canister_id"
-  | "wiki_request_failed";
+  | "icpdb_request_failed";
 
 export type PublicApiError = {
   error: string;
   hint: string;
   code: ApiErrorCode;
 };
+
+export class ApiError extends Error {
+  constructor(message: string, readonly status: number, readonly hint: string | null = null, readonly code: string | null = null) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
 
 export function invalidCanisterIdError(reason: string): PublicApiError {
   return {
@@ -26,7 +33,7 @@ export function classifyApiError(error: unknown, host: string): PublicApiError {
     return {
       error: "Canister not found on this IC host",
       hint: local
-        ? "Check that the local replica is running, the icp local network state matches this canister ID, and the wiki canister has been deployed."
+        ? "Check that the local replica is running, the icp local network state matches this canister ID, and the ICPDB canister has been deployed."
         : "Check the canister ID and confirm that the target canister exists on this IC host.",
       code: "canister_not_found"
     };
@@ -42,17 +49,17 @@ export function classifyApiError(error: unknown, host: string): PublicApiError {
   }
   if (/method .*not found|no (query|update) method|does not expose|Cannot find field|subtype|type mismatch|Candid|IDL/i.test(raw)) {
     return {
-      error: "This canister does not expose the Wiki VFS API",
-      hint: "Use a Kinic Wiki canister with read_node_context, list_children, graph_neighborhood, search, and recent_nodes methods.",
-      code: "wiki_api_missing"
+      error: "This canister does not expose the ICPDB API",
+      hint: "Use an ICPDB canister with database, billing, deposit, token, and SQL methods.",
+      code: "icpdb_api_missing"
     };
   }
   return {
-    error: "Wiki request failed",
+    error: "ICPDB request failed",
     hint: local
-      ? "Check the local replica logs and confirm the wiki canister is healthy."
-      : "Check the canister ID, gateway host, and public Wiki VFS API availability.",
-    code: "wiki_request_failed"
+      ? "Check the local replica logs and confirm the ICPDB canister is healthy."
+      : "Check the canister ID, gateway host, and ICPDB API availability.",
+    code: "icpdb_request_failed"
   };
 }
 

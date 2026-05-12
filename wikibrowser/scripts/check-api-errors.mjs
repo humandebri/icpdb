@@ -14,9 +14,9 @@ assert.equal(
 );
 assert.equal(
   classifyApiError(new Error("Canister has no query method search_nodes"), "https://icp0.io").code,
-  "wiki_api_missing"
+  "icpdb_api_missing"
 );
-assert.equal(classifyApiError(new Error("replica rejected request"), "https://icp0.io").error, "Wiki request failed");
+assert.equal(classifyApiError(new Error("replica rejected request"), "https://icp0.io").error, "ICPDB request failed");
 assert.equal(invalidCanisterIdError("invalid principal").error, "Invalid canister ID");
 
 console.log("API error checks OK");

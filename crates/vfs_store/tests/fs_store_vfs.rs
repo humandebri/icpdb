@@ -477,7 +477,7 @@ fn memory_queries_return_context_and_scope_evidence() {
         ),
         (
             "/Wiki/scope/alpha.md",
-            "# Alpha\n\nbeam full reset detail [Raw](/Sources/raw/a/a.md)",
+            "# Alpha\n\nsample reset detail [Raw](/Sources/raw/a/a.md)",
             14,
         ),
         ("/Wiki/scope/topics/foo.md", "# Foo\n\ntopic detail", 15),
@@ -506,7 +506,7 @@ fn memory_queries_return_context_and_scope_evidence() {
     let context = store
         .query_context(QueryContextRequest {
             database_id: "default".to_string(),
-            task: "beam reset".to_string(),
+            task: "sample reset".to_string(),
             entities: vec!["alpha".to_string()],
             namespace: Some("/Wiki/scope".to_string()),
             budget_tokens: 1_000,
@@ -569,7 +569,7 @@ fn memory_queries_return_context_and_scope_evidence() {
 
     let invalid_depth = store.query_context(QueryContextRequest {
         database_id: "default".to_string(),
-        task: "beam".to_string(),
+        task: "sample".to_string(),
         entities: Vec::new(),
         namespace: Some("/Wiki/scope".to_string()),
         budget_tokens: 1_000,

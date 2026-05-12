@@ -51,7 +51,7 @@ const defaultWalletSignerUrl = "https://oisy.com/sign";
 const defaultWalletHost = "https://icp-api.io";
 
 export function IcpdbWorkbench() {
-  const canisterId = process.env.NEXT_PUBLIC_KINIC_WIKI_CANISTER_ID ?? "";
+  const canisterId = process.env.NEXT_PUBLIC_ICPDB_CANISTER_ID ?? "";
   const walletSignerUrl = process.env.NEXT_PUBLIC_ICPDB_WALLET_SIGNER_URL ?? defaultWalletSignerUrl;
   const walletHost = process.env.NEXT_PUBLIC_ICPDB_WALLET_HOST ?? defaultWalletHost;
   const walletRef = useRef<IcpWallet | null>(null);
@@ -110,7 +110,7 @@ export function IcpdbWorkbench() {
   const refreshDatabases = useCallback(
     async (client: AuthClient) => {
       if (!canisterId) {
-        setError("NEXT_PUBLIC_KINIC_WIKI_CANISTER_ID is not configured.");
+        setError("NEXT_PUBLIC_ICPDB_CANISTER_ID is not configured.");
         setLoadState("error");
         return;
       }

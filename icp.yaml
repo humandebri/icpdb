@@ -1,5 +1,5 @@
 canisters:
-  - name: wiki
+  - name: icpdb
     build:
       steps:
         - type: script
@@ -7,7 +7,7 @@ canisters:
             - bash scripts/build-vfs-canister.sh
 
 networks:
-  - name: local-wiki
+  - name: local-icpdb
     mode: managed
     ii: true
     gateway:
@@ -15,7 +15,7 @@ networks:
       port: 8001
 
 environments:
-  - name: local-wiki
-    network: local-wiki
+  - name: local-icpdb
+    network: local-icpdb
     canisters:
-      - wiki
+      - icpdb

@@ -1273,9 +1273,6 @@ fn ensure_outgoing_links_request(interface: String) -> String {
     )
 }
 
-#[cfg(feature = "canbench-rs")]
-mod benches;
-
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

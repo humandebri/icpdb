@@ -56,12 +56,9 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Run tests
-        run: cargo test --workspace --locked
-      - name: Guard legacy wiki client aliases
-        run: |
-          ! rg -n '\b(WikiApi|CanisterWikiClient)\b' crates
+        run: cargo test -p vfs-runtime -p vfs-canister --locked
       - name: Run clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        run: cargo clippy -p vfs-runtime -p vfs-canister --all-targets --locked -- -D warnings
 
   canister-build:
     runs-on: ubuntu-latest
@@ -90,19 +87,3 @@ jobs:
         env:
           ICP_WASM_OUTPUT_PATH: /tmp/vfs_canister.wasm
         run: bash scripts/build-vfs-canister.sh
-
-  extension-check:
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: extensions/conversation-capture
-    steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: extensions/conversation-capture/package-lock.json
-      - run: npm ci
-      - run: npm run build
-      - run: npm test

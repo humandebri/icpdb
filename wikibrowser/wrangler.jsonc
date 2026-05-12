@@ -1,6 +1,6 @@
 {
   "$schema": "./node_modules/wrangler/config-schema.json",
-  "name": "kinic-wiki-browser",
+  "name": "icpdb-console",
   "main": ".open-next/worker.js",
   "compatibility_date": "2026-05-11",
   "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
@@ -11,16 +11,12 @@
   "services": [
     {
       "binding": "WORKER_SELF_REFERENCE",
-      "service": "kinic-wiki-browser"
+      "service": "icpdb-console"
     }
   ],
   "routes": [
     {
-      "pattern": "kinic.xyz",
-      "custom_domain": true
-    },
-    {
-      "pattern": "wiki.kinic.xyz",
+      "pattern": "icpdb.example.com",
       "custom_domain": true
     }
   ]

@@ -425,7 +425,7 @@ fn memory_entrypoints_return_agent_memory_contract() {
         ("/Wiki/scope/index.md", "# Index\n\n[Overview](overview.md)"),
         (
             "/Wiki/scope/overview.md",
-            "# Overview\n\nbeam memory [Raw](/Sources/raw/a/a.md)",
+            "# Overview\n\nsample memory [Raw](/Sources/raw/a/a.md)",
         ),
         ("/Wiki/scope/schema.md", "# Schema\n\nread-only"),
         (
@@ -451,7 +451,7 @@ fn memory_entrypoints_return_agent_memory_contract() {
 
     let context = query_context(QueryContextRequest {
         database_id: "default".to_string(),
-        task: "beam memory".to_string(),
+        task: "sample memory".to_string(),
         entities: Vec::new(),
         namespace: Some("/Wiki/scope".to_string()),
         budget_tokens: 1_000,

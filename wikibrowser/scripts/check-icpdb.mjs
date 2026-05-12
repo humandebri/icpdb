@@ -26,6 +26,7 @@ assert.match(workbench, /depositQuoteMatchesAmount/);
 assert.match(workbench, /fresh quote required before deposit/);
 assert.match(workbench, /NEXT_PUBLIC_ICPDB_WALLET_SIGNER_URL/);
 assert.match(workbench, /NEXT_PUBLIC_ICPDB_WALLET_HOST/);
+assert.match(workbench, /NEXT_PUBLIC_ICPDB_CANISTER_ID/);
 assert.match(workbench, /IcpWallet\.connect/);
 assert.match(workbench, /icrc2Approve/);
 assert.match(workbench, /wallet principal must match login principal/);
@@ -37,6 +38,15 @@ assert.doesNotMatch(workbench, /\bany\b/);
 assert.doesNotMatch(workbench, /\bas\b/);
 
 assert.match(packageJson.scripts.test, /check-icpdb\.mjs/);
+const removedScriptChecks = [
+  ["check-", "dash", "board"].join(""),
+  "check-paths",
+  "check-smoke-url",
+  "check-ui-helpers"
+];
+for (const removedScriptCheck of removedScriptChecks) {
+  assert.equal(packageJson.scripts.test.includes(removedScriptCheck), false);
+}
 assert.equal(packageJson.dependencies["@dfinity/oisy-wallet-signer"], "^4.1.3");
 
 console.log("ICPDB console checks OK");

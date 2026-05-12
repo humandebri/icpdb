@@ -1,8 +1,6 @@
 import { Actor, HttpAgent, type Identity } from "@icp-sdk/core/agent";
 import { Principal } from "@icp-sdk/core/principal";
-import { classifyApiError, invalidCanisterIdError } from "@/lib/api-errors";
-import { sortChildNodes } from "@/lib/child-sort";
-import { normalizeSearchHit, type RawSearchHit } from "@/lib/search-normalizer";
+import { ApiError, classifyApiError, invalidCanisterIdError } from "@/lib/api-errors";
 import { idlFactory } from "@/lib/vfs-idl";
 import type {
   CanisterHealth,
@@ -25,6 +23,8 @@ import type {
   PaymentRecord,
   RecentNode,
   SearchNodeHit,
+  SearchPreview,
+  SearchPreviewField,
   SqlExecuteRequest,
   SqlExecuteResponse,
   SqlValue,
@@ -32,7 +32,6 @@ import type {
   WriteNodeRequest,
   WriteNodeResult
 } from "@/lib/types";
-import { ApiError } from "@/lib/wiki-helpers";
 
 type Variant = Record<string, null>;
 
@@ -140,6 +139,22 @@ type RawRecent = {
   kind: Variant;
   updated_at: bigint;
   etag: string;
+};
+
+type RawSearchPreview = {
+  field: Variant;
+  char_offset: number;
+  match_reason: string;
+  excerpt: [] | [string];
+};
+
+type RawSearchHit = {
+  path: string;
+  kind: Variant;
+  snippet: [] | [string];
+  preview: [] | [RawSearchPreview];
+  score: number;
+  match_reasons: string[];
 };
 
 type RawWriteNodeRequest = {
@@ -859,6 +874,32 @@ function normalizeChild(raw: RawChild): ChildNode {
   };
 }
 
+function sortChildNodes(children: ChildNode[]): ChildNode[] {
+  return [...children].sort(compareChildNodes);
+}
+
+function compareChildNodes(left: ChildNode, right: ChildNode): number {
+  const kindOrder = childKindOrder(left) - childKindOrder(right);
+  if (kindOrder !== 0) {
+    return kindOrder;
+  }
+  const nameOrder = left.name.localeCompare(right.name, undefined, {
+    numeric: true,
+    sensitivity: "base"
+  });
+  if (nameOrder !== 0) {
+    return nameOrder;
+  }
+  return left.path.localeCompare(right.path, undefined, {
+    numeric: true,
+    sensitivity: "base"
+  });
+}
+
+function childKindOrder(child: ChildNode): number {
+  return child.kind === "directory" ? 0 : 1;
+}
+
 function normalizeLinkEdge(raw: RawLinkEdge): LinkEdge {
   return {
     sourcePath: raw.source_path,
@@ -868,6 +909,30 @@ function normalizeLinkEdge(raw: RawLinkEdge): LinkEdge {
     linkKind: raw.link_kind,
     updatedAt: raw.updated_at.toString()
   };
+}
+
+function normalizeSearchHit(raw: RawSearchHit): SearchNodeHit {
+  return {
+    path: raw.path,
+    kind: normalizeNodeKind(raw.kind),
+    snippet: raw.snippet[0] ?? null,
+    preview: raw.preview[0] ? normalizeSearchPreview(raw.preview[0]) : null,
+    score: raw.score,
+    matchReasons: raw.match_reasons
+  };
+}
+
+function normalizeSearchPreview(raw: RawSearchPreview): SearchPreview {
+  return {
+    field: normalizePreviewField(raw.field),
+    charOffset: raw.char_offset,
+    matchReason: raw.match_reason,
+    excerpt: raw.excerpt[0] ?? null
+  };
+}
+
+function normalizePreviewField(field: Variant): SearchPreviewField {
+  return "Path" in field ? "path" : "content";
 }
 
 function normalizeNodeContext(raw: RawNodeContext): NodeContext {
