@@ -6,3 +6,5 @@ allowBuilds:
   unrs-resolver@1.11.1: true
   workerd: true
   workerd@1.20260507.1: true
+overrides:
+  postcss@<8.5.10: ^8.5.10
