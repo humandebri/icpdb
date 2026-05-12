@@ -1,4 +1,4 @@
-// Where: crates/vfs_types/src/sql.rs
+// Where: crates/icpdb_types/src/sql.rs
 // What: SQL hosting request and response contracts.
 // Why: Raw SQLite execution needs a transport-safe value model shared by canister and clients.
 use candid::CandidType;

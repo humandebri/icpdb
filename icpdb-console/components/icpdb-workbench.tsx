@@ -1,6 +1,6 @@
 "use client";
 
-// wikibrowser/components/icpdb-workbench.tsx
+// icpdb-console/components/icpdb-workbench.tsx
 // Live SQL panel: connects the ICPDB console prototype to the canister SQL API.
 
 import { AuthClient } from "@icp-sdk/auth/client";
@@ -32,7 +32,7 @@ import {
   listPaymentsAuthenticated,
   sqlExecuteAuthenticated,
   sqlQueryAuthenticated
-} from "@/lib/vfs-client";
+} from "@/lib/icpdb-client";
 
 type SqlMode = "query" | "update";
 type LoadState = "idle" | "loading" | "ready" | "error";

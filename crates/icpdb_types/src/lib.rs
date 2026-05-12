@@ -1,4 +1,4 @@
-// Where: crates/vfs_types/src/lib.rs
+// Where: crates/icpdb_types/src/lib.rs
 // What: Shared contracts for the ICPDB canister, runtime, and frontend bindings.
 // Why: SQL hosting clients need stable database, billing, deposit, and SQL transport types.
 mod fs;

@@ -5,7 +5,7 @@ ICPDB is an MVP for SQLite hosting on the Internet Computer.
 The current product surface is intentionally small:
 
 - one Rust canister hosting multiple isolated SQLite databases
-- Candid SQL query/update APIs with quota and billing-unit checks
+- Candid SQL read query APIs with quota checks, plus billed update/write APIs
 - ICP prepaid deposit using ICRC-2 approve / transfer_from
 - payment history, usage, dump, restore, and token management APIs
 - Next.js console at `/icpdb`
@@ -15,10 +15,10 @@ Phase 2 cleanup removes the old node/search/graph API and keeps the repository f
 ## Repository
 
 ```text
-crates/vfs_canister   Rust canister entrypoints and Candid API
-crates/vfs_runtime    SQLite runtime, billing, quota, payments
-crates/vfs_types      Shared SQL, lifecycle, billing, and deposit types
-wikibrowser           ICPDB web console
+crates/icpdb_canister   Rust canister entrypoints and Candid API
+crates/icpdb_runtime    SQLite runtime, billing, quota, payments
+crates/icpdb_types      Shared SQL, lifecycle, billing, and deposit types
+icpdb-console           ICPDB web console
 scripts               Canister build helpers
 ```
 
@@ -31,7 +31,7 @@ Forked dependencies are pinned in `Cargo.toml`:
 ## Local Canister
 
 ```bash
-bash scripts/build-vfs-canister.sh
+bash scripts/build-icpdb-canister.sh
 icp network start -d -e local-icpdb
 icp deploy -e local-icpdb
 ```
@@ -45,7 +45,7 @@ rustup target add wasm32-wasip1
 ## Web Console
 
 ```bash
-cd wikibrowser
+cd icpdb-console
 pnpm install
 cp .env.local.example .env.local
 pnpm dev
@@ -85,17 +85,23 @@ Initial rate:
 
 `top_up_database_balance` remains an operator correction API and is not exposed in the normal UI.
 
+## Billing Model
+
+Read-only `sql_query` calls are free and remain Candid query calls. They still enforce SQL mode, response limits, and role checks.
+
+Write/update APIs consume billing units only after successful execution. `sql_execute` costs `5` units, and `sql_batch` costs `5 * statement_count` units.
+
 ## Checks
 
 ```bash
-cargo test -p vfs-runtime
-cargo test -p vfs-canister
+cargo test -p icpdb-runtime
+cargo test -p icpdb-canister
 icp build
 
-pnpm --dir wikibrowser test
-pnpm --dir wikibrowser typecheck
-pnpm --dir wikibrowser lint
-pnpm --dir wikibrowser build
+pnpm --dir icpdb-console test
+pnpm --dir icpdb-console typecheck
+pnpm --dir icpdb-console lint
+pnpm --dir icpdb-console build
 ```
 
 ## Scope Limits

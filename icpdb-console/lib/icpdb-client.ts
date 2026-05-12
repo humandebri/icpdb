@@ -1,7 +1,7 @@
 import { Actor, HttpAgent, type Identity } from "@icp-sdk/core/agent";
 import { Principal } from "@icp-sdk/core/principal";
 import { ApiError, classifyApiError, invalidCanisterIdError } from "@/lib/api-errors";
-import { idlFactory } from "@/lib/vfs-idl";
+import { idlFactory } from "@/lib/icpdb-idl";
 import type {
   CanisterHealth,
   CreateDatabaseTokenResponse,
@@ -115,7 +115,7 @@ type RawSqlExecuteResponse = {
   truncated: boolean;
 };
 
-type VfsActor = {
+type IcpdbActor = {
   canister_health: () => Promise<RawCanisterHealth>;
   create_database: () => Promise<{ Ok: string } | { Err: string }>;
   create_database_token: (request: { database_id: string; name: string; scope: Variant }) => Promise<
@@ -140,10 +140,10 @@ export function validateCanisterId(canisterId: string): Principal | string {
   }
 }
 
-const actorCache = new Map<string, Promise<VfsActor>>();
+const actorCache = new Map<string, Promise<IcpdbActor>>();
 const healthCache = new Map<string, Promise<CanisterHealth>>();
 
-export async function createVfsActor(canisterId: string): Promise<VfsActor> {
+export async function createIcpdbActor(canisterId: string): Promise<IcpdbActor> {
   const principal = validateCanisterId(canisterId);
   if (typeof principal === "string") {
     const error = invalidCanisterIdError(principal);
@@ -160,18 +160,18 @@ export async function createVfsActor(canisterId: string): Promise<VfsActor> {
   return actorPromise;
 }
 
-async function createActor(principal: Principal, host: string): Promise<VfsActor> {
+async function createActor(principal: Principal, host: string): Promise<IcpdbActor> {
   const agent = HttpAgent.createSync({ host });
   if (isLocalHost(host)) {
     await agent.fetchRootKey();
   }
-  return Actor.createActor<VfsActor>((idl) => idlFactory(idl), {
+  return Actor.createActor<IcpdbActor>((idl) => idlFactory(idl), {
     agent,
     canisterId: principal
   });
 }
 
-async function createAuthenticatedActor(canisterId: string, identity: Identity): Promise<VfsActor> {
+async function createAuthenticatedActor(canisterId: string, identity: Identity): Promise<IcpdbActor> {
   const principal = validateCanisterId(canisterId);
   if (typeof principal === "string") {
     const error = invalidCanisterIdError(principal);
@@ -182,13 +182,13 @@ async function createAuthenticatedActor(canisterId: string, identity: Identity):
   if (isLocalHost(host)) {
     await agent.fetchRootKey();
   }
-  return Actor.createActor<VfsActor>((idl) => idlFactory(idl), {
+  return Actor.createActor<IcpdbActor>((idl) => idlFactory(idl), {
     agent,
     canisterId: principal
   });
 }
 
-async function callVfs<T>(operation: () => Promise<T>): Promise<T> {
+async function callIcpdb<T>(operation: () => Promise<T>): Promise<T> {
   try {
     return await operation();
   } catch (error) {
@@ -210,8 +210,8 @@ export function canisterHealth(canisterId: string): Promise<CanisterHealth> {
   if (cached) {
     return cached;
   }
-  const request = callVfs(async () => {
-    const actor = await createVfsActor(canisterId);
+  const request = callIcpdb(async () => {
+    const actor = await createIcpdbActor(canisterId);
     return normalizeCanisterHealth(await actor.canister_health());
   }).catch((error) => {
     healthCache.delete(canisterId);
@@ -222,7 +222,7 @@ export function canisterHealth(canisterId: string): Promise<CanisterHealth> {
 }
 
 export async function listDatabasesAuthenticated(canisterId: string, identity: Identity): Promise<DatabaseSummary[]> {
-  return callVfs(async () => {
+  return callIcpdb(async () => {
     const actor = await createAuthenticatedActor(canisterId, identity);
     const result = await actor.list_databases();
     if ("Err" in result) {
@@ -233,7 +233,7 @@ export async function listDatabasesAuthenticated(canisterId: string, identity: I
 }
 
 export async function createDatabaseAuthenticated(canisterId: string, identity: Identity): Promise<string> {
-  return callVfs(async () => {
+  return callIcpdb(async () => {
     const actor = await createAuthenticatedActor(canisterId, identity);
     const result = await actor.create_database();
     if ("Err" in result) {
@@ -244,7 +244,7 @@ export async function createDatabaseAuthenticated(canisterId: string, identity: 
 }
 
 export async function getUsageAuthenticated(canisterId: string, identity: Identity, databaseId: string): Promise<DatabaseUsage> {
-  return callVfs(async () => {
+  return callIcpdb(async () => {
     const actor = await createAuthenticatedActor(canisterId, identity);
     const result = await actor.get_usage(databaseId);
     if ("Err" in result) {
@@ -255,7 +255,7 @@ export async function getUsageAuthenticated(canisterId: string, identity: Identi
 }
 
 export async function getBillingAuthenticated(canisterId: string, identity: Identity, databaseId: string): Promise<DatabaseBilling> {
-  return callVfs(async () => {
+  return callIcpdb(async () => {
     const actor = await createAuthenticatedActor(canisterId, identity);
     const result = await actor.get_billing(databaseId);
     if ("Err" in result) {
@@ -271,7 +271,7 @@ export async function getDepositQuoteAuthenticated(
   databaseId: string,
   amountE8s: string
 ): Promise<DepositQuote> {
-  return callVfs(async () => {
+  return callIcpdb(async () => {
     const actor = await createAuthenticatedActor(canisterId, identity);
     const result = await actor.get_deposit_quote(databaseId, BigInt(amountE8s));
     if ("Err" in result) {
@@ -287,7 +287,7 @@ export async function depositWithApprovalAuthenticated(
   databaseId: string,
   amountE8s: string
 ): Promise<DepositResult> {
-  return callVfs(async () => {
+  return callIcpdb(async () => {
     const actor = await createAuthenticatedActor(canisterId, identity);
     const result = await actor.deposit_with_approval(databaseId, BigInt(amountE8s));
     if ("Err" in result) {
@@ -298,7 +298,7 @@ export async function depositWithApprovalAuthenticated(
 }
 
 export async function listPaymentsAuthenticated(canisterId: string, identity: Identity, databaseId: string): Promise<PaymentRecord[]> {
-  return callVfs(async () => {
+  return callIcpdb(async () => {
     const actor = await createAuthenticatedActor(canisterId, identity);
     const result = await actor.list_payments(databaseId);
     if ("Err" in result) {
@@ -315,7 +315,7 @@ export async function createDatabaseTokenAuthenticated(
   name: string,
   scope: DatabaseTokenScope
 ): Promise<CreateDatabaseTokenResponse> {
-  return callVfs(async () => {
+  return callIcpdb(async () => {
     const actor = await createAuthenticatedActor(canisterId, identity);
     const result = await actor.create_database_token({
       database_id: databaseId,
@@ -333,7 +333,7 @@ export async function createDatabaseTokenAuthenticated(
 }
 
 export async function listDatabaseTokensAuthenticated(canisterId: string, identity: Identity, databaseId: string): Promise<DatabaseTokenInfo[]> {
-  return callVfs(async () => {
+  return callIcpdb(async () => {
     const actor = await createAuthenticatedActor(canisterId, identity);
     const result = await actor.list_database_tokens(databaseId);
     if ("Err" in result) {
@@ -344,7 +344,7 @@ export async function listDatabaseTokensAuthenticated(canisterId: string, identi
 }
 
 export async function sqlQueryAuthenticated(canisterId: string, identity: Identity, request: SqlExecuteRequest): Promise<SqlExecuteResponse> {
-  return callVfs(async () => {
+  return callIcpdb(async () => {
     const actor = await createAuthenticatedActor(canisterId, identity);
     const result = await actor.sql_query(rawSqlRequest(request));
     if ("Err" in result) {
@@ -355,7 +355,7 @@ export async function sqlQueryAuthenticated(canisterId: string, identity: Identi
 }
 
 export async function sqlExecuteAuthenticated(canisterId: string, identity: Identity, request: SqlExecuteRequest): Promise<SqlExecuteResponse> {
-  return callVfs(async () => {
+  return callIcpdb(async () => {
     const actor = await createAuthenticatedActor(canisterId, identity);
     const result = await actor.sql_execute(rawSqlRequest(request));
     if ("Err" in result) {

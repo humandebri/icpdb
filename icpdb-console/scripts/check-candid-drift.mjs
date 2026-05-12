@@ -5,8 +5,8 @@ import { didTypeAliases, expectedMethods, expectedTypes } from "./candid-shapes.
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = join(here, "..", "..");
-const did = readFileSync(join(root, "crates", "vfs_canister", "vfs.did"), "utf8");
-const idl = readFileSync(join(here, "..", "lib", "vfs-idl.ts"), "utf8");
+const did = readFileSync(join(root, "crates", "icpdb_canister", "icpdb.did"), "utf8");
+const idl = readFileSync(join(here, "..", "lib", "icpdb-idl.ts"), "utf8");
 
 const didTypes = parseDidTypes(did);
 const didMethods = parseDidMethods(did);
@@ -15,18 +15,18 @@ const idlMethods = parseIdlMethods(idl);
 const failures = [];
 
 for (const [name, shape] of Object.entries(expectedTypes)) {
-  compareShape(`vfs.did type ${name}`, didTypes[didTypeAliases[name] ?? name], shape);
-  compareShape(`vfs-idl.ts type ${name}`, idlTypes[name], shape);
+  compareShape(`icpdb.did type ${name}`, didTypes[didTypeAliases[name] ?? name], shape);
+  compareShape(`icpdb-idl.ts type ${name}`, idlTypes[name], shape);
 }
 
 for (const [name, shape] of Object.entries(expectedMethods)) {
-  compareMethod(`vfs.did method ${name}`, didMethods[name], shape);
-  compareMethod(`vfs-idl.ts method ${name}`, idlMethods[name], shape);
+  compareMethod(`icpdb.did method ${name}`, didMethods[name], shape);
+  compareMethod(`icpdb-idl.ts method ${name}`, idlMethods[name], shape);
 }
 
 for (const name of Object.keys(idlMethods)) {
   if (!(name in expectedMethods)) {
-    failures.push(`unexpected wikibrowser IDL method: ${name}`);
+    failures.push(`unexpected icpdb-console IDL method: ${name}`);
   }
 }
 

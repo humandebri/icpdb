@@ -1,8 +1,8 @@
 [workspace]
 members = [
-    "crates/vfs_runtime",
-    "crates/vfs_types",
-    "crates/vfs_canister",
+    "crates/icpdb_runtime",
+    "crates/icpdb_types",
+    "crates/icpdb_canister",
 ]
 resolver = "2"
 

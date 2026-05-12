@@ -1,13 +1,13 @@
-// Where: crates/vfs_runtime/src/sql.rs
+// Where: crates/icpdb_runtime/src/sql.rs
 // What: Bounded raw SQLite execution for canister-hosted databases.
 // Why: ICPDB exposes SQLite directly while keeping read/write calls and response size constrained.
 use std::path::Path;
 
+use icpdb_types::{SqlExecuteRequest, SqlExecuteResponse, SqlStatement, SqlValue};
 use rusqlite::{
     Connection, OpenFlags, Statement, params_from_iter,
     types::{Value, ValueRef},
 };
-use vfs_types::{SqlExecuteRequest, SqlExecuteResponse, SqlStatement, SqlValue};
 
 pub const DEFAULT_SQL_MAX_ROWS: u32 = 100;
 pub const MAX_SQL_ROWS: u32 = 500;

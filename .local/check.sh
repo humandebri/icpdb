@@ -18,5 +18,5 @@ cargo fmt --all -- --check
 cargo test --workspace --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
 
-ICP_WASM_OUTPUT_PATH="${TMPDIR:-/tmp}/vfs_canister.wasm" \
-  bash scripts/build-vfs-canister.sh
+ICP_WASM_OUTPUT_PATH="${TMPDIR:-/tmp}/icpdb_canister.wasm" \
+  bash scripts/build-icpdb-canister.sh

@@ -1,4 +1,4 @@
-// Where: crates/vfs_types/src/fs.rs
+// Where: crates/icpdb_types/src/fs.rs
 // What: Shared database lifecycle, billing, deposit, and token contracts.
 // Why: Runtime, canister, and frontend bindings must agree on stable ICPDB transport types.
 use candid::CandidType;

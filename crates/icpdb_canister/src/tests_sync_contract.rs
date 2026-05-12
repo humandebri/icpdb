@@ -1,4 +1,4 @@
-// Where: crates/vfs_canister/src/tests_sync_contract.rs
+// Where: crates/icpdb_canister/src/tests_sync_contract.rs
 // What: Candid contract tests for the ICPDB public API.
 // Why: The checked-in DID must track the SQL hosting surface and exclude retired methods.
 
@@ -30,17 +30,17 @@ const REMOVED_METHODS: &[&str] = &[
 ];
 
 #[test]
-fn exported_candid_matches_checked_in_vfs_did() {
+fn exported_candid_matches_checked_in_icpdb_did() {
     assert_eq!(
         super::candid_interface().trim_end(),
-        include_str!("../vfs.did").trim_end()
+        include_str!("../icpdb.did").trim_end()
     );
 }
 
 #[test]
 fn candid_excludes_retired_methods() {
     let generated = super::candid_interface();
-    let checked_in = include_str!("../vfs.did");
+    let checked_in = include_str!("../icpdb.did");
 
     for did in [generated.as_str(), checked_in] {
         for method in REMOVED_METHODS {

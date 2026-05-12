@@ -1,4 +1,4 @@
-// wikibrowser/app/icpdb/page.tsx
+// icpdb-console/app/icpdb/page.tsx
 // ICPDB console shell: exposes only the live MVP surface backed by the canister.
 
 import type { Metadata } from "next";

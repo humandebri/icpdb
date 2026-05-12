@@ -4,7 +4,7 @@ canisters:
       steps:
         - type: script
           commands:
-            - bash scripts/build-vfs-canister.sh
+            - bash scripts/build-icpdb-canister.sh
 
 networks:
   - name: local-icpdb

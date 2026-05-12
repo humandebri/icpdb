@@ -1,5 +1,5 @@
 [package]
-name = "vfs-canister"
+name = "icpdb-canister"
 version = "0.1.0"
 edition = "2024"
 
@@ -15,8 +15,8 @@ icrc-ledger-types = "0.1.13"
 serde_json = "1.0.145"
 serde = { version = "1.0.228", features = ["derive"] }
 sha2 = "0.10.9"
-vfs-runtime = { path = "../vfs_runtime" }
-vfs-types = { path = "../vfs_types" }
+icpdb-runtime = { path = "../icpdb_runtime" }
+icpdb-types = { path = "../icpdb_types" }
 
 [dev-dependencies]
 tempfile = "3.23.0"

@@ -1,4 +1,4 @@
-// Where: crates/vfs_canister/src/tests.rs
+// Where: crates/icpdb_canister/src/tests.rs
 // What: Entry-point level tests for the ICPDB canister surface.
 // Why: SQL hosting, billing, deposit, and lifecycle wrappers need direct coverage.
 use std::future::Future;
@@ -6,14 +6,14 @@ use std::sync::Arc;
 use std::task::{Context, Poll, Wake, Waker};
 
 use candid::Nat;
-use icrc_ledger_types::icrc2::transfer_from::TransferFromError;
-use sha2::{Digest, Sha256};
-use tempfile::tempdir;
-use vfs_runtime::VfsService;
-use vfs_types::{
+use icpdb_runtime::IcpdbService;
+use icpdb_types::{
     DatabaseBalanceTopUpRequest, DatabaseBillingStatus, DatabaseRole, DatabaseStatus,
     SqlExecuteRequest,
 };
+use icrc_ledger_types::icrc2::transfer_from::TransferFromError;
+use sha2::{Digest, Sha256};
+use tempfile::tempdir;
 
 use super::{
     PENDING_DEPOSITS, SERVICE, acquire_deposit_guard_for_test, begin_database_archive,
@@ -48,7 +48,7 @@ fn install_test_service() {
     PENDING_DEPOSITS.with(|pending| pending.borrow_mut().clear());
     let dir = tempdir().expect("tempdir should create");
     let root = dir.keep();
-    let service = VfsService::new(root.join("index.sqlite3"), root.join("databases"));
+    let service = IcpdbService::new(root.join("index.sqlite3"), root.join("databases"));
     service
         .run_index_migrations()
         .expect("index migrations should run");
@@ -65,7 +65,7 @@ fn install_empty_test_service() {
     PENDING_DEPOSITS.with(|pending| pending.borrow_mut().clear());
     let dir = tempdir().expect("tempdir should create");
     let root = dir.keep();
-    let service = VfsService::new(root.join("index.sqlite3"), root.join("databases"));
+    let service = IcpdbService::new(root.join("index.sqlite3"), root.join("databases"));
     service
         .run_index_migrations()
         .expect("index migrations should run");
@@ -99,7 +99,7 @@ fn sql_request(database_id: &str, sql: &str) -> SqlExecuteRequest {
 fn empty_index_does_not_create_default_database() {
     let dir = tempdir().expect("tempdir should create");
     let root = dir.keep();
-    let service = VfsService::new(root.join("index.sqlite3"), root.join("databases"));
+    let service = IcpdbService::new(root.join("index.sqlite3"), root.join("databases"));
     service
         .run_index_migrations()
         .expect("index migrations should run");
@@ -114,7 +114,7 @@ fn empty_index_does_not_create_default_database() {
 fn existing_database_index_is_loaded_without_implicit_default() {
     let dir = tempdir().expect("tempdir should create");
     let root = dir.keep();
-    let service = VfsService::new(root.join("index.sqlite3"), root.join("databases"));
+    let service = IcpdbService::new(root.join("index.sqlite3"), root.join("databases"));
     service
         .run_index_migrations()
         .expect("index migrations should run");
@@ -315,7 +315,7 @@ fn canister_create_database_returns_generated_id_for_followup_reads() {
 }
 
 #[test]
-fn sql_query_charges_billing_without_usage_event() {
+fn sql_query_does_not_charge_billing_or_usage_event() {
     install_test_service();
 
     let before = get_billing("default".to_string()).expect("billing should load");
@@ -323,7 +323,8 @@ fn sql_query_charges_billing_without_usage_event() {
     let after = get_billing("default".to_string()).expect("billing should load");
 
     assert_eq!(response.rows.len(), 1);
-    assert_eq!(after.spent_units, before.spent_units + 1);
+    assert_eq!(after.balance_units, before.balance_units);
+    assert_eq!(after.spent_units, before.spent_units);
     assert_eq!(usage_event_count(), 0);
 }
 
@@ -363,7 +364,7 @@ fn revoke_database_access_validates_and_canonicalizes_principal() {
 fn anonymous_reader_grant_allows_public_query() {
     let dir = tempdir().expect("tempdir should create");
     let root = dir.keep();
-    let service = VfsService::new(root.join("index.sqlite3"), root.join("databases"));
+    let service = IcpdbService::new(root.join("index.sqlite3"), root.join("databases"));
     service
         .run_index_migrations()
         .expect("index migrations should run");
@@ -510,7 +511,7 @@ fn cancel_database_archive_entrypoint_returns_database_to_hot() {
 fn cancel_database_archive_entrypoint_rejects_non_owner() {
     let dir = tempdir().expect("tempdir should create");
     let root = dir.keep();
-    let service = VfsService::new(root.join("index.sqlite3"), root.join("databases"));
+    let service = IcpdbService::new(root.join("index.sqlite3"), root.join("databases"));
     service
         .run_index_migrations()
         .expect("index migrations should run");

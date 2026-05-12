@@ -24,5 +24,5 @@ When changing any patched revision:
 
 - verify mount IDs above `255` can be allocated and used for a database file
 - run `./.local/check.sh`
-- confirm `crates/vfs_canister/vfs.did` still matches the generated Candid interface
+- confirm `crates/icpdb_canister/icpdb.did` still matches the generated Candid interface
 - review archive/restore smoke coverage because restore allocates a fresh mount ID

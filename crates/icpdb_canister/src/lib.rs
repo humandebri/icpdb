@@ -1,5 +1,5 @@
-// Where: crates/vfs_canister/src/lib.rs
-// What: ICP canister entrypoints backed by VfsService for ICPDB SQL hosting.
+// Where: crates/icpdb_canister/src/lib.rs
+// What: ICP canister entrypoints backed by IcpdbService for ICPDB SQL hosting.
 // Why: The canister exposes database lifecycle, SQL, billing, deposit, and token APIs.
 use std::cell::RefCell;
 use std::collections::BTreeSet;
@@ -14,6 +14,14 @@ use ic_cdk::call::Call;
 use ic_cdk::{init, post_upgrade, query, update};
 use ic_stable_structures::DefaultMemoryImpl;
 use ic_stable_structures::memory_manager::{MemoryId, MemoryManager};
+use icpdb_runtime::{DatabaseMeta, IcpdbService, UsageEvent, hash_api_token};
+use icpdb_types::{
+    CanisterHealth, CreateDatabaseTokenRequest, CreateDatabaseTokenResponse, DatabaseArchiveChunk,
+    DatabaseArchiveInfo, DatabaseBalanceTopUpRequest, DatabaseBilling, DatabaseMember,
+    DatabaseQuotaRequest, DatabaseRestoreChunkRequest, DatabaseRole, DatabaseSummary,
+    DatabaseTokenInfo, DatabaseUsage, DepositQuote, DepositResult, PaymentRecord, SqlBatchRequest,
+    SqlExecuteRequest, SqlExecuteResponse,
+};
 #[cfg(not(test))]
 use icrc_ledger_types::icrc1::account::Account;
 #[cfg(not(test))]
@@ -21,14 +29,6 @@ use icrc_ledger_types::icrc2::transfer_from::TransferFromArgs;
 use icrc_ledger_types::icrc2::transfer_from::TransferFromError;
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use vfs_runtime::{DatabaseMeta, UsageEvent, VfsService, hash_api_token};
-use vfs_types::{
-    CanisterHealth, CreateDatabaseTokenRequest, CreateDatabaseTokenResponse, DatabaseArchiveChunk,
-    DatabaseArchiveInfo, DatabaseBalanceTopUpRequest, DatabaseBilling, DatabaseMember,
-    DatabaseQuotaRequest, DatabaseRestoreChunkRequest, DatabaseRole, DatabaseSummary,
-    DatabaseTokenInfo, DatabaseUsage, DepositQuote, DepositResult, PaymentRecord, SqlBatchRequest,
-    SqlExecuteRequest, SqlExecuteResponse,
-};
 
 const INDEX_DB_PATH: &str = "./DB/index.sqlite3";
 const DATABASES_DIR: &str = "./DB/databases";
@@ -77,7 +77,7 @@ struct HttpUpdateResponse {
 thread_local! {
     static MEMORY_MANAGER: RefCell<MemoryManager<DefaultMemoryImpl>> =
         RefCell::new(MemoryManager::init(DefaultMemoryImpl::default()));
-    static SERVICE: RefCell<Option<VfsService>> = const { RefCell::new(None) };
+    static SERVICE: RefCell<Option<IcpdbService>> = const { RefCell::new(None) };
     static PENDING_DEPOSITS: RefCell<BTreeSet<String>> = const { RefCell::new(BTreeSet::new()) };
 }
 
@@ -513,7 +513,7 @@ fn initialize_or_trap() {
 
 fn initialize_service() -> Result<(), String> {
     initialize_wasi_storage()?;
-    let service = VfsService::new(PathBuf::from(INDEX_DB_PATH), PathBuf::from(DATABASES_DIR));
+    let service = IcpdbService::new(PathBuf::from(INDEX_DB_PATH), PathBuf::from(DATABASES_DIR));
     service.run_index_migrations()?;
     for meta in service.list_databases()? {
         mount_database_file(&meta)?;
@@ -792,15 +792,17 @@ fn handle_http_json(request: HttpUpdateRequest) -> Result<HttpUpdateResponse, (u
     let now = now_millis();
     with_service(|service| {
         let required_role = match request.url.split('?').next().unwrap_or("") {
-            "/v1/sql/query" => vfs_runtime::RequiredRole::Reader,
-            "/v1/sql/execute" => vfs_runtime::RequiredRole::Writer,
+            "/v1/sql/query" => icpdb_runtime::RequiredRole::Reader,
+            "/v1/sql/execute" => icpdb_runtime::RequiredRole::Writer,
             _ => return Err("unknown endpoint".to_string()),
         };
         let auth = service.authenticate_database_token(token, required_role, now)?;
         match required_role {
-            vfs_runtime::RequiredRole::Reader => service.sql_query_with_token(&auth, sql_request),
-            vfs_runtime::RequiredRole::Writer => service.sql_execute_with_token(&auth, sql_request),
-            vfs_runtime::RequiredRole::Owner => {
+            icpdb_runtime::RequiredRole::Reader => service.sql_query_with_token(&auth, sql_request),
+            icpdb_runtime::RequiredRole::Writer => {
+                service.sql_execute_with_token(&auth, sql_request)
+            }
+            icpdb_runtime::RequiredRole::Owner => {
                 Err("owner token endpoint is not supported".to_string())
             }
         }
@@ -936,7 +938,7 @@ fn cycle_balance() -> u128 {
 
 fn with_usage<T, F>(method: &str, database_id: Option<String>, f: F) -> Result<T, String>
 where
-    F: FnOnce(&VfsService, &str, i64) -> Result<T, String>,
+    F: FnOnce(&IcpdbService, &str, i64) -> Result<T, String>,
 {
     let caller = caller_text();
     let now = now_millis();
@@ -965,7 +967,7 @@ where
 
 fn with_service<T, F>(f: F) -> Result<T, String>
 where
-    F: FnOnce(&VfsService) -> Result<T, String>,
+    F: FnOnce(&IcpdbService) -> Result<T, String>,
 {
     SERVICE.with(|slot| {
         let borrowed = slot.borrow();

@@ -1,29 +1,29 @@
-// Where: crates/vfs_runtime/tests/database_service.rs
+// Where: crates/icpdb_runtime/tests/database_service.rs
 // What: Multi-database service tests over local SQLite files.
 // Why: The canister mount layer depends on runtime index and role semantics being deterministic.
 use std::path::PathBuf;
 
-use rusqlite::{Connection, params};
-use sha2::{Digest, Sha256};
-use tempfile::tempdir;
-use vfs_runtime::{
-    ICP_TRANSFER_FEE_E8S_DEFAULT, ICPDB_UNITS_PER_ICP, MAX_ARCHIVE_CHUNK_BYTES,
+use icpdb_runtime::{
+    ICP_TRANSFER_FEE_E8S_DEFAULT, ICPDB_UNITS_PER_ICP, IcpdbService, MAX_ARCHIVE_CHUNK_BYTES,
     MAX_DATABASE_SIZE_BYTES, MAX_RESTORE_CHUNK_BYTES, MIN_DEPOSIT_E8S, SQL_EXECUTE_BILLING_UNITS,
-    SQL_QUERY_BILLING_UNITS, USAGE_EVENTS_RETENTION_LIMIT, UsageEvent, VfsService, hash_api_token,
+    USAGE_EVENTS_RETENTION_LIMIT, UsageEvent, hash_api_token,
 };
-use vfs_types::{
+use icpdb_types::{
     CreateDatabaseTokenRequest, DatabaseBalanceTopUpRequest, DatabaseBillingStatus, DatabaseRole,
     DatabaseStatus, DatabaseTokenScope, SqlBatchRequest, SqlExecuteRequest, SqlStatement, SqlValue,
 };
+use rusqlite::{Connection, params};
+use sha2::{Digest, Sha256};
+use tempfile::tempdir;
 
-fn service() -> VfsService {
+fn service() -> IcpdbService {
     service_with_root().0
 }
 
-fn service_with_root() -> (VfsService, PathBuf) {
+fn service_with_root() -> (IcpdbService, PathBuf) {
     let dir = tempdir().expect("tempdir should create");
     let root = dir.keep();
-    let service = VfsService::new(root.join("index.sqlite3"), root.join("databases"));
+    let service = IcpdbService::new(root.join("index.sqlite3"), root.join("databases"));
     service
         .run_index_migrations()
         .expect("index migrations should run");
@@ -163,7 +163,7 @@ fn usage_event_rows(root: &std::path::Path) -> Vec<UsageEventTuple> {
 }
 
 fn read_archive_in_chunks(
-    service: &VfsService,
+    service: &IcpdbService,
     database_id: &str,
     size_bytes: u64,
     chunk_size: u32,
@@ -183,7 +183,7 @@ fn read_archive_in_chunks(
 }
 
 fn archive_bytes_for_chunk_size(
-    service: &VfsService,
+    service: &IcpdbService,
     database_id: &str,
     size_bytes: u64,
     chunk_size: u32,
@@ -355,7 +355,7 @@ fn sql_query_rejects_writes() {
 }
 
 #[test]
-fn sql_query_charges_billing_units_and_blocks_empty_balance() {
+fn sql_query_is_free_and_allows_empty_balance() {
     let (service, root) = service_with_root();
     let meta = service
         .create_generated_database("owner", 1)
@@ -374,14 +374,12 @@ fn sql_query_charges_billing_units_and_blocks_empty_balance() {
                 max_rows: Some(1),
             },
         )
-        .expect("query should charge");
+        .expect("query should succeed");
     let charged = service
         .database_billing(&meta.database_id, "owner")
         .expect("billing should load after query");
-    assert_eq!(
-        initial.balance_units - charged.balance_units,
-        SQL_QUERY_BILLING_UNITS
-    );
+    assert_eq!(charged.balance_units, initial.balance_units);
+    assert_eq!(charged.spent_units, initial.spent_units);
 
     let conn = Connection::open(root.join("index.sqlite3")).expect("index should open");
     conn.execute(
@@ -389,7 +387,7 @@ fn sql_query_charges_billing_units_and_blocks_empty_balance() {
         params![meta.database_id],
     )
     .expect("test balance should update");
-    let error = service
+    let response = service
         .sql_query(
             "owner",
             SqlExecuteRequest {
@@ -399,14 +397,14 @@ fn sql_query_charges_billing_units_and_blocks_empty_balance() {
                 max_rows: Some(1),
             },
         )
-        .expect_err("empty balance should block query");
-    assert!(error.starts_with("database billing balance exhausted:"));
+        .expect("empty balance should still allow query");
+    assert_eq!(response.rows.len(), 1);
     assert_eq!(
         service
             .database_billing(&meta.database_id, "owner")
-            .expect("billing should load suspended")
+            .expect("billing should load")
             .status,
-        DatabaseBillingStatus::Suspended
+        DatabaseBillingStatus::Active
     );
 }
 
@@ -545,7 +543,7 @@ fn database_quota_blocks_oversized_sql_write_and_rolls_back() {
     service
         .set_database_quota(
             "owner",
-            vfs_types::DatabaseQuotaRequest {
+            icpdb_types::DatabaseQuotaRequest {
                 database_id: meta.database_id.clone(),
                 max_logical_size_bytes: usage.logical_size_bytes + 4096,
             },
@@ -592,7 +590,7 @@ fn set_database_quota_rejects_values_below_current_size() {
     let error = service
         .set_database_quota(
             "owner",
-            vfs_types::DatabaseQuotaRequest {
+            icpdb_types::DatabaseQuotaRequest {
                 database_id: meta.database_id,
                 max_logical_size_bytes: usage.logical_size_bytes.saturating_sub(1),
             },
@@ -621,7 +619,7 @@ fn database_tokens_authorize_http_sql_by_scope_and_track_last_use() {
         )
         .expect("read token should create");
     let auth = service
-        .authenticate_database_token("secret-read", vfs_runtime::RequiredRole::Reader, 11)
+        .authenticate_database_token("secret-read", icpdb_runtime::RequiredRole::Reader, 11)
         .expect("read token should authenticate");
     assert_eq!(auth.database_id, "alpha");
 
@@ -638,7 +636,7 @@ fn database_tokens_authorize_http_sql_by_scope_and_track_last_use() {
         .expect("read token should query");
     assert_eq!(usage.rows.len(), 1);
     let error = service
-        .authenticate_database_token("secret-read", vfs_runtime::RequiredRole::Writer, 12)
+        .authenticate_database_token("secret-read", icpdb_runtime::RequiredRole::Writer, 12)
         .expect_err("read token should not write");
     assert_eq!(error, "api token scope does not allow this operation");
 
@@ -709,7 +707,7 @@ fn billing_units_are_charged_and_exhaustion_suspends_database() {
     service
         .top_up_database_balance(DatabaseBalanceTopUpRequest {
             database_id: "alpha".to_string(),
-            units: SQL_QUERY_BILLING_UNITS,
+            units: 1,
         })
         .expect("top-up should reactivate");
 }

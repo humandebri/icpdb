@@ -8,11 +8,11 @@ on:
   workflow_dispatch:
 
 jobs:
-  wikibrowser-check:
+  icpdb-console-check:
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: wikibrowser
+        working-directory: icpdb-console
     steps:
       - uses: actions/checkout@v5
       - name: Enable corepack
@@ -22,7 +22,7 @@ jobs:
         with:
           node-version: 24
           cache: pnpm
-          cache-dependency-path: wikibrowser/pnpm-lock.yaml
+          cache-dependency-path: icpdb-console/pnpm-lock.yaml
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
       - name: Run tests
@@ -56,9 +56,9 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Run tests
-        run: cargo test -p vfs-runtime -p vfs-canister --locked
+        run: cargo test -p icpdb-runtime -p icpdb-canister --locked
       - name: Run clippy
-        run: cargo clippy -p vfs-runtime -p vfs-canister --all-targets --locked -- -D warnings
+        run: cargo clippy -p icpdb-runtime -p icpdb-canister --all-targets --locked -- -D warnings
 
   canister-build:
     runs-on: ubuntu-latest
@@ -85,5 +85,5 @@ jobs:
         run: cargo install wasi2ic ic-wasm --locked
       - name: Build canister artifact
         env:
-          ICP_WASM_OUTPUT_PATH: /tmp/vfs_canister.wasm
-        run: bash scripts/build-vfs-canister.sh
+          ICP_WASM_OUTPUT_PATH: /tmp/icpdb_canister.wasm
+        run: bash scripts/build-icpdb-canister.sh

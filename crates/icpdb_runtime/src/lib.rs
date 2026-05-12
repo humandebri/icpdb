@@ -1,4 +1,4 @@
-// Where: crates/vfs_runtime/src/lib.rs
+// Where: crates/icpdb_runtime/src/lib.rs
 // What: Service orchestration for multiple hosted SQLite databases.
 // Why: One canister can host isolated SQL databases with shared lifecycle, quota, and billing.
 mod sql;
@@ -7,14 +7,14 @@ use std::fs::{File, OpenOptions, create_dir_all, metadata, remove_file};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use rusqlite::{Connection, OptionalExtension, params};
-use sha2::{Digest, Sha256};
-use vfs_types::{
+use icpdb_types::{
     DatabaseArchiveInfo, DatabaseBalanceTopUpRequest, DatabaseBilling, DatabaseBillingStatus,
     DatabaseInfo, DatabaseMember, DatabaseQuotaRequest, DatabaseRole, DatabaseStatus,
     DatabaseSummary, DatabaseTokenInfo, DatabaseTokenScope, DatabaseUsage, DepositQuote,
     DepositResult, PaymentRecord, SqlBatchRequest, SqlExecuteRequest, SqlExecuteResponse,
 };
+use rusqlite::{Connection, OptionalExtension, params};
+use sha2::{Digest, Sha256};
 
 const INDEX_SCHEMA_VERSION_INITIAL: &str = "database_index:000_initial";
 const INDEX_SCHEMA_VERSION_LIFECYCLE: &str = "database_index:001_lifecycle";
@@ -48,7 +48,6 @@ const GENERATED_TOKEN_ID_PREFIX: &str = "tok_";
 const GENERATED_TOKEN_ID_HASH_CHARS: usize = 12;
 const GENERATED_PAYMENT_ID_PREFIX: &str = "pay_";
 const GENERATED_PAYMENT_ID_HASH_CHARS: usize = 12;
-pub const SQL_QUERY_BILLING_UNITS: u64 = 1;
 pub const SQL_EXECUTE_BILLING_UNITS: u64 = 5;
 pub const ICP_E8S_PER_ICP: u64 = 100_000_000;
 pub const ICPDB_UNITS_PER_ICP: u64 = 100_000;
@@ -106,12 +105,12 @@ pub struct AuthenticatedDatabaseToken {
     pub scope: DatabaseTokenScope,
 }
 
-pub struct VfsService {
+pub struct IcpdbService {
     index_path: PathBuf,
     databases_dir: PathBuf,
 }
 
-impl VfsService {
+impl IcpdbService {
     pub fn new(index_path: PathBuf, databases_dir: PathBuf) -> Self {
         Self {
             index_path,
@@ -418,7 +417,7 @@ impl VfsService {
     pub fn create_database_token(
         &self,
         caller: &str,
-        request: vfs_types::CreateDatabaseTokenRequest,
+        request: icpdb_types::CreateDatabaseTokenRequest,
         token_hash: Vec<u8>,
         now: i64,
     ) -> Result<DatabaseTokenInfo, String> {
@@ -1137,8 +1136,7 @@ impl VfsService {
         request: SqlExecuteRequest,
     ) -> Result<SqlExecuteResponse, String> {
         let database_id = request.database_id.clone();
-        self.ensure_database_has_units(&database_id, SQL_QUERY_BILLING_UNITS)?;
-        let result = self.with_database_path(
+        self.with_database_path(
             &database_id,
             caller,
             RequiredRole::Reader,
@@ -1150,11 +1148,7 @@ impl VfsService {
                     max_database_size_bytes,
                 )
             },
-        );
-        if result.is_ok() {
-            self.charge_database_units(&database_id, SQL_QUERY_BILLING_UNITS)?;
-        }
-        result
+        )
     }
 
     pub fn sql_execute(
@@ -1221,8 +1215,7 @@ impl VfsService {
         if auth.database_id != request.database_id {
             return Err("api token database_id does not match request".to_string());
         }
-        self.ensure_database_has_units(&auth.database_id, SQL_QUERY_BILLING_UNITS)?;
-        let result = self.with_database_path_for_token(
+        self.with_database_path_for_token(
             &auth.database_id,
             RequiredRole::Reader,
             auth.scope,
@@ -1234,11 +1227,7 @@ impl VfsService {
                     max_database_size_bytes,
                 )
             },
-        );
-        if result.is_ok() {
-            self.charge_database_units(&auth.database_id, SQL_QUERY_BILLING_UNITS)?;
-        }
-        result
+        )
     }
 
     pub fn sql_execute_with_token(

@@ -51,11 +51,13 @@ Deleting or archiving a DB releases the active mount. It does not imply that can
 
 ## Usage Ledger
 
-`usage_events` records update calls and charged SQL query calls.
+`usage_events` records update calls and charged SQL write calls.
 
 Each event stores method, database ID when present, caller principal, success flag, observed cycle delta, error text, and timestamp.
 The cycle delta is an operational observation from canister balance before and after the call, not a guaranteed one-to-one IC billing statement.
 Only the latest 100,000 events are retained.
+
+Read-only `sql_query` calls are free Candid query calls. They do not change billing balance or usage event state.
 
 ## Delete
 

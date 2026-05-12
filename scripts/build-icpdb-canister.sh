@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Where: scripts/build-vfs-canister.sh
+# Where: scripts/build-icpdb-canister.sh
 # What: Build the release wasm artifact used by the ICPDB canister deployment flow.
 # Why: The canister target pulls in bundled sqlite C code, so wasm32-wasip1 builds need a WASI sysroot when running on Linux.
 
@@ -11,8 +11,8 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 # CARGO_TARGET_DIR to a sandbox cache, which would make cargo and wasi2ic disagree on paths.
 unset CARGO_TARGET_DIR
 TARGET_DIR="${REPO_ROOT}/target/wasm32-wasip1/release"
-INPUT_WASM="${TARGET_DIR}/vfs_canister.wasm"
-OUTPUT_WASM="${TARGET_DIR}/vfs_canister_nowasi.wasm"
+INPUT_WASM="${TARGET_DIR}/icpdb_canister.wasm"
+OUTPUT_WASM="${TARGET_DIR}/icpdb_canister_nowasi.wasm"
 # `icp deploy` sets this; standalone runs default to the repo artifact path.
 ICP_WASM_OUTPUT_PATH="${ICP_WASM_OUTPUT_PATH:-${OUTPUT_WASM}}"
 
@@ -23,7 +23,7 @@ configure_wasi_cc_env
 build_cmd=(
   cargo build
   --manifest-path "${REPO_ROOT}/Cargo.toml"
-  --package vfs-canister
+  --package icpdb-canister
   --release
   --locked
   --target wasm32-wasip1
@@ -59,6 +59,6 @@ fi
 ic-wasm "${ICP_WASM_OUTPUT_PATH}" \
   -o "${ICP_WASM_OUTPUT_PATH}" \
   metadata candid:service \
-  -f "${REPO_ROOT}/crates/vfs_canister/vfs.did" \
+  -f "${REPO_ROOT}/crates/icpdb_canister/icpdb.did" \
   -v public \
   --keep-name-section

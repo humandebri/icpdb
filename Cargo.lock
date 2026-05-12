@@ -341,9 +341,9 @@ checksum = "7360491ce676a36bf9bb3c56c1aa791658183a54d2744120f27285738d90465a"
 
 [[package]]
 name = "fastrand"
-version = "2.4.0"
+version = "2.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a043dc74da1e37d6afe657061213aa6f425f855399a11d3463c6ecccc4dfda1f"
+checksum = "9f1f227452a390804cdb637b74a86990f2a7d7ba4b7d5693aac9b4dd6defd8d6"
 
 [[package]]
 name = "find-msvc-tools"
@@ -577,6 +577,41 @@ dependencies = [
  "serde",
  "sha2",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "icpdb-canister"
+version = "0.1.0"
+dependencies = [
+ "candid",
+ "ic-cdk 0.20.0",
+ "ic-stable-structures 0.7.2",
+ "ic-wasi-polyfill",
+ "icpdb-runtime",
+ "icpdb-types",
+ "icrc-ledger-types",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
+name = "icpdb-runtime"
+version = "0.1.0"
+dependencies = [
+ "icpdb-types",
+ "rusqlite",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
+name = "icpdb-types"
+version = "0.1.0"
+dependencies = [
+ "candid",
+ "serde",
 ]
 
 [[package]]
@@ -1195,41 +1230,6 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
-
-[[package]]
-name = "vfs-canister"
-version = "0.1.0"
-dependencies = [
- "candid",
- "ic-cdk 0.20.0",
- "ic-stable-structures 0.7.2",
- "ic-wasi-polyfill",
- "icrc-ledger-types",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "vfs-runtime",
- "vfs-types",
-]
-
-[[package]]
-name = "vfs-runtime"
-version = "0.1.0"
-dependencies = [
- "rusqlite",
- "sha2",
- "tempfile",
- "vfs-types",
-]
-
-[[package]]
-name = "vfs-types"
-version = "0.1.0"
-dependencies = [
- "candid",
- "serde",
-]
 
 [[package]]
 name = "wasip2"
