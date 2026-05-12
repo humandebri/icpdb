@@ -124,6 +124,7 @@ fn canister_health() -> CanisterHealth {
 
 #[update]
 fn create_database() -> Result<String, String> {
+    require_authenticated()?;
     with_usage("create_database", None, |service, caller, now| {
         let meta = service.reserve_generated_database(caller, now)?;
         if let Err(error) = mount_database_file(&meta) {
@@ -315,6 +316,8 @@ async fn create_database_token(
     request: CreateDatabaseTokenRequest,
 ) -> Result<CreateDatabaseTokenResponse, String> {
     let database_id = request.database_id.clone();
+    let caller = caller_text();
+    with_service(|service| service.validate_create_database_token(&caller, &request))?;
     let token = random_api_token().await?;
     let token_hash = hash_api_token(&token);
     let info = with_usage(
@@ -348,13 +351,7 @@ fn delete_database(database_id: String) -> Result<(), String> {
         "delete_database",
         Some(database_id.clone()),
         |service, caller, now| {
-            let meta = service.list_databases().and_then(|databases| {
-                databases
-                    .into_iter()
-                    .find(|meta| meta.database_id == database_id)
-                    .ok_or_else(|| format!("database not found: {database_id}"))
-            })?;
-            service.delete_database(&database_id, caller, now)?;
+            let meta = service.delete_database(&database_id, caller, now)?;
             unmount_database_file(&meta.db_file_name);
             Ok(())
         },
@@ -462,8 +459,13 @@ fn finalize_database_restore(database_id: String) -> Result<(), String> {
         "finalize_database_restore",
         Some(database_id.clone()),
         |service, caller, now| {
-            let meta = service.finalize_database_restore(&database_id, caller, now)?;
-            mount_database_file(&meta)
+            let meta = service.prepare_database_restore_finalize(&database_id, caller)?;
+            mount_database_file(&meta)?;
+            if let Err(error) = service.complete_database_restore(&database_id, caller, now) {
+                unmount_database_file(&meta.db_file_name);
+                return Err(error);
+            }
+            Ok(())
         },
     )
 }
@@ -490,12 +492,18 @@ fn sql_batch(request: SqlBatchRequest) -> Result<Vec<SqlExecuteResponse>, String
 }
 
 #[query]
-fn http_request(_request: HttpRequest) -> HttpResponse {
-    HttpResponse {
-        status_code: 200,
-        headers: json_headers(),
-        body: Vec::new(),
-        upgrade: Some(true),
+fn http_request(request: HttpRequest) -> HttpResponse {
+    if !request.method.eq_ignore_ascii_case("POST") {
+        return json_query_response(405, json!({ "error": "only POST is supported" }));
+    }
+    match request.url.split('?').next().unwrap_or("") {
+        "/v1/sql/query" | "/v1/sql/execute" => HttpResponse {
+            status_code: 200,
+            headers: json_headers(),
+            body: Vec::new(),
+            upgrade: Some(true),
+        },
+        _ => json_query_response(404, json!({ "error": "unknown endpoint" })),
     }
 }
 
@@ -759,14 +767,19 @@ fn nat_to_u64(value: &Nat) -> Result<u64, String> {
 
 fn require_controller() -> Result<(), String> {
     let caller = caller_principal();
-    if caller == Principal::anonymous() {
-        return Err("anonymous caller not allowed".to_string());
-    }
+    require_authenticated()?;
     if caller_is_controller(&caller) {
         Ok(())
     } else {
         Err("caller is not a canister controller".to_string())
     }
+}
+
+fn require_authenticated() -> Result<(), String> {
+    if caller_principal() == Principal::anonymous() {
+        return Err("anonymous caller not allowed".to_string());
+    }
+    Ok(())
 }
 
 fn caller_is_controller(caller: &Principal) -> bool {
@@ -812,17 +825,44 @@ fn handle_http_json(request: HttpUpdateRequest) -> Result<HttpUpdateResponse, (u
             .map_err(|error| error.to_string())
             .map(|value| json_response(200, value))
     })
-    .map_err(|error| {
-        let status = if error.contains("token") { 401 } else { 400 };
-        (status, error)
-    })
+    .map_err(|error| (http_error_status(&error), error))
 }
 
 fn bearer_token(headers: &[HeaderField]) -> Option<&str> {
     headers
         .iter()
         .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
-        .and_then(|(_, value)| value.strip_prefix("Bearer "))
+        .and_then(|(_, value)| {
+            let mut parts = value.split_whitespace();
+            let scheme = parts.next()?;
+            let token = parts.next()?;
+            if scheme.eq_ignore_ascii_case("bearer") {
+                Some(token)
+            } else {
+                None
+            }
+        })
+}
+
+fn http_error_status(error: &str) -> u16 {
+    if error == "api token scope does not allow this operation" {
+        return 403;
+    }
+    if error.contains("token") {
+        return 401;
+    }
+    400
+}
+
+fn json_query_response(status_code: u16, value: serde_json::Value) -> HttpResponse {
+    let body = serde_json::to_vec(&value)
+        .unwrap_or_else(|_| b"{\"error\":\"failed to encode response\"}".to_vec());
+    HttpResponse {
+        status_code,
+        headers: json_headers(),
+        body,
+        upgrade: None,
+    }
 }
 
 fn json_response(status_code: u16, value: serde_json::Value) -> HttpUpdateResponse {

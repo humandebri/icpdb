@@ -54,6 +54,7 @@ pub const ICPDB_UNITS_PER_ICP: u64 = 100_000;
 pub const MIN_DEPOSIT_E8S: u64 = 1_000_000;
 pub const ICP_TRANSFER_FEE_E8S_DEFAULT: u64 = 10_000;
 const BILLING_CONFIG_ICP_TRANSFER_FEE_E8S: &str = "icp_transfer_fee_e8s";
+const ANONYMOUS_PRINCIPAL_TEXT: &str = "2vxsx-fae";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DatabaseMeta {
@@ -249,16 +250,14 @@ impl IcpdbService {
         if request.units == 0 {
             return Err("units must be greater than 0".to_string());
         }
+        let units = u64_to_sqlite_i64(request.units, "units")?;
         let conn = self.open_index()?;
         conn.execute(
             "UPDATE databases
              SET billing_balance_units = billing_balance_units + ?2,
                  billing_status = 'active'
              WHERE database_id = ?1",
-            params![
-                &request.database_id,
-                i64::try_from(request.units).unwrap_or(i64::MAX)
-            ],
+            params![&request.database_id, units],
         )
         .map_err(|error| error.to_string())?;
         self.load_database_billing(&request.database_id)
@@ -421,8 +420,7 @@ impl IcpdbService {
         token_hash: Vec<u8>,
         now: i64,
     ) -> Result<DatabaseTokenInfo, String> {
-        self.require_role(&request.database_id, caller, RequiredRole::Owner)?;
-        validate_database_token_name(&request.name)?;
+        self.validate_create_database_token(caller, &request)?;
         validate_token_hash(&token_hash)?;
         let token_id = generated_token_id(&token_hash);
         let conn = self.open_index()?;
@@ -449,6 +447,15 @@ impl IcpdbService {
             last_used_at_ms: None,
             revoked_at_ms: None,
         })
+    }
+
+    pub fn validate_create_database_token(
+        &self,
+        caller: &str,
+        request: &icpdb_types::CreateDatabaseTokenRequest,
+    ) -> Result<(), String> {
+        self.require_role(&request.database_id, caller, RequiredRole::Owner)?;
+        validate_database_token_name(&request.name)
     }
 
     pub fn list_database_tokens(
@@ -701,16 +708,17 @@ impl IcpdbService {
         result.map_err(|error| error.to_string())
     }
 
-    pub fn delete_database(&self, database_id: &str, caller: &str, now: i64) -> Result<(), String> {
+    pub fn delete_database(
+        &self,
+        database_id: &str,
+        caller: &str,
+        now: i64,
+    ) -> Result<DatabaseMeta, String> {
         self.require_role(database_id, caller, RequiredRole::Owner)?;
-        let meta = self.database_meta(database_id)?;
-        if let Err(error) = remove_file(&meta.db_file_name)
-            && error.kind() != std::io::ErrorKind::NotFound
-        {
-            return Err(error.to_string());
-        }
-        let conn = self.open_index()?;
-        conn.execute(
+        let meta = self.database_meta_for_delete(database_id)?;
+        let mut conn = self.open_index()?;
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        tx.execute(
             "UPDATE databases
              SET status = 'deleted',
                  active_mount_id = NULL,
@@ -722,7 +730,13 @@ impl IcpdbService {
             params![database_id, now],
         )
         .map_err(|error| error.to_string())?;
-        Ok(())
+        if let Err(error) = remove_file(&meta.db_file_name)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(error.to_string());
+        }
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(meta)
     }
 
     pub fn begin_database_archive(
@@ -1006,6 +1020,15 @@ impl IcpdbService {
         caller: &str,
         now: i64,
     ) -> Result<DatabaseMeta, String> {
+        self.prepare_database_restore_finalize(database_id, caller)?;
+        self.complete_database_restore(database_id, caller, now)
+    }
+
+    pub fn prepare_database_restore_finalize(
+        &self,
+        database_id: &str,
+        caller: &str,
+    ) -> Result<DatabaseMeta, String> {
         self.require_role(database_id, caller, RequiredRole::Owner)?;
         let meta = self.database_meta_with_statuses(database_id, &[DatabaseStatus::Restoring])?;
         let expected_size = self.restore_size_bytes(database_id)?;
@@ -1033,6 +1056,18 @@ impl IcpdbService {
         Connection::open(&meta.db_file_name)
             .and_then(|conn| conn.execute_batch("PRAGMA application_id = 0x49435044;"))
             .map_err(|error| error.to_string())?;
+        Ok(meta)
+    }
+
+    pub fn complete_database_restore(
+        &self,
+        database_id: &str,
+        caller: &str,
+        now: i64,
+    ) -> Result<DatabaseMeta, String> {
+        self.require_role(database_id, caller, RequiredRole::Owner)?;
+        let meta = self.database_meta_with_statuses(database_id, &[DatabaseStatus::Restoring])?;
+        let size = file_size(&meta.db_file_name)?;
         let mut conn = self.open_index()?;
         let tx = conn.transaction().map_err(|error| error.to_string())?;
         tx.execute(
@@ -1069,6 +1104,9 @@ impl IcpdbService {
         self.require_role(database_id, caller, RequiredRole::Owner)?;
         if caller == principal && role != DatabaseRole::Owner {
             return Err("owner cannot downgrade own access".to_string());
+        }
+        if principal == ANONYMOUS_PRINCIPAL_TEXT && role != DatabaseRole::Reader {
+            return Err("anonymous principal can only be granted reader access".to_string());
         }
         let conn = self.open_index()?;
         conn.execute(
@@ -1329,6 +1367,25 @@ impl IcpdbService {
         let conn = self.open_index()?;
         load_database_with_statuses(&conn, database_id, statuses)?
             .ok_or_else(|| database_meta_error(&conn, database_id))
+    }
+
+    fn database_meta_for_delete(&self, database_id: &str) -> Result<DatabaseMeta, String> {
+        let conn = self.open_index()?;
+        conn.query_row(
+            "SELECT database_id, db_file_name, mount_id, schema_version, logical_size_bytes, status
+             FROM databases
+             WHERE database_id = ?1",
+            params![database_id],
+            |row| {
+                map_database_meta_with_statuses(
+                    row,
+                    &[DatabaseStatus::Hot, DatabaseStatus::Archived],
+                )
+            },
+        )
+        .optional()
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| database_meta_error(&conn, database_id))
     }
 
     fn database_restore_rollback(

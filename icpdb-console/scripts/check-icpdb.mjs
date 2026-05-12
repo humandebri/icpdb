@@ -34,6 +34,8 @@ assert.match(workbench, /wallet approve required before deposit/);
 assert.match(workbench, /walletStatus === "approving"/);
 assert.match(workbench, /disabled=\{!canDeposit\}/);
 assert.match(workbench, /disabled=\{!canApproveDeposit\}/);
+assert.match(workbench, /Number\.isSafeInteger/);
+assert.match(workbench, /integer params must be safe JS integers/);
 assert.doesNotMatch(workbench, /\bany\b/);
 assert.doesNotMatch(workbench, /\bas\b/);
 

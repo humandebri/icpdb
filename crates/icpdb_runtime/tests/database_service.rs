@@ -90,6 +90,16 @@ fn database_member_count(root: &std::path::Path, database_id: &str) -> i64 {
     .expect("member count should load")
 }
 
+fn billing_balance_storage_type(root: &std::path::Path, database_id: &str) -> String {
+    let conn = Connection::open(root.join("index.sqlite3")).expect("index should open");
+    conn.query_row(
+        "SELECT typeof(billing_balance_units) FROM databases WHERE database_id = ?1",
+        params![database_id],
+        |row| row.get(0),
+    )
+    .expect("billing balance type should load")
+}
+
 fn assert_generated_database_id(database_id: &str) {
     assert!(database_id.starts_with("db_"));
     assert_eq!(database_id.len(), 15);
@@ -713,6 +723,24 @@ fn billing_units_are_charged_and_exhaustion_suspends_database() {
 }
 
 #[test]
+fn manual_top_up_rejects_values_outside_sqlite_integer_range() {
+    let (service, root) = service_with_root();
+    service
+        .create_database("alpha", "owner", 1)
+        .expect("database should create");
+
+    let error = service
+        .top_up_database_balance(DatabaseBalanceTopUpRequest {
+            database_id: "alpha".to_string(),
+            units: u64::MAX,
+        })
+        .expect_err("oversized top-up should fail");
+
+    assert_eq!(error, "units exceeds SQLite integer range");
+    assert_eq!(billing_balance_storage_type(&root, "alpha"), "integer");
+}
+
+#[test]
 fn icp_transfer_fee_config_defaults_and_updates_from_bad_fee() {
     let service = service();
 
@@ -1238,6 +1266,59 @@ fn delete_database_allows_missing_file_but_rejects_other_remove_errors() {
         .expect_err("non-NotFound remove error should fail");
     assert!(!error.is_empty());
     assert_eq!(database_index_row(&root, "remove_error").0, "hot");
+}
+
+#[test]
+fn delete_database_accepts_archived_database_and_preserves_state_on_remove_error() {
+    let (service, root) = service_with_root();
+    service
+        .create_database("archived", "owner", 1)
+        .expect("database should create");
+    service
+        .sql_execute(
+            "owner",
+            sql_request("archived", "CREATE TABLE t (id INTEGER)"),
+        )
+        .expect("table create should succeed");
+    let archive = service
+        .begin_database_archive("archived", "owner", 2)
+        .expect("archive should begin");
+    let bytes = read_archive_in_chunks(&service, "archived", archive.size_bytes, 64);
+    service
+        .finalize_database_archive("archived", "owner", sha256_bytes(&bytes), 3)
+        .expect("archive should finalize");
+
+    service
+        .delete_database("archived", "owner", 4)
+        .expect("archived database should delete");
+
+    assert_eq!(database_index_row(&root, "archived").0, "deleted");
+
+    service
+        .create_database("remove_error_archived", "owner", 5)
+        .expect("database should create");
+    let archive = service
+        .begin_database_archive("remove_error_archived", "owner", 6)
+        .expect("archive should begin");
+    let bytes = read_archive_in_chunks(&service, "remove_error_archived", archive.size_bytes, 64);
+    service
+        .finalize_database_archive("remove_error_archived", "owner", sha256_bytes(&bytes), 7)
+        .expect("archive should finalize");
+    let conn = Connection::open(root.join("index.sqlite3")).expect("index should open");
+    conn.execute(
+        "UPDATE databases SET db_file_name = ?2 WHERE database_id = ?1",
+        params!["remove_error_archived", root.to_string_lossy().as_ref()],
+    )
+    .expect("db file path should update");
+
+    let error = service
+        .delete_database("remove_error_archived", "owner", 8)
+        .expect_err("non-NotFound remove error should fail");
+    assert!(!error.is_empty());
+    assert_eq!(
+        database_index_row(&root, "remove_error_archived").0,
+        "archived"
+    );
 }
 
 #[test]
@@ -1881,5 +1962,38 @@ fn enforces_reader_writer_owner_roles() {
             .revoke_database_access("shared", "owner", "owner")
             .expect_err("owner should not revoke own access")
             .contains("own access")
+    );
+}
+
+#[test]
+fn anonymous_principal_can_only_receive_reader_access() {
+    let service = service();
+    service
+        .create_database("public", "owner", 1)
+        .expect("database should create");
+
+    service
+        .grant_database_access("public", "owner", "2vxsx-fae", DatabaseRole::Reader, 2)
+        .expect("anonymous reader should be allowed");
+    let writer_error = service
+        .grant_database_access("public", "owner", "2vxsx-fae", DatabaseRole::Writer, 3)
+        .expect_err("anonymous writer should fail");
+    let owner_error = service
+        .grant_database_access("public", "owner", "2vxsx-fae", DatabaseRole::Owner, 4)
+        .expect_err("anonymous owner should fail");
+
+    assert!(writer_error.contains("anonymous principal"));
+    assert!(owner_error.contains("anonymous principal"));
+    service
+        .sql_query("2vxsx-fae", sql_request("public", "SELECT 1"))
+        .expect("anonymous reader query should pass");
+    assert!(
+        service
+            .sql_execute(
+                "2vxsx-fae",
+                sql_request("public", "CREATE TABLE nope (id INTEGER)")
+            )
+            .expect_err("anonymous reader write should fail")
+            .contains("lacks required database role")
     );
 }

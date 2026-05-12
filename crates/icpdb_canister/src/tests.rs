@@ -8,7 +8,8 @@ use std::task::{Context, Poll, Wake, Waker};
 use candid::Nat;
 use icpdb_runtime::IcpdbService;
 use icpdb_types::{
-    DatabaseBalanceTopUpRequest, DatabaseBillingStatus, DatabaseRole, DatabaseStatus,
+    CreateDatabaseTokenRequest, DatabaseBalanceTopUpRequest, DatabaseBillingStatus,
+    DatabaseRestoreChunkRequest, DatabaseRole, DatabaseStatus, DatabaseTokenScope,
     SqlExecuteRequest,
 };
 use icrc_ledger_types::icrc2::transfer_from::TransferFromError;
@@ -16,13 +17,15 @@ use sha2::{Digest, Sha256};
 use tempfile::tempdir;
 
 use super::{
-    PENDING_DEPOSITS, SERVICE, acquire_deposit_guard_for_test, begin_database_archive,
-    begin_database_restore, cancel_database_archive, clear_test_icp_transfer_from, create_database,
-    deposit_with_approval, describe_transfer_from_error, fail_next_mount_database_file_for_test,
-    finalize_database_archive, get_billing, get_deposit_quote, grant_database_access,
-    list_databases, list_payments, read_database_archive_chunk, revoke_database_access,
-    set_test_caller_is_controller, set_test_caller_text, set_test_icp_transfer_from, sql_execute,
-    sql_query, top_up_database_balance,
+    HeaderField, HttpRequest, PENDING_DEPOSITS, SERVICE, acquire_deposit_guard_for_test,
+    bearer_token, begin_database_archive, begin_database_restore, cancel_database_archive,
+    clear_test_icp_transfer_from, create_database, create_database_token, deposit_with_approval,
+    describe_transfer_from_error, fail_next_mount_database_file_for_test,
+    finalize_database_archive, finalize_database_restore, get_billing, get_deposit_quote,
+    grant_database_access, http_error_status, http_request, list_databases, list_payments,
+    read_database_archive_chunk, revoke_database_access, set_test_caller_is_controller,
+    set_test_caller_text, set_test_icp_transfer_from, sql_execute, sql_query,
+    top_up_database_balance, write_database_restore_chunk,
 };
 
 struct NoopWaker;
@@ -95,6 +98,16 @@ fn sql_request(database_id: &str, sql: &str) -> SqlExecuteRequest {
     }
 }
 
+fn http_sql_request(method: &str, url: &str) -> HttpRequest {
+    HttpRequest {
+        method: method.to_string(),
+        url: url.to_string(),
+        headers: Vec::new(),
+        body: Vec::new(),
+        certificate_version: None,
+    }
+}
+
 #[test]
 fn empty_index_does_not_create_default_database() {
     let dir = tempdir().expect("tempdir should create");
@@ -145,6 +158,7 @@ fn canister_list_databases_returns_caller_membership_summaries() {
 #[test]
 fn update_entrypoints_record_usage_events() {
     install_empty_test_service();
+    set_test_caller_text(Some("aaaaa-aa"));
 
     let database_id = create_database().expect("database should create");
     assert_eq!(usage_event_count(), 1);
@@ -152,6 +166,35 @@ fn update_entrypoints_record_usage_events() {
     let failed = sql_execute(sql_request(&database_id, ""));
     assert!(failed.is_err());
     assert_eq!(usage_event_count(), 2);
+}
+
+#[test]
+fn anonymous_create_database_is_rejected() {
+    install_empty_test_service();
+
+    let error = create_database().expect_err("anonymous create should fail");
+
+    assert_eq!(error, "anonymous caller not allowed");
+    assert!(
+        list_databases()
+            .expect("database summaries should load")
+            .is_empty()
+    );
+}
+
+#[test]
+fn create_database_token_authorizes_before_raw_rand() {
+    install_test_service();
+    set_test_caller_text(Some("aaaaa-aa"));
+
+    let error = block_on_ready(create_database_token(CreateDatabaseTokenRequest {
+        database_id: "default".to_string(),
+        name: "read".to_string(),
+        scope: DatabaseTokenScope::Read,
+    }))
+    .expect_err("non-owner should fail before raw_rand");
+
+    assert!(error.contains("principal has no access"));
 }
 
 #[test]
@@ -302,8 +345,39 @@ fn transfer_from_errors_are_user_actionable() {
 }
 
 #[test]
+fn http_request_upgrades_only_supported_post_sql_endpoints() {
+    let upgraded = http_request(http_sql_request("POST", "/v1/sql/query"));
+    assert_eq!(upgraded.status_code, 200);
+    assert_eq!(upgraded.upgrade, Some(true));
+
+    let get_rejected = http_request(http_sql_request("GET", "/v1/sql/query"));
+    assert_eq!(get_rejected.status_code, 405);
+    assert_eq!(get_rejected.upgrade, None);
+
+    let unknown_rejected = http_request(http_sql_request("POST", "/unknown"));
+    assert_eq!(unknown_rejected.status_code, 404);
+    assert_eq!(unknown_rejected.upgrade, None);
+}
+
+#[test]
+fn bearer_token_scheme_is_case_insensitive_and_scope_error_is_forbidden() {
+    let headers: Vec<HeaderField> = vec![(
+        "authorization".to_string(),
+        "bearer icpdb_token".to_string(),
+    )];
+
+    assert_eq!(bearer_token(&headers), Some("icpdb_token"));
+    assert_eq!(
+        http_error_status("api token scope does not allow this operation"),
+        403
+    );
+    assert_eq!(http_error_status("invalid api token"), 401);
+}
+
+#[test]
 fn canister_create_database_returns_generated_id_for_followup_reads() {
     install_empty_test_service();
+    set_test_caller_text(Some("aaaaa-aa"));
 
     let database_id = create_database().expect("database should create");
     assert!(database_id.starts_with("db_"));
@@ -471,6 +545,42 @@ fn begin_database_restore_rolls_back_when_mount_fails() {
         .expect("default info should exist");
     assert_eq!(restoring.status, DatabaseStatus::Restoring);
     assert_eq!(restoring.role, DatabaseRole::Owner);
+}
+
+#[test]
+fn finalize_database_restore_keeps_restoring_when_mount_fails() {
+    install_test_service();
+    sql_execute(sql_request(
+        "default",
+        "CREATE TABLE restore_finalize_smoke (id INTEGER)",
+    ))
+    .expect("table create should succeed");
+    let archive = begin_database_archive("default".to_string()).expect("archive should begin");
+    let bytes = read_database_archive_chunk("default".to_string(), 0, archive.size_bytes as u32)
+        .expect("archive chunk should read")
+        .bytes;
+    let snapshot_hash = sha256_bytes(&bytes);
+    finalize_database_archive("default".to_string(), snapshot_hash.clone())
+        .expect("archive should finalize");
+    begin_database_restore("default".to_string(), snapshot_hash, archive.size_bytes)
+        .expect("restore begin should succeed");
+    write_database_restore_chunk(DatabaseRestoreChunkRequest {
+        database_id: "default".to_string(),
+        offset: 0,
+        bytes,
+    })
+    .expect("restore chunk should write");
+
+    fail_next_mount_database_file_for_test();
+    let error = finalize_database_restore("default".to_string())
+        .expect_err("mount failure should fail finalize");
+    assert!(error.contains("test mount failure"));
+    let info = list_databases()
+        .expect("database summaries should load")
+        .into_iter()
+        .find(|info| info.database_id == "default")
+        .expect("default info should exist");
+    assert_eq!(info.status, DatabaseStatus::Restoring);
 }
 
 #[test]

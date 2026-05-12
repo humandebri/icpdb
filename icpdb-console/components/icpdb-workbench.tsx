@@ -587,7 +587,11 @@ function jsonToSqlValue(value: unknown): SqlValue {
   if (value === null) return { kind: "null" };
   if (typeof value === "string") return { kind: "text", value };
   if (typeof value === "number" && Number.isFinite(value)) {
-    return Number.isInteger(value) ? { kind: "integer", value: String(value) } : { kind: "real", value };
+    if (!Number.isInteger(value)) return { kind: "real", value };
+    if (!Number.isSafeInteger(value)) {
+      throw new Error("integer params must be safe JS integers; use a string for large values");
+    }
+    return { kind: "integer", value: String(value) };
   }
   throw new Error("params may contain only null, string, or number values");
 }
