@@ -7,16 +7,27 @@ import { idlFactory } from "@/lib/vfs-idl";
 import type {
   CanisterHealth,
   ChildNode,
+  CreateDatabaseTokenResponse,
+  DatabaseBilling,
   DatabaseMember,
   DatabaseRole,
   DatabaseStatus,
   DatabaseSummary,
+  DatabaseTokenInfo,
+  DatabaseTokenScope,
+  DatabaseUsage,
+  DepositQuote,
+  DepositResult,
   LinkEdge,
   NodeContext,
   NodeEntryKind,
   NodeKind,
+  PaymentRecord,
   RecentNode,
   SearchNodeHit,
+  SqlExecuteRequest,
+  SqlExecuteResponse,
+  SqlValue,
   WikiNode,
   WriteNodeRequest,
   WriteNodeResult
@@ -53,6 +64,64 @@ type RawDatabaseMember = {
   principal: string;
   role: Variant;
   created_at_ms: bigint;
+};
+
+type RawDatabaseUsage = {
+  database_id: string;
+  status: Variant;
+  logical_size_bytes: bigint;
+  max_logical_size_bytes: bigint;
+  usage_event_count: bigint;
+};
+
+type RawDatabaseBilling = {
+  database_id: string;
+  status: Variant;
+  balance_units: bigint;
+  spent_units: bigint;
+  usage_event_count: bigint;
+};
+
+type RawDepositQuote = {
+  database_id: string;
+  amount_e8s: bigint;
+  expected_fee_e8s: bigint;
+  credited_units: bigint;
+  ledger_canister_id: string;
+  spender_principal: string;
+};
+
+type RawDepositResult = {
+  database_id: string;
+  amount_e8s: bigint;
+  credited_units: bigint;
+  block_index: bigint;
+  balance_units: bigint;
+};
+
+type RawPaymentRecord = {
+  payment_id: string;
+  database_id: string;
+  payer_principal: string;
+  amount_e8s: bigint;
+  credited_units: bigint;
+  block_index: bigint;
+  created_at_ms: bigint;
+};
+
+type RawDatabaseTokenInfo = {
+  token_id: string;
+  database_id: string;
+  name: string;
+  scope: Variant;
+  created_at_ms: bigint;
+  last_used_at_ms: [] | [bigint];
+  revoked_at_ms: [] | [bigint];
+};
+
+type RawCreateDatabaseTokenResponse = {
+  token: string;
+  info: RawDatabaseTokenInfo;
 };
 
 type RawChild = {
@@ -102,13 +171,47 @@ type RawNodeContext = {
   outgoing_links: RawLinkEdge[];
 };
 
+type RawSqlValue =
+  | { Null: null }
+  | { Integer: bigint }
+  | { Real: number }
+  | { Text: string }
+  | { Blob: number[] };
+
+type RawSqlExecuteRequest = {
+  database_id: string;
+  sql: string;
+  params: RawSqlValue[];
+  max_rows: [] | [number];
+};
+
+type RawSqlExecuteResponse = {
+  columns: string[];
+  rows: RawSqlValue[][];
+  rows_affected: bigint;
+  last_insert_rowid: bigint;
+  truncated: boolean;
+};
+
 type VfsActor = {
   canister_health: () => Promise<RawCanisterHealth>;
   create_database: () => Promise<{ Ok: string } | { Err: string }>;
+  create_database_token: (request: { database_id: string; name: string; scope: Variant }) => Promise<
+    { Ok: RawCreateDatabaseTokenResponse } | { Err: string }
+  >;
+  deposit_with_approval: (databaseId: string, amountE8s: bigint) => Promise<{ Ok: RawDepositResult } | { Err: string }>;
+  get_deposit_quote: (databaseId: string, amountE8s: bigint) => Promise<{ Ok: RawDepositQuote } | { Err: string }>;
   grant_database_access: (databaseId: string, principal: string, role: Variant) => Promise<{ Ok: null } | { Err: string }>;
+  get_billing: (databaseId: string) => Promise<{ Ok: RawDatabaseBilling } | { Err: string }>;
+  get_usage: (databaseId: string) => Promise<{ Ok: RawDatabaseUsage } | { Err: string }>;
   list_databases: () => Promise<{ Ok: RawDatabaseSummary[] } | { Err: string }>;
   list_database_members: (databaseId: string) => Promise<{ Ok: RawDatabaseMember[] } | { Err: string }>;
+  list_database_tokens: (databaseId: string) => Promise<{ Ok: RawDatabaseTokenInfo[] } | { Err: string }>;
+  list_payments: (databaseId: string) => Promise<{ Ok: RawPaymentRecord[] } | { Err: string }>;
   revoke_database_access: (databaseId: string, principal: string) => Promise<{ Ok: null } | { Err: string }>;
+  revoke_database_token: (databaseId: string, tokenId: string) => Promise<{ Ok: RawDatabaseTokenInfo } | { Err: string }>;
+  set_database_quota: (request: { database_id: string; max_logical_size_bytes: bigint }) => Promise<{ Ok: RawDatabaseUsage } | { Err: string }>;
+  top_up_database_balance: (request: { database_id: string; units: bigint }) => Promise<{ Ok: RawDatabaseBilling } | { Err: string }>;
   read_node: (databaseId: string, path: string) => Promise<{ Ok: [] | [RawNode] } | { Err: string }>;
   list_children: (request: { database_id: string; path: string }) => Promise<{ Ok: RawChild[] } | { Err: string }>;
   recent_nodes: (request: { database_id: string; path: [] | [string]; limit: number }) => Promise<
@@ -133,6 +236,8 @@ type VfsActor = {
     top_k: number;
     preview_mode: [] | [Variant];
   }) => Promise<{ Ok: RawSearchHit[] } | { Err: string }>;
+  sql_execute: (request: RawSqlExecuteRequest) => Promise<{ Ok: RawSqlExecuteResponse } | { Err: string }>;
+  sql_query: (request: RawSqlExecuteRequest) => Promise<{ Ok: RawSqlExecuteResponse } | { Err: string }>;
   write_node: (request: RawWriteNodeRequest) => Promise<{ Ok: RawWriteNodeResult } | { Err: string }>;
 };
 
@@ -259,6 +364,160 @@ export async function createDatabaseAuthenticated(canisterId: string, identity: 
       throw new Error(result.Err);
     }
     return result.Ok;
+  });
+}
+
+export async function getUsageAuthenticated(canisterId: string, identity: Identity, databaseId: string): Promise<DatabaseUsage> {
+  return callVfs(async () => {
+    const actor = await createAuthenticatedActor(canisterId, identity);
+    const result = await actor.get_usage(databaseId);
+    if ("Err" in result) {
+      throw new Error(result.Err);
+    }
+    return normalizeDatabaseUsage(result.Ok);
+  });
+}
+
+export async function getBillingAuthenticated(canisterId: string, identity: Identity, databaseId: string): Promise<DatabaseBilling> {
+  return callVfs(async () => {
+    const actor = await createAuthenticatedActor(canisterId, identity);
+    const result = await actor.get_billing(databaseId);
+    if ("Err" in result) {
+      throw new Error(result.Err);
+    }
+    return normalizeDatabaseBilling(result.Ok);
+  });
+}
+
+export async function topUpDatabaseBalanceAuthenticated(
+  canisterId: string,
+  identity: Identity,
+  databaseId: string,
+  units: string
+): Promise<DatabaseBilling> {
+  return callVfs(async () => {
+    const actor = await createAuthenticatedActor(canisterId, identity);
+    const result = await actor.top_up_database_balance({
+      database_id: databaseId,
+      units: BigInt(units)
+    });
+    if ("Err" in result) {
+      throw new Error(result.Err);
+    }
+    return normalizeDatabaseBilling(result.Ok);
+  });
+}
+
+export async function getDepositQuoteAuthenticated(
+  canisterId: string,
+  identity: Identity,
+  databaseId: string,
+  amountE8s: string
+): Promise<DepositQuote> {
+  return callVfs(async () => {
+    const actor = await createAuthenticatedActor(canisterId, identity);
+    const result = await actor.get_deposit_quote(databaseId, BigInt(amountE8s));
+    if ("Err" in result) {
+      throw new Error(result.Err);
+    }
+    return normalizeDepositQuote(result.Ok);
+  });
+}
+
+export async function depositWithApprovalAuthenticated(
+  canisterId: string,
+  identity: Identity,
+  databaseId: string,
+  amountE8s: string
+): Promise<DepositResult> {
+  return callVfs(async () => {
+    const actor = await createAuthenticatedActor(canisterId, identity);
+    const result = await actor.deposit_with_approval(databaseId, BigInt(amountE8s));
+    if ("Err" in result) {
+      throw new Error(result.Err);
+    }
+    return normalizeDepositResult(result.Ok);
+  });
+}
+
+export async function listPaymentsAuthenticated(canisterId: string, identity: Identity, databaseId: string): Promise<PaymentRecord[]> {
+  return callVfs(async () => {
+    const actor = await createAuthenticatedActor(canisterId, identity);
+    const result = await actor.list_payments(databaseId);
+    if ("Err" in result) {
+      throw new Error(result.Err);
+    }
+    return result.Ok.map(normalizePaymentRecord);
+  });
+}
+
+export async function setDatabaseQuotaAuthenticated(
+  canisterId: string,
+  identity: Identity,
+  databaseId: string,
+  maxLogicalSizeBytes: string
+): Promise<DatabaseUsage> {
+  return callVfs(async () => {
+    const actor = await createAuthenticatedActor(canisterId, identity);
+    const result = await actor.set_database_quota({
+      database_id: databaseId,
+      max_logical_size_bytes: BigInt(maxLogicalSizeBytes)
+    });
+    if ("Err" in result) {
+      throw new Error(result.Err);
+    }
+    return normalizeDatabaseUsage(result.Ok);
+  });
+}
+
+export async function createDatabaseTokenAuthenticated(
+  canisterId: string,
+  identity: Identity,
+  databaseId: string,
+  name: string,
+  scope: DatabaseTokenScope
+): Promise<CreateDatabaseTokenResponse> {
+  return callVfs(async () => {
+    const actor = await createAuthenticatedActor(canisterId, identity);
+    const result = await actor.create_database_token({
+      database_id: databaseId,
+      name,
+      scope: databaseTokenScopeVariant(scope)
+    });
+    if ("Err" in result) {
+      throw new Error(result.Err);
+    }
+    return {
+      token: result.Ok.token,
+      info: normalizeDatabaseTokenInfo(result.Ok.info)
+    };
+  });
+}
+
+export async function listDatabaseTokensAuthenticated(canisterId: string, identity: Identity, databaseId: string): Promise<DatabaseTokenInfo[]> {
+  return callVfs(async () => {
+    const actor = await createAuthenticatedActor(canisterId, identity);
+    const result = await actor.list_database_tokens(databaseId);
+    if ("Err" in result) {
+      throw new Error(result.Err);
+    }
+    return result.Ok.map(normalizeDatabaseTokenInfo);
+  });
+}
+
+export async function revokeDatabaseTokenAuthenticated(
+  canisterId: string,
+  identity: Identity,
+  databaseId: string,
+  tokenId: string
+): Promise<DatabaseTokenInfo> {
+  return callVfs(async () => {
+    const actor = await createAuthenticatedActor(canisterId, identity);
+    const result = await actor.revoke_database_token(databaseId, tokenId);
+    if ("Err" in result) {
+      throw new Error(result.Err);
+    }
+    return normalizeDatabaseTokenInfo(result.Ok);
   });
 }
 
@@ -453,6 +712,28 @@ export async function searchNodes(
   });
 }
 
+export async function sqlQueryAuthenticated(canisterId: string, identity: Identity, request: SqlExecuteRequest): Promise<SqlExecuteResponse> {
+  return callVfs(async () => {
+    const actor = await createAuthenticatedActor(canisterId, identity);
+    const result = await actor.sql_query(rawSqlRequest(request));
+    if ("Err" in result) {
+      throwCanisterError(result.Err);
+    }
+    return normalizeSqlResponse(result.Ok);
+  });
+}
+
+export async function sqlExecuteAuthenticated(canisterId: string, identity: Identity, request: SqlExecuteRequest): Promise<SqlExecuteResponse> {
+  return callVfs(async () => {
+    const actor = await createAuthenticatedActor(canisterId, identity);
+    const result = await actor.sql_execute(rawSqlRequest(request));
+    if ("Err" in result) {
+      throwCanisterError(result.Err);
+    }
+    return normalizeSqlResponse(result.Ok);
+  });
+}
+
 function normalizeNode(raw: RawNode): WikiNode {
   return {
     path: raw.path,
@@ -488,6 +769,71 @@ function normalizeDatabaseMember(raw: RawDatabaseMember): DatabaseMember {
     principal: raw.principal,
     role: normalizeDatabaseRole(raw.role),
     createdAtMs: raw.created_at_ms.toString()
+  };
+}
+
+function normalizeDatabaseUsage(raw: RawDatabaseUsage): DatabaseUsage {
+  return {
+    databaseId: raw.database_id,
+    status: normalizeDatabaseStatus(raw.status),
+    logicalSizeBytes: raw.logical_size_bytes.toString(),
+    maxLogicalSizeBytes: raw.max_logical_size_bytes.toString(),
+    usageEventCount: raw.usage_event_count.toString()
+  };
+}
+
+function normalizeDatabaseBilling(raw: RawDatabaseBilling): DatabaseBilling {
+  return {
+    databaseId: raw.database_id,
+    status: "Suspended" in raw.status ? "suspended" : "active",
+    balanceUnits: raw.balance_units.toString(),
+    spentUnits: raw.spent_units.toString(),
+    usageEventCount: raw.usage_event_count.toString()
+  };
+}
+
+function normalizeDepositQuote(raw: RawDepositQuote): DepositQuote {
+  return {
+    databaseId: raw.database_id,
+    amountE8s: raw.amount_e8s.toString(),
+    expectedFeeE8s: raw.expected_fee_e8s.toString(),
+    creditedUnits: raw.credited_units.toString(),
+    ledgerCanisterId: raw.ledger_canister_id,
+    spenderPrincipal: raw.spender_principal
+  };
+}
+
+function normalizeDepositResult(raw: RawDepositResult): DepositResult {
+  return {
+    databaseId: raw.database_id,
+    amountE8s: raw.amount_e8s.toString(),
+    creditedUnits: raw.credited_units.toString(),
+    blockIndex: raw.block_index.toString(),
+    balanceUnits: raw.balance_units.toString()
+  };
+}
+
+function normalizePaymentRecord(raw: RawPaymentRecord): PaymentRecord {
+  return {
+    paymentId: raw.payment_id,
+    databaseId: raw.database_id,
+    payerPrincipal: raw.payer_principal,
+    amountE8s: raw.amount_e8s.toString(),
+    creditedUnits: raw.credited_units.toString(),
+    blockIndex: raw.block_index.toString(),
+    createdAtMs: raw.created_at_ms.toString()
+  };
+}
+
+function normalizeDatabaseTokenInfo(raw: RawDatabaseTokenInfo): DatabaseTokenInfo {
+  return {
+    tokenId: raw.token_id,
+    databaseId: raw.database_id,
+    name: raw.name,
+    scope: "Write" in raw.scope ? "write" : "read",
+    createdAtMs: raw.created_at_ms.toString(),
+    lastUsedAtMs: raw.last_used_at_ms[0]?.toString() ?? null,
+    revokedAtMs: raw.revoked_at_ms[0]?.toString() ?? null
   };
 }
 
@@ -532,6 +878,41 @@ function normalizeNodeContext(raw: RawNodeContext): NodeContext {
   };
 }
 
+function rawSqlRequest(request: SqlExecuteRequest): RawSqlExecuteRequest {
+  return {
+    database_id: request.databaseId,
+    sql: request.sql,
+    params: request.params.map(rawSqlValue),
+    max_rows: request.maxRows === null ? [] : [request.maxRows]
+  };
+}
+
+function rawSqlValue(value: SqlValue): RawSqlValue {
+  if (value.kind === "null") return { Null: null };
+  if (value.kind === "integer") return { Integer: BigInt(value.value) };
+  if (value.kind === "real") return { Real: value.value };
+  if (value.kind === "text") return { Text: value.value };
+  return { Blob: value.value };
+}
+
+function normalizeSqlResponse(raw: RawSqlExecuteResponse): SqlExecuteResponse {
+  return {
+    columns: raw.columns,
+    rows: raw.rows.map((row) => row.map(normalizeSqlValue)),
+    rowsAffected: raw.rows_affected.toString(),
+    lastInsertRowId: raw.last_insert_rowid.toString(),
+    truncated: raw.truncated
+  };
+}
+
+function normalizeSqlValue(value: RawSqlValue): SqlValue {
+  if ("Null" in value) return { kind: "null" };
+  if ("Integer" in value) return { kind: "integer", value: value.Integer.toString() };
+  if ("Real" in value) return { kind: "real", value: value.Real };
+  if ("Text" in value) return { kind: "text", value: value.Text };
+  return { kind: "blob", value: value.Blob };
+}
+
 function normalizeNodeKind(kind: Variant): NodeKind {
   return "Source" in kind ? "source" : "file";
 }
@@ -561,6 +942,10 @@ function databaseRoleVariant(role: DatabaseRole): Variant {
     return { Writer: null };
   }
   return { Reader: null };
+}
+
+function databaseTokenScopeVariant(scope: DatabaseTokenScope): Variant {
+  return scope === "write" ? { Write: null } : { Read: null };
 }
 
 function nodeKindVariant(kind: NodeKind): Variant {

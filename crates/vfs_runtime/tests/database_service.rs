@@ -7,12 +7,15 @@ use rusqlite::{Connection, params};
 use sha2::{Digest, Sha256};
 use tempfile::tempdir;
 use vfs_runtime::{
-    MAX_ARCHIVE_CHUNK_BYTES, MAX_DATABASE_SIZE_BYTES, MAX_RESTORE_CHUNK_BYTES,
-    USAGE_EVENTS_RETENTION_LIMIT, UsageEvent, VfsService,
+    ICP_TRANSFER_FEE_E8S_DEFAULT, ICPDB_UNITS_PER_ICP, MAX_ARCHIVE_CHUNK_BYTES,
+    MAX_DATABASE_SIZE_BYTES, MAX_RESTORE_CHUNK_BYTES, MIN_DEPOSIT_E8S, SQL_EXECUTE_BILLING_UNITS,
+    SQL_QUERY_BILLING_UNITS, USAGE_EVENTS_RETENTION_LIMIT, UsageEvent, VfsService, hash_api_token,
 };
 use vfs_types::{
-    AppendNodeRequest, DatabaseRole, DatabaseStatus, DeleteNodeRequest, NodeKind,
-    SearchNodesRequest, SearchPreviewMode, WriteNodeRequest,
+    AppendNodeRequest, CreateDatabaseTokenRequest, DatabaseBalanceTopUpRequest,
+    DatabaseBillingStatus, DatabaseRole, DatabaseStatus, DatabaseTokenScope, DeleteNodeRequest,
+    NodeKind, SearchNodesRequest, SearchPreviewMode, SqlBatchRequest, SqlExecuteRequest,
+    SqlStatement, SqlValue, WriteNodeRequest,
 };
 
 fn service() -> VfsService {
@@ -266,6 +269,592 @@ fn generated_database_create_avoids_same_input_collision_by_mount_id() {
     assert_ne!(first.database_id, second.database_id);
     assert_eq!(first.mount_id, 11);
     assert_eq!(second.mount_id, 12);
+}
+
+#[test]
+fn sql_execute_writes_and_sql_query_reads_rows() {
+    let service = service();
+    let meta = service
+        .create_generated_database("owner", 1)
+        .expect("database should create");
+
+    service
+        .sql_execute(
+            "owner",
+            SqlExecuteRequest {
+                database_id: meta.database_id.clone(),
+                sql: "CREATE TABLE accounts (id INTEGER PRIMARY KEY, name TEXT NOT NULL)"
+                    .to_string(),
+                params: vec![],
+                max_rows: None,
+            },
+        )
+        .expect("table create should execute");
+    service
+        .sql_execute(
+            "owner",
+            SqlExecuteRequest {
+                database_id: meta.database_id.clone(),
+                sql: "INSERT INTO accounts (name) VALUES (?1)".to_string(),
+                params: vec![SqlValue::Text("alice".to_string())],
+                max_rows: None,
+            },
+        )
+        .expect("insert should execute");
+
+    let response = service
+        .sql_query(
+            "owner",
+            SqlExecuteRequest {
+                database_id: meta.database_id,
+                sql: "SELECT id, name FROM accounts WHERE name = ?1".to_string(),
+                params: vec![SqlValue::Text("alice".to_string())],
+                max_rows: Some(10),
+            },
+        )
+        .expect("select should query");
+
+    assert_eq!(response.columns, vec!["id", "name"]);
+    assert_eq!(
+        response.rows,
+        vec![vec![
+            SqlValue::Integer(1),
+            SqlValue::Text("alice".to_string())
+        ]]
+    );
+    assert!(!response.truncated);
+}
+
+#[test]
+fn sql_query_rejects_writes() {
+    let service = service();
+    let meta = service
+        .create_generated_database("owner", 1)
+        .expect("database should create");
+
+    let error = service
+        .sql_query(
+            "owner",
+            SqlExecuteRequest {
+                database_id: meta.database_id,
+                sql: "CREATE TABLE blocked (id INTEGER)".to_string(),
+                params: vec![],
+                max_rows: None,
+            },
+        )
+        .expect_err("query endpoint should reject write SQL");
+
+    assert_eq!(error, "sql_query only accepts read-only SQL");
+}
+
+#[test]
+fn sql_query_charges_billing_units_and_blocks_empty_balance() {
+    let (service, root) = service_with_root();
+    let meta = service
+        .create_generated_database("owner", 1)
+        .expect("database should create");
+    let initial = service
+        .database_billing(&meta.database_id, "owner")
+        .expect("billing should load");
+
+    service
+        .sql_query(
+            "owner",
+            SqlExecuteRequest {
+                database_id: meta.database_id.clone(),
+                sql: "SELECT 1".to_string(),
+                params: vec![],
+                max_rows: Some(1),
+            },
+        )
+        .expect("query should charge");
+    let charged = service
+        .database_billing(&meta.database_id, "owner")
+        .expect("billing should load after query");
+    assert_eq!(
+        initial.balance_units - charged.balance_units,
+        SQL_QUERY_BILLING_UNITS
+    );
+
+    let conn = Connection::open(root.join("index.sqlite3")).expect("index should open");
+    conn.execute(
+        "UPDATE databases SET billing_balance_units = 0 WHERE database_id = ?1",
+        params![meta.database_id],
+    )
+    .expect("test balance should update");
+    let error = service
+        .sql_query(
+            "owner",
+            SqlExecuteRequest {
+                database_id: meta.database_id.clone(),
+                sql: "SELECT 1".to_string(),
+                params: vec![],
+                max_rows: Some(1),
+            },
+        )
+        .expect_err("empty balance should block query");
+    assert!(error.starts_with("database billing balance exhausted:"));
+    assert_eq!(
+        service
+            .database_billing(&meta.database_id, "owner")
+            .expect("billing should load suspended")
+            .status,
+        DatabaseBillingStatus::Suspended
+    );
+}
+
+#[test]
+fn sql_execute_rejects_file_affecting_statements() {
+    let service = service();
+    let meta = service
+        .create_generated_database("owner", 1)
+        .expect("database should create");
+
+    for sql in [
+        "ATTACH DATABASE 'outside.sqlite3' AS outside",
+        "DETACH DATABASE outside",
+        "VACUUM",
+        "PRAGMA journal_mode = WAL",
+        "  -- leading comment\nATTACH DATABASE 'outside.sqlite3' AS outside",
+        "/* leading block */ VACUUM",
+    ] {
+        let error = service
+            .sql_execute(
+                "owner",
+                SqlExecuteRequest {
+                    database_id: meta.database_id.clone(),
+                    sql: sql.to_string(),
+                    params: vec![],
+                    max_rows: None,
+                },
+            )
+            .expect_err("file-affecting SQL should be rejected");
+        assert_eq!(error, "sql statement is not allowed for hosted databases");
+    }
+}
+
+#[test]
+fn sql_batch_rejects_forbidden_statement_and_rolls_back() {
+    let service = service();
+    let meta = service
+        .create_generated_database("owner", 1)
+        .expect("database should create");
+
+    let error = service
+        .sql_batch(
+            "owner",
+            SqlBatchRequest {
+                database_id: meta.database_id.clone(),
+                statements: vec![
+                    SqlStatement {
+                        sql: "CREATE TABLE rollback_probe (id INTEGER)".to_string(),
+                        params: vec![],
+                    },
+                    SqlStatement {
+                        sql: "VACUUM".to_string(),
+                        params: vec![],
+                    },
+                ],
+                max_rows: None,
+            },
+        )
+        .expect_err("forbidden batch statement should fail");
+    assert_eq!(error, "sql statement is not allowed for hosted databases");
+
+    let error = service
+        .sql_query(
+            "owner",
+            SqlExecuteRequest {
+                database_id: meta.database_id,
+                sql: "SELECT COUNT(*) FROM rollback_probe".to_string(),
+                params: vec![],
+                max_rows: Some(1),
+            },
+        )
+        .expect_err("table creation should roll back");
+    assert!(error.contains("no such table: rollback_probe"));
+}
+
+#[test]
+fn database_usage_counts_database_scoped_usage_events() {
+    let service = service();
+    let meta = service
+        .create_generated_database("owner", 1)
+        .expect("database should create");
+
+    service
+        .record_usage_event(UsageEvent {
+            method: "sql_execute",
+            database_id: Some(&meta.database_id),
+            caller: "owner",
+            success: true,
+            cycles_delta: 10,
+            error: None,
+            now: 2,
+        })
+        .expect("usage should record");
+    service
+        .record_usage_event(UsageEvent {
+            method: "list_databases",
+            database_id: None,
+            caller: "owner",
+            success: true,
+            cycles_delta: 1,
+            error: None,
+            now: 3,
+        })
+        .expect("global usage should record");
+
+    let usage = service
+        .database_usage(&meta.database_id, "owner")
+        .expect("database usage should load");
+
+    assert_eq!(usage.database_id, meta.database_id);
+    assert_eq!(usage.status, DatabaseStatus::Hot);
+    assert_eq!(usage.usage_event_count, 1);
+    assert!(usage.max_logical_size_bytes >= usage.logical_size_bytes);
+}
+
+#[test]
+fn database_quota_blocks_oversized_sql_write_and_rolls_back() {
+    let service = service();
+    let meta = service
+        .create_generated_database("owner", 1)
+        .expect("database should create");
+    service
+        .sql_execute(
+            "owner",
+            SqlExecuteRequest {
+                database_id: meta.database_id.clone(),
+                sql: "CREATE TABLE quota_probe (payload BLOB)".to_string(),
+                params: vec![],
+                max_rows: None,
+            },
+        )
+        .expect("table should create before quota is lowered");
+    let usage = service
+        .database_usage(&meta.database_id, "owner")
+        .expect("usage should load");
+    service
+        .set_database_quota(
+            "owner",
+            vfs_types::DatabaseQuotaRequest {
+                database_id: meta.database_id.clone(),
+                max_logical_size_bytes: usage.logical_size_bytes + 4096,
+            },
+        )
+        .expect("quota should lower above current size");
+
+    let error = service
+        .sql_execute(
+            "owner",
+            SqlExecuteRequest {
+                database_id: meta.database_id.clone(),
+                sql: "INSERT INTO quota_probe (payload) VALUES (zeroblob(1000000))".to_string(),
+                params: vec![],
+                max_rows: None,
+            },
+        )
+        .expect_err("oversized insert should fail");
+    assert!(error.starts_with("database quota exceeded:"));
+
+    let response = service
+        .sql_query(
+            "owner",
+            SqlExecuteRequest {
+                database_id: meta.database_id,
+                sql: "SELECT COUNT(*) FROM quota_probe".to_string(),
+                params: vec![],
+                max_rows: Some(1),
+            },
+        )
+        .expect("count query should work");
+    assert_eq!(response.rows, vec![vec![SqlValue::Integer(0)]]);
+}
+
+#[test]
+fn set_database_quota_rejects_values_below_current_size() {
+    let service = service();
+    let meta = service
+        .create_generated_database("owner", 1)
+        .expect("database should create");
+    let usage = service
+        .database_usage(&meta.database_id, "owner")
+        .expect("usage should load");
+
+    let error = service
+        .set_database_quota(
+            "owner",
+            vfs_types::DatabaseQuotaRequest {
+                database_id: meta.database_id,
+                max_logical_size_bytes: usage.logical_size_bytes.saturating_sub(1),
+            },
+        )
+        .expect_err("quota below current size should fail");
+
+    assert!(error.starts_with("quota is below current database size:"));
+}
+
+#[test]
+fn database_tokens_authorize_http_sql_by_scope_and_track_last_use() {
+    let service = service();
+    service
+        .create_database("alpha", "owner", 1)
+        .expect("database should create");
+    service
+        .create_database_token(
+            "owner",
+            CreateDatabaseTokenRequest {
+                database_id: "alpha".to_string(),
+                name: "web-read".to_string(),
+                scope: DatabaseTokenScope::Read,
+            },
+            hash_api_token("secret-read"),
+            10,
+        )
+        .expect("read token should create");
+    let auth = service
+        .authenticate_database_token("secret-read", vfs_runtime::RequiredRole::Reader, 11)
+        .expect("read token should authenticate");
+    assert_eq!(auth.database_id, "alpha");
+
+    let usage = service
+        .sql_query_with_token(
+            &auth,
+            SqlExecuteRequest {
+                database_id: "alpha".to_string(),
+                sql: "SELECT 1".to_string(),
+                params: Vec::new(),
+                max_rows: None,
+            },
+        )
+        .expect("read token should query");
+    assert_eq!(usage.rows.len(), 1);
+    let error = service
+        .authenticate_database_token("secret-read", vfs_runtime::RequiredRole::Writer, 12)
+        .expect_err("read token should not write");
+    assert_eq!(error, "api token scope does not allow this operation");
+
+    let tokens = service
+        .list_database_tokens("alpha", "owner")
+        .expect("tokens should list");
+    assert_eq!(tokens.len(), 1);
+    assert_eq!(tokens[0].last_used_at_ms, Some(11));
+}
+
+#[test]
+fn billing_units_are_charged_and_exhaustion_suspends_database() {
+    let (service, root) = service_with_root();
+    service
+        .create_database("alpha", "owner", 1)
+        .expect("database should create");
+    let initial = service
+        .database_billing("alpha", "owner")
+        .expect("billing should load");
+    assert_eq!(initial.status, DatabaseBillingStatus::Active);
+
+    service
+        .sql_execute(
+            "owner",
+            SqlExecuteRequest {
+                database_id: "alpha".to_string(),
+                sql: "CREATE TABLE billing_probe (id INTEGER)".to_string(),
+                params: Vec::new(),
+                max_rows: None,
+            },
+        )
+        .expect("write should charge");
+    let charged = service
+        .database_billing("alpha", "owner")
+        .expect("billing should load after charge");
+    assert_eq!(
+        initial.balance_units - charged.balance_units,
+        SQL_EXECUTE_BILLING_UNITS
+    );
+    assert_eq!(charged.spent_units, SQL_EXECUTE_BILLING_UNITS);
+
+    let conn = Connection::open(root.join("index.sqlite3")).expect("index should open");
+    conn.execute(
+        "UPDATE databases SET billing_balance_units = 0 WHERE database_id = 'alpha'",
+        [],
+    )
+    .expect("test balance should update");
+    let error = service
+        .sql_execute(
+            "owner",
+            SqlExecuteRequest {
+                database_id: "alpha".to_string(),
+                sql: "INSERT INTO billing_probe (id) VALUES (1)".to_string(),
+                params: Vec::new(),
+                max_rows: None,
+            },
+        )
+        .expect_err("empty balance should block write");
+    assert!(error.starts_with("database billing balance exhausted:"));
+    assert_eq!(
+        service
+            .database_billing("alpha", "owner")
+            .expect("billing should load suspended")
+            .status,
+        DatabaseBillingStatus::Suspended
+    );
+
+    service
+        .top_up_database_balance(DatabaseBalanceTopUpRequest {
+            database_id: "alpha".to_string(),
+            units: SQL_QUERY_BILLING_UNITS,
+        })
+        .expect("top-up should reactivate");
+}
+
+#[test]
+fn icp_transfer_fee_config_defaults_and_updates_from_bad_fee() {
+    let service = service();
+
+    assert_eq!(
+        service
+            .icp_transfer_fee_e8s()
+            .expect("default fee should load"),
+        ICP_TRANSFER_FEE_E8S_DEFAULT
+    );
+
+    service
+        .update_icp_transfer_fee_from_bad_fee(12_345, 2)
+        .expect("bad fee should update cache");
+
+    assert_eq!(
+        service
+            .icp_transfer_fee_e8s()
+            .expect("updated fee should load"),
+        12_345
+    );
+}
+
+#[test]
+fn approved_deposit_records_payment_and_reactivates_billing() {
+    let (service, root) = service_with_root();
+    service
+        .create_database("alpha", "owner", 1)
+        .expect("database should create");
+    let conn = Connection::open(root.join("index.sqlite3")).expect("index should open");
+    conn.execute(
+        "UPDATE databases SET billing_status = 'suspended' WHERE database_id = 'alpha'",
+        [],
+    )
+    .expect("test billing status should update");
+
+    let quote = service
+        .deposit_quote(
+            "alpha",
+            "owner",
+            MIN_DEPOSIT_E8S,
+            "ryjl3-tyaaa-aaaaa-aaaba-cai",
+            "aaaaa-aa",
+        )
+        .expect("quote should convert units");
+    assert_eq!(quote.credited_units, ICPDB_UNITS_PER_ICP / 100);
+
+    let result = service
+        .record_approved_deposit(
+            "alpha",
+            "owner",
+            MIN_DEPOSIT_E8S,
+            "ryjl3-tyaaa-aaaaa-aaaba-cai",
+            42,
+            2,
+        )
+        .expect("deposit should record");
+    assert_eq!(result.credited_units, quote.credited_units);
+    assert_eq!(result.block_index, 42);
+    assert_eq!(
+        service
+            .database_billing("alpha", "owner")
+            .expect("billing should load")
+            .status,
+        DatabaseBillingStatus::Active
+    );
+
+    let payments = service
+        .list_payments("alpha", "owner")
+        .expect("payments should list");
+    assert_eq!(payments.len(), 1);
+    assert_eq!(payments[0].amount_e8s, MIN_DEPOSIT_E8S);
+    assert_eq!(payments[0].credited_units, quote.credited_units);
+}
+
+#[test]
+fn duplicate_payment_block_is_rejected_but_existing_result_can_be_loaded() {
+    let service = service();
+    service
+        .create_database("alpha", "owner", 1)
+        .expect("database should create");
+    service
+        .record_approved_deposit(
+            "alpha",
+            "owner",
+            MIN_DEPOSIT_E8S,
+            "ryjl3-tyaaa-aaaaa-aaaba-cai",
+            77,
+            2,
+        )
+        .expect("first payment should record");
+
+    let duplicate = service
+        .record_approved_deposit(
+            "alpha",
+            "owner",
+            MIN_DEPOSIT_E8S,
+            "ryjl3-tyaaa-aaaaa-aaaba-cai",
+            77,
+            3,
+        )
+        .expect_err("duplicate block should fail");
+    assert_eq!(duplicate, "payment block already recorded: 77");
+
+    let existing = service
+        .deposit_result_for_existing_payment("alpha", "owner", 77)
+        .expect("recorded duplicate block should load");
+    assert_eq!(existing.block_index, 77);
+    assert_eq!(existing.amount_e8s, MIN_DEPOSIT_E8S);
+}
+
+#[test]
+fn sql_batch_runs_statements_in_one_write_call() {
+    let service = service();
+    let meta = service
+        .create_generated_database("owner", 1)
+        .expect("database should create");
+
+    let responses = service
+        .sql_batch(
+            "owner",
+            SqlBatchRequest {
+                database_id: meta.database_id.clone(),
+                statements: vec![
+                    SqlStatement {
+                        sql: "CREATE TABLE events (id INTEGER PRIMARY KEY, label TEXT)".to_string(),
+                        params: vec![],
+                    },
+                    SqlStatement {
+                        sql: "INSERT INTO events (label) VALUES (?1)".to_string(),
+                        params: vec![SqlValue::Text("created".to_string())],
+                    },
+                    SqlStatement {
+                        sql: "SELECT label FROM events".to_string(),
+                        params: vec![],
+                    },
+                ],
+                max_rows: Some(10),
+            },
+        )
+        .expect("batch should execute");
+
+    assert_eq!(responses.len(), 3);
+    assert_eq!(responses[1].rows_affected, 1);
+    assert_eq!(
+        responses[2].rows,
+        vec![vec![SqlValue::Text("created".to_string())]]
+    );
 }
 
 #[test]

@@ -120,16 +120,21 @@ export default function HomePage() {
             <p className="font-mono text-xs uppercase tracking-[0.18em] text-muted">Kinic Wiki</p>
             <h1 className="mt-2 text-3xl font-semibold text-ink">Database dashboard</h1>
           </div>
-          <AuthControls
-            authReady={Boolean(authClient)}
-            principal={principal}
-            loading={loadState === "loading"}
-            onLogin={login}
-            onLogout={logout}
-            onRefresh={() => {
-              if (authClient) void refreshDatabases(authClient);
-            }}
-          />
+          <div className="flex flex-wrap items-center gap-3">
+            <AuthControls
+              authReady={Boolean(authClient)}
+              principal={principal}
+              loading={loadState === "loading"}
+              onLogin={login}
+              onLogout={logout}
+              onRefresh={() => {
+                if (authClient) void refreshDatabases(authClient);
+              }}
+            />
+            <Link className="text-sm text-accent no-underline hover:underline" href="/icpdb">
+              Open ICPDB console
+            </Link>
+          </div>
         </header>
 
         {error ? <StatusPanel tone="error" message={error} /> : null}

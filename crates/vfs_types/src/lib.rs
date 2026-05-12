@@ -2,11 +2,13 @@
 // What: FS-first shared contracts exposed as the reusable VFS public boundary.
 // Why: VFS consumers should depend on stable node contracts without importing wiki-specific crates.
 mod fs;
+mod sql;
 
 use candid::CandidType;
 use serde::{Deserialize, Serialize};
 
 pub use fs::*;
+pub use sql::*;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, CandidType)]
 pub struct Status {

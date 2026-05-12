@@ -1,31 +1,60 @@
 // Where: crates/vfs_canister/src/tests.rs
 // What: Entry-point level tests for the FS-first canister surface.
 // Why: Phase 3 replaces the public canister contract, so tests must assert the wrapper behavior directly.
+use std::future::Future;
+use std::sync::Arc;
+use std::task::{Context, Poll, Wake, Waker};
+
+use candid::Nat;
+use icrc_ledger_types::icrc2::transfer_from::TransferFromError;
 use sha2::{Digest, Sha256};
 use tempfile::tempdir;
 use vfs_runtime::VfsService;
 use vfs_types::{
-    AppendNodeRequest, DatabaseRole, DatabaseStatus, DeleteNodeRequest, EditNodeRequest,
-    ExportSnapshotRequest, FetchUpdatesRequest, GlobNodeType, GlobNodesRequest, GraphLinksRequest,
-    GraphNeighborhoodRequest, IncomingLinksRequest, ListChildrenRequest, ListNodesRequest,
-    MkdirNodeRequest, MoveNodeRequest, MultiEdit, MultiEditNodeRequest, NodeContextRequest,
-    NodeEntryKind, NodeKind, OutgoingLinksRequest, QueryContextRequest, RecentNodesRequest,
-    SearchNodePathsRequest, SearchNodesRequest, SearchPreviewMode, SourceEvidenceRequest,
-    WriteNodeRequest,
+    AppendNodeRequest, DatabaseBalanceTopUpRequest, DatabaseBillingStatus, DatabaseRole,
+    DatabaseStatus, DeleteNodeRequest, EditNodeRequest, ExportSnapshotRequest, FetchUpdatesRequest,
+    GlobNodeType, GlobNodesRequest, GraphLinksRequest, GraphNeighborhoodRequest,
+    IncomingLinksRequest, ListChildrenRequest, ListNodesRequest, MkdirNodeRequest, MoveNodeRequest,
+    MultiEdit, MultiEditNodeRequest, NodeContextRequest, NodeEntryKind, NodeKind,
+    OutgoingLinksRequest, QueryContextRequest, RecentNodesRequest, SearchNodePathsRequest,
+    SearchNodesRequest, SearchPreviewMode, SourceEvidenceRequest, WriteNodeRequest,
 };
 
 use super::{
-    SERVICE, append_node, begin_database_archive, begin_database_restore, cancel_database_archive,
-    create_database, delete_node, edit_node, export_snapshot,
-    fail_next_mount_database_file_for_test, fetch_updates, finalize_database_archive, glob_nodes,
-    grant_database_access, graph_links, graph_neighborhood, incoming_links, list_children,
-    list_databases, list_nodes, memory_manifest, mkdir_node, move_node, multi_edit_node,
-    outgoing_links, query_context, read_database_archive_chunk, read_node, read_node_context,
-    recent_nodes, revoke_database_access, search_node_paths, search_nodes, source_evidence, status,
-    write_node,
+    PENDING_DEPOSITS, SERVICE, acquire_deposit_guard_for_test, append_node, begin_database_archive,
+    begin_database_restore, cancel_database_archive, clear_test_icp_transfer_from, create_database,
+    delete_node, deposit_with_approval, describe_transfer_from_error, edit_node, export_snapshot,
+    fail_next_mount_database_file_for_test, fetch_updates, finalize_database_archive, get_billing,
+    get_deposit_quote, glob_nodes, grant_database_access, graph_links, graph_neighborhood,
+    incoming_links, list_children, list_databases, list_nodes, list_payments, memory_manifest,
+    mkdir_node, move_node, multi_edit_node, outgoing_links, query_context,
+    read_database_archive_chunk, read_node, read_node_context, recent_nodes,
+    revoke_database_access, search_node_paths, search_nodes, set_test_caller_is_controller,
+    set_test_caller_text, set_test_icp_transfer_from, source_evidence, status,
+    top_up_database_balance, write_node,
 };
 
+struct NoopWaker;
+
+impl Wake for NoopWaker {
+    fn wake(self: Arc<Self>) {}
+}
+
+fn block_on_ready<T>(future: impl Future<Output = T>) -> T {
+    let waker = Waker::from(Arc::new(NoopWaker));
+    let mut context = Context::from_waker(&waker);
+    let mut future = Box::pin(future);
+    match Future::poll(future.as_mut(), &mut context) {
+        Poll::Ready(value) => value,
+        Poll::Pending => panic!("test future unexpectedly pending"),
+    }
+}
+
 fn install_test_service() {
+    set_test_caller_text(None);
+    set_test_caller_is_controller(false);
+    clear_test_icp_transfer_from();
+    PENDING_DEPOSITS.with(|pending| pending.borrow_mut().clear());
     let dir = tempdir().expect("tempdir should create");
     let root = dir.keep();
     let service = VfsService::new(root.join("index.sqlite3"), root.join("databases"));
@@ -39,6 +68,10 @@ fn install_test_service() {
 }
 
 fn install_empty_test_service() {
+    set_test_caller_text(None);
+    set_test_caller_is_controller(false);
+    clear_test_icp_transfer_from();
+    PENDING_DEPOSITS.with(|pending| pending.borrow_mut().clear());
     let dir = tempdir().expect("tempdir should create");
     let root = dir.keep();
     let service = VfsService::new(root.join("index.sqlite3"), root.join("databases"));
@@ -126,6 +159,153 @@ fn update_entrypoints_record_usage_events() {
     });
     assert!(failed.is_err());
     assert_eq!(usage_event_count(), 2);
+}
+
+#[test]
+fn deposit_with_approval_records_ledger_payment() {
+    install_test_service();
+    set_test_icp_transfer_from(Ok(99));
+
+    let quote = block_on_ready(get_deposit_quote("default".to_string(), 1_000_000))
+        .expect("quote should load");
+    assert_eq!(quote.expected_fee_e8s, 10_000);
+    assert_eq!(quote.credited_units, 1_000);
+
+    let result = block_on_ready(deposit_with_approval("default".to_string(), 1_000_000))
+        .expect("deposit should record");
+    assert_eq!(result.block_index, 99);
+    assert_eq!(result.credited_units, 1_000);
+    assert_eq!(
+        get_billing("default".to_string())
+            .expect("billing should load")
+            .status,
+        DatabaseBillingStatus::Active
+    );
+    let payments = list_payments("default".to_string()).expect("payments should list");
+    assert_eq!(payments.len(), 1);
+    assert_eq!(payments[0].block_index, 99);
+}
+
+#[test]
+fn deposit_guard_rejects_same_payer_database_until_released() {
+    install_test_service();
+    let guard =
+        acquire_deposit_guard_for_test("2vxsx-fae", "default").expect("test guard should acquire");
+
+    let blocked = block_on_ready(deposit_with_approval("default".to_string(), 1_000_000))
+        .expect_err("pending deposit should block");
+    assert_eq!(blocked, "deposit already in progress");
+    assert_eq!(
+        list_payments("default".to_string())
+            .expect("payments should list")
+            .len(),
+        0
+    );
+
+    drop(guard);
+    set_test_icp_transfer_from(Ok(100));
+    let result = block_on_ready(deposit_with_approval("default".to_string(), 1_000_000))
+        .expect("deposit should run after guard release");
+    assert_eq!(result.block_index, 100);
+}
+
+#[test]
+fn deposit_duplicate_block_returns_existing_payment() {
+    install_test_service();
+    set_test_icp_transfer_from(Ok(101));
+    block_on_ready(deposit_with_approval("default".to_string(), 1_000_000))
+        .expect("first deposit should record");
+
+    set_test_icp_transfer_from(Err(TransferFromError::Duplicate {
+        duplicate_of: Nat::from(101_u64),
+    }));
+    let duplicate = block_on_ready(deposit_with_approval("default".to_string(), 1_000_000))
+        .expect("known duplicate should be success");
+
+    assert_eq!(duplicate.block_index, 101);
+    assert_eq!(
+        list_payments("default".to_string())
+            .expect("payments should list")
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn deposit_bad_fee_updates_cached_fee_without_recording_payment() {
+    install_test_service();
+    set_test_icp_transfer_from(Err(TransferFromError::BadFee {
+        expected_fee: Nat::from(12_345_u64),
+    }));
+
+    let error = block_on_ready(deposit_with_approval("default".to_string(), 1_000_000))
+        .expect_err("bad fee should ask for requote");
+    assert!(error.contains("fee更新済み"), "{error}");
+    assert_eq!(
+        list_payments("default".to_string())
+            .expect("payments should list")
+            .len(),
+        0
+    );
+
+    let quote = block_on_ready(get_deposit_quote("default".to_string(), 1_000_000))
+        .expect("quote should load updated fee");
+    assert_eq!(quote.expected_fee_e8s, 12_345);
+}
+
+#[test]
+fn deposit_unknown_duplicate_requires_operator_verification() {
+    install_test_service();
+    set_test_icp_transfer_from(Err(TransferFromError::Duplicate {
+        duplicate_of: Nat::from(404_u64),
+    }));
+
+    let error = block_on_ready(deposit_with_approval("default".to_string(), 1_000_000))
+        .expect_err("unknown duplicate should fail");
+
+    assert!(error.contains("operator verification required"));
+}
+
+#[test]
+fn manual_top_up_requires_controller() {
+    install_test_service();
+    set_test_caller_text(Some("aaaaa-aa"));
+
+    let rejected = top_up_database_balance(DatabaseBalanceTopUpRequest {
+        database_id: "default".to_string(),
+        units: 1,
+    })
+    .expect_err("non-controller should not top up");
+    assert!(rejected.contains("caller is not a canister controller"));
+
+    set_test_caller_is_controller(true);
+    let billing = top_up_database_balance(DatabaseBalanceTopUpRequest {
+        database_id: "default".to_string(),
+        units: 1,
+    })
+    .expect("controller should top up");
+
+    assert_eq!(billing.status, DatabaseBillingStatus::Active);
+}
+
+#[test]
+fn transfer_from_errors_are_user_actionable() {
+    assert!(
+        describe_transfer_from_error(&TransferFromError::BadFee {
+            expected_fee: Nat::from(10_000_u64)
+        })
+        .contains("bad ICP ledger fee")
+    );
+    assert!(
+        describe_transfer_from_error(&TransferFromError::InsufficientAllowance {
+            allowance: Nat::from(0_u64)
+        })
+        .contains("approve不足")
+    );
+    assert!(
+        describe_transfer_from_error(&TransferFromError::TemporarilyUnavailable)
+            .contains("balance unchanged")
+    );
 }
 
 #[test]

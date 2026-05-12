@@ -1,6 +1,8 @@
 // Where: crates/vfs_runtime/src/lib.rs
 // What: Service orchestration for multiple SQLite-backed VFS databases.
 // Why: One canister can host isolated databases while sharing one VFS store implementation.
+mod sql;
+
 use std::fs::{File, OpenOptions, create_dir_all, metadata, remove_file};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -9,16 +11,19 @@ use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 use vfs_store::FsStore;
 use vfs_types::{
-    AppendNodeRequest, ChildNode, DatabaseArchiveInfo, DatabaseInfo, DatabaseMember, DatabaseRole,
-    DatabaseStatus, DatabaseSummary, DeleteNodeRequest, DeleteNodeResult, EditNodeRequest,
-    EditNodeResult, ExportSnapshotRequest, ExportSnapshotResponse, FetchUpdatesRequest,
-    FetchUpdatesResponse, GlobNodeHit, GlobNodesRequest, GraphLinksRequest,
+    AppendNodeRequest, ChildNode, DatabaseArchiveInfo, DatabaseBalanceTopUpRequest,
+    DatabaseBilling, DatabaseBillingStatus, DatabaseInfo, DatabaseMember, DatabaseQuotaRequest,
+    DatabaseRole, DatabaseStatus, DatabaseSummary, DatabaseTokenInfo, DatabaseTokenScope,
+    DatabaseUsage, DeleteNodeRequest, DeleteNodeResult, DepositQuote, DepositResult,
+    EditNodeRequest, EditNodeResult, ExportSnapshotRequest, ExportSnapshotResponse,
+    FetchUpdatesRequest, FetchUpdatesResponse, GlobNodeHit, GlobNodesRequest, GraphLinksRequest,
     GraphNeighborhoodRequest, IncomingLinksRequest, LinkEdge, ListChildrenRequest,
     ListNodesRequest, MkdirNodeRequest, MkdirNodeResult, MoveNodeRequest, MoveNodeResult,
     MultiEditNodeRequest, MultiEditNodeResult, Node, NodeContext, NodeContextRequest, NodeEntry,
-    NodeKind, OutgoingLinksRequest, QueryContext, QueryContextRequest, RecentNodeHit,
-    RecentNodesRequest, SearchNodeHit, SearchNodePathsRequest, SearchNodesRequest, SourceEvidence,
-    SourceEvidenceRequest, Status, WriteNodeRequest, WriteNodeResult,
+    NodeKind, OutgoingLinksRequest, PaymentRecord, QueryContext, QueryContextRequest,
+    RecentNodeHit, RecentNodesRequest, SearchNodeHit, SearchNodePathsRequest, SearchNodesRequest,
+    SourceEvidence, SourceEvidenceRequest, SqlBatchRequest, SqlExecuteRequest, SqlExecuteResponse,
+    Status, WriteNodeRequest, WriteNodeResult,
 };
 use wiki_domain::validate_source_path_for_kind;
 
@@ -28,17 +33,39 @@ const INDEX_SCHEMA_VERSION_RESTORE_SIZE: &str = "database_index:002_restore_size
 const INDEX_SCHEMA_VERSION_RESTORE_CHUNKS: &str = "database_index:003_restore_chunks";
 const INDEX_SCHEMA_VERSION_USAGE_EVENTS: &str = "database_index:004_usage_events";
 const INDEX_SCHEMA_VERSION_MOUNT_HISTORY: &str = "database_index:005_mount_history";
+const INDEX_SCHEMA_VERSION_QUOTAS: &str = "database_index:006_quotas";
+const INDEX_SCHEMA_VERSION_BILLING: &str = "database_index:007_billing";
+const INDEX_SCHEMA_VERSION_TOKENS: &str = "database_index:008_tokens";
+const INDEX_SCHEMA_VERSION_PAYMENTS: &str = "database_index:009_payments";
+const INDEX_SCHEMA_VERSION_BILLING_CONFIG: &str = "database_index:010_billing_config";
 const DATABASE_SCHEMA_VERSION: &str = "vfs_store:current";
 const MIN_DATABASE_MOUNT_ID: u16 = 11;
 const MAX_DATABASE_MOUNT_ID: u16 = 32767;
 pub const MAX_ARCHIVE_CHUNK_BYTES: u32 = 1024 * 1024;
 pub const MAX_RESTORE_CHUNK_BYTES: usize = 1024 * 1024;
 pub const MAX_DATABASE_SIZE_BYTES: u64 = i64::MAX as u64;
+pub const DEFAULT_DATABASE_QUOTA_BYTES: u64 = 64 * 1024 * 1024;
+pub const DEFAULT_DATABASE_BALANCE_UNITS: u64 = 1_000;
 pub const USAGE_EVENTS_RETENTION_LIMIT: u64 = 100_000;
+pub use sql::{
+    DEFAULT_SQL_MAX_ROWS, MAX_SQL_BATCH_STATEMENTS, MAX_SQL_PARAMS, MAX_SQL_RESPONSE_BYTES,
+    MAX_SQL_ROWS, MAX_SQL_TEXT_BYTES,
+};
 const USAGE_EVENTS_PURGE_INTERVAL: i64 = 100;
 const SHA256_DIGEST_BYTES: usize = 32;
 const GENERATED_DATABASE_ID_PREFIX: &str = "db_";
 const GENERATED_DATABASE_ID_HASH_CHARS: usize = 12;
+const GENERATED_TOKEN_ID_PREFIX: &str = "tok_";
+const GENERATED_TOKEN_ID_HASH_CHARS: usize = 12;
+const GENERATED_PAYMENT_ID_PREFIX: &str = "pay_";
+const GENERATED_PAYMENT_ID_HASH_CHARS: usize = 12;
+pub const SQL_QUERY_BILLING_UNITS: u64 = 1;
+pub const SQL_EXECUTE_BILLING_UNITS: u64 = 5;
+pub const ICP_E8S_PER_ICP: u64 = 100_000_000;
+pub const ICPDB_UNITS_PER_ICP: u64 = 100_000;
+pub const MIN_DEPOSIT_E8S: u64 = 1_000_000;
+pub const ICP_TRANSFER_FEE_E8S_DEFAULT: u64 = 10_000;
+const BILLING_CONFIG_ICP_TRANSFER_FEE_E8S: &str = "icp_transfer_fee_e8s";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DatabaseMeta {
@@ -81,6 +108,13 @@ pub struct UsageEvent<'a> {
     pub cycles_delta: u128,
     pub error: Option<&'a str>,
     pub now: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthenticatedDatabaseToken {
+    pub token_id: String,
+    pub database_id: String,
+    pub scope: DatabaseTokenScope,
 }
 
 pub struct VfsService {
@@ -150,6 +184,359 @@ impl VfsService {
         })
         .map(|count| count.max(0) as u64)
         .map_err(|error| error.to_string())
+    }
+
+    pub fn database_usage(&self, database_id: &str, caller: &str) -> Result<DatabaseUsage, String> {
+        self.require_role(database_id, caller, RequiredRole::Reader)?;
+        let conn = self.open_index()?;
+        conn.query_row(
+            "SELECT database_id, status, logical_size_bytes, max_logical_size_bytes,
+                    (SELECT COUNT(*) FROM usage_events WHERE database_id = databases.database_id)
+             FROM databases
+             WHERE database_id = ?1",
+            params![database_id],
+            |row| {
+                let logical_size_bytes: i64 = row.get(2)?;
+                let max_logical_size_bytes: i64 = row.get(3)?;
+                let usage_event_count: i64 = row.get(4)?;
+                Ok(DatabaseUsage {
+                    database_id: row.get(0)?,
+                    status: status_from_db(&row.get::<_, String>(1)?)?,
+                    logical_size_bytes: logical_size_bytes.max(0) as u64,
+                    max_logical_size_bytes: max_logical_size_bytes.max(0) as u64,
+                    usage_event_count: usage_event_count.max(0) as u64,
+                })
+            },
+        )
+        .optional()
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("database not found: {database_id}"))
+    }
+
+    pub fn set_database_quota(
+        &self,
+        caller: &str,
+        request: DatabaseQuotaRequest,
+    ) -> Result<DatabaseUsage, String> {
+        self.require_role(&request.database_id, caller, RequiredRole::Owner)?;
+        if request.max_logical_size_bytes == 0 {
+            return Err("max_logical_size_bytes must be greater than 0".to_string());
+        }
+        let current_size = self
+            .database_usage(&request.database_id, caller)?
+            .logical_size_bytes;
+        if request.max_logical_size_bytes < current_size {
+            return Err(format!(
+                "quota is below current database size: {} < {}",
+                request.max_logical_size_bytes, current_size
+            ));
+        }
+        let conn = self.open_index()?;
+        conn.execute(
+            "UPDATE databases
+             SET max_logical_size_bytes = ?2
+             WHERE database_id = ?1",
+            params![
+                &request.database_id,
+                i64::try_from(request.max_logical_size_bytes).unwrap_or(i64::MAX)
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+        self.database_usage(&request.database_id, caller)
+    }
+
+    pub fn database_billing(
+        &self,
+        database_id: &str,
+        caller: &str,
+    ) -> Result<DatabaseBilling, String> {
+        self.require_role(database_id, caller, RequiredRole::Owner)?;
+        self.load_database_billing(database_id)
+    }
+
+    pub fn top_up_database_balance(
+        &self,
+        request: DatabaseBalanceTopUpRequest,
+    ) -> Result<DatabaseBilling, String> {
+        if request.units == 0 {
+            return Err("units must be greater than 0".to_string());
+        }
+        let conn = self.open_index()?;
+        conn.execute(
+            "UPDATE databases
+             SET billing_balance_units = billing_balance_units + ?2,
+                 billing_status = 'active'
+             WHERE database_id = ?1",
+            params![
+                &request.database_id,
+                i64::try_from(request.units).unwrap_or(i64::MAX)
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+        self.load_database_billing(&request.database_id)
+    }
+
+    pub fn icp_transfer_fee_e8s(&self) -> Result<u64, String> {
+        let conn = self.open_index()?;
+        load_billing_config_u64(&conn, BILLING_CONFIG_ICP_TRANSFER_FEE_E8S)
+            .map(|fee| fee.unwrap_or(ICP_TRANSFER_FEE_E8S_DEFAULT))
+    }
+
+    pub fn update_icp_transfer_fee_from_bad_fee(
+        &self,
+        expected_fee_e8s: u64,
+        now: i64,
+    ) -> Result<u64, String> {
+        if expected_fee_e8s == 0 {
+            return Err("expected_fee_e8s must be greater than 0".to_string());
+        }
+        let expected_fee_i64 = u64_to_sqlite_i64(expected_fee_e8s, "expected_fee_e8s")?;
+        let conn = self.open_index()?;
+        conn.execute(
+            "INSERT INTO billing_config (key, value_u64, updated_at_ms)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(key) DO UPDATE SET
+               value_u64 = excluded.value_u64,
+               updated_at_ms = excluded.updated_at_ms",
+            params![BILLING_CONFIG_ICP_TRANSFER_FEE_E8S, expected_fee_i64, now],
+        )
+        .map_err(|error| error.to_string())?;
+        Ok(expected_fee_e8s)
+    }
+
+    pub fn deposit_quote(
+        &self,
+        database_id: &str,
+        caller: &str,
+        amount_e8s: u64,
+        ledger_canister_id: &str,
+        spender_principal: &str,
+    ) -> Result<DepositQuote, String> {
+        self.require_role(database_id, caller, RequiredRole::Owner)?;
+        let expected_fee_e8s = self.icp_transfer_fee_e8s()?;
+        Ok(DepositQuote {
+            database_id: database_id.to_string(),
+            amount_e8s,
+            expected_fee_e8s,
+            credited_units: credited_units_for_deposit(amount_e8s)?,
+            ledger_canister_id: ledger_canister_id.to_string(),
+            spender_principal: spender_principal.to_string(),
+        })
+    }
+
+    pub fn record_approved_deposit(
+        &self,
+        database_id: &str,
+        payer_principal: &str,
+        amount_e8s: u64,
+        ledger_canister_id: &str,
+        block_index: u64,
+        now: i64,
+    ) -> Result<DepositResult, String> {
+        self.require_role(database_id, payer_principal, RequiredRole::Owner)?;
+        let credited_units = credited_units_for_deposit(amount_e8s)?;
+        let payment_id = generated_payment_id(
+            database_id,
+            payer_principal,
+            ledger_canister_id,
+            block_index,
+        );
+        let original_amount_e8s = amount_e8s;
+        let amount_e8s = u64_to_sqlite_i64(amount_e8s, "amount_e8s")?;
+        let credited_units_i64 = u64_to_sqlite_i64(credited_units, "credited_units")?;
+        let block_index_i64 = u64_to_sqlite_i64(block_index, "block_index")?;
+        let mut conn = self.open_index()?;
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        if load_payment_by_block(&tx, block_index)?.is_some() {
+            return Err(format!("payment block already recorded: {block_index}"));
+        }
+        tx.execute(
+            "INSERT INTO payments
+             (payment_id, database_id, payer_principal, amount_e8s, credited_units,
+              ledger_canister_id, block_index, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                &payment_id,
+                database_id,
+                payer_principal,
+                amount_e8s,
+                credited_units_i64,
+                ledger_canister_id,
+                block_index_i64,
+                now
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.execute(
+            "UPDATE databases
+             SET billing_balance_units = billing_balance_units + ?2,
+                 billing_status = 'active'
+             WHERE database_id = ?1",
+            params![database_id, credited_units_i64],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())?;
+        let balance = self.load_database_billing(database_id)?;
+        Ok(DepositResult {
+            database_id: database_id.to_string(),
+            amount_e8s: original_amount_e8s,
+            credited_units,
+            block_index,
+            balance_units: balance.balance_units,
+        })
+    }
+
+    pub fn deposit_result_for_existing_payment(
+        &self,
+        database_id: &str,
+        payer_principal: &str,
+        block_index: u64,
+    ) -> Result<DepositResult, String> {
+        self.require_role(database_id, payer_principal, RequiredRole::Owner)?;
+        let payment = self
+            .payment_for_block(block_index)?
+            .ok_or_else(|| format!("duplicate block is not recorded: {block_index}"))?;
+        if payment.database_id != database_id || payment.payer_principal != payer_principal {
+            return Err(format!(
+                "duplicate block belongs to another payment: {block_index}"
+            ));
+        }
+        let balance = self.load_database_billing(database_id)?;
+        Ok(DepositResult {
+            database_id: payment.database_id,
+            amount_e8s: payment.amount_e8s,
+            credited_units: payment.credited_units,
+            block_index: payment.block_index,
+            balance_units: balance.balance_units,
+        })
+    }
+
+    pub fn payment_for_block(&self, block_index: u64) -> Result<Option<PaymentRecord>, String> {
+        let conn = self.open_index()?;
+        load_payment_by_block(&conn, block_index)
+    }
+
+    pub fn list_payments(
+        &self,
+        database_id: &str,
+        caller: &str,
+    ) -> Result<Vec<PaymentRecord>, String> {
+        self.require_role(database_id, caller, RequiredRole::Owner)?;
+        let conn = self.open_index()?;
+        load_payments(&conn, database_id)
+    }
+
+    pub fn create_database_token(
+        &self,
+        caller: &str,
+        request: vfs_types::CreateDatabaseTokenRequest,
+        token_hash: Vec<u8>,
+        now: i64,
+    ) -> Result<DatabaseTokenInfo, String> {
+        self.require_role(&request.database_id, caller, RequiredRole::Owner)?;
+        validate_database_token_name(&request.name)?;
+        validate_token_hash(&token_hash)?;
+        let token_id = generated_token_id(&token_hash);
+        let conn = self.open_index()?;
+        conn.execute(
+            "INSERT INTO database_tokens
+             (token_id, database_id, name, scope, token_hash, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                &token_id,
+                &request.database_id,
+                &request.name,
+                token_scope_to_db(request.scope),
+                token_hash,
+                now
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+        Ok(DatabaseTokenInfo {
+            token_id,
+            database_id: request.database_id,
+            name: request.name,
+            scope: request.scope,
+            created_at_ms: now,
+            last_used_at_ms: None,
+            revoked_at_ms: None,
+        })
+    }
+
+    pub fn list_database_tokens(
+        &self,
+        database_id: &str,
+        caller: &str,
+    ) -> Result<Vec<DatabaseTokenInfo>, String> {
+        self.require_role(database_id, caller, RequiredRole::Owner)?;
+        let conn = self.open_index()?;
+        load_database_tokens(&conn, database_id)
+    }
+
+    pub fn revoke_database_token(
+        &self,
+        database_id: &str,
+        token_id: &str,
+        caller: &str,
+        now: i64,
+    ) -> Result<DatabaseTokenInfo, String> {
+        self.require_role(database_id, caller, RequiredRole::Owner)?;
+        let conn = self.open_index()?;
+        conn.execute(
+            "UPDATE database_tokens
+             SET revoked_at_ms = COALESCE(revoked_at_ms, ?3)
+             WHERE database_id = ?1 AND token_id = ?2",
+            params![database_id, token_id, now],
+        )
+        .map_err(|error| error.to_string())?;
+        load_database_token(&conn, database_id, token_id)?
+            .ok_or_else(|| format!("database token not found: {token_id}"))
+    }
+
+    pub fn authenticate_database_token(
+        &self,
+        token: &str,
+        required_role: RequiredRole,
+        now: i64,
+    ) -> Result<AuthenticatedDatabaseToken, String> {
+        let token_hash = hash_api_token(token);
+        let conn = self.open_index()?;
+        let token = conn
+            .query_row(
+                "SELECT token_id, database_id, scope, revoked_at_ms
+                 FROM database_tokens
+                 WHERE token_hash = ?1",
+                params![token_hash],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        token_scope_from_db(&row.get::<_, String>(2)?)?,
+                        row.get::<_, Option<i64>>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "invalid api token".to_string())?;
+        if token.3.is_some() {
+            return Err("api token revoked".to_string());
+        }
+        if !token_scope_allows(token.2, required_role) {
+            return Err("api token scope does not allow this operation".to_string());
+        }
+        conn.execute(
+            "UPDATE database_tokens
+             SET last_used_at_ms = ?2
+             WHERE token_id = ?1",
+            params![&token.0, now],
+        )
+        .map_err(|error| error.to_string())?;
+        Ok(AuthenticatedDatabaseToken {
+            token_id: token.0,
+            database_id: token.1,
+            scope: token.2,
+        })
     }
 
     pub fn create_database(
@@ -1062,6 +1449,145 @@ impl VfsService {
         })
     }
 
+    pub fn sql_query(
+        &self,
+        caller: &str,
+        request: SqlExecuteRequest,
+    ) -> Result<SqlExecuteResponse, String> {
+        let database_id = request.database_id.clone();
+        self.ensure_database_has_units(&database_id, SQL_QUERY_BILLING_UNITS)?;
+        let result = self.with_database_path(
+            &database_id,
+            caller,
+            RequiredRole::Reader,
+            |database_path, max_database_size_bytes| {
+                sql::execute_sql_file(
+                    database_path,
+                    request,
+                    sql::SqlMode::ReadOnly,
+                    max_database_size_bytes,
+                )
+            },
+        );
+        if result.is_ok() {
+            self.charge_database_units(&database_id, SQL_QUERY_BILLING_UNITS)?;
+        }
+        result
+    }
+
+    pub fn sql_execute(
+        &self,
+        caller: &str,
+        request: SqlExecuteRequest,
+    ) -> Result<SqlExecuteResponse, String> {
+        let database_id = request.database_id.clone();
+        self.ensure_database_has_units(&database_id, SQL_EXECUTE_BILLING_UNITS)?;
+        let result = self.with_database_path(
+            &database_id,
+            caller,
+            RequiredRole::Writer,
+            |database_path, max_database_size_bytes| {
+                sql::execute_sql_file(
+                    database_path,
+                    request,
+                    sql::SqlMode::ReadWrite,
+                    max_database_size_bytes,
+                )
+            },
+        );
+        if result.is_ok() {
+            self.charge_database_units(&database_id, SQL_EXECUTE_BILLING_UNITS)?;
+            self.refresh_logical_size(&database_id)?;
+        }
+        result
+    }
+
+    pub fn sql_batch(
+        &self,
+        caller: &str,
+        request: SqlBatchRequest,
+    ) -> Result<Vec<SqlExecuteResponse>, String> {
+        let database_id = request.database_id.clone();
+        let billing_units =
+            SQL_EXECUTE_BILLING_UNITS.saturating_mul(request.statements.len().max(1) as u64);
+        self.ensure_database_has_units(&database_id, billing_units)?;
+        let result = self.with_database_path(
+            &database_id,
+            caller,
+            RequiredRole::Writer,
+            |database_path, max_database_size_bytes| {
+                sql::execute_sql_batch_file(
+                    database_path,
+                    request.statements,
+                    request.max_rows,
+                    max_database_size_bytes,
+                )
+            },
+        );
+        if result.is_ok() {
+            self.charge_database_units(&database_id, billing_units)?;
+            self.refresh_logical_size(&database_id)?;
+        }
+        result
+    }
+
+    pub fn sql_query_with_token(
+        &self,
+        auth: &AuthenticatedDatabaseToken,
+        request: SqlExecuteRequest,
+    ) -> Result<SqlExecuteResponse, String> {
+        if auth.database_id != request.database_id {
+            return Err("api token database_id does not match request".to_string());
+        }
+        self.ensure_database_has_units(&auth.database_id, SQL_QUERY_BILLING_UNITS)?;
+        let result = self.with_database_path_for_token(
+            &auth.database_id,
+            RequiredRole::Reader,
+            auth.scope,
+            |database_path, max_database_size_bytes| {
+                sql::execute_sql_file(
+                    database_path,
+                    request,
+                    sql::SqlMode::ReadOnly,
+                    max_database_size_bytes,
+                )
+            },
+        );
+        if result.is_ok() {
+            self.charge_database_units(&auth.database_id, SQL_QUERY_BILLING_UNITS)?;
+        }
+        result
+    }
+
+    pub fn sql_execute_with_token(
+        &self,
+        auth: &AuthenticatedDatabaseToken,
+        request: SqlExecuteRequest,
+    ) -> Result<SqlExecuteResponse, String> {
+        if auth.database_id != request.database_id {
+            return Err("api token database_id does not match request".to_string());
+        }
+        self.ensure_database_has_units(&auth.database_id, SQL_EXECUTE_BILLING_UNITS)?;
+        let result = self.with_database_path_for_token(
+            &auth.database_id,
+            RequiredRole::Writer,
+            auth.scope,
+            |database_path, max_database_size_bytes| {
+                sql::execute_sql_file(
+                    database_path,
+                    request,
+                    sql::SqlMode::ReadWrite,
+                    max_database_size_bytes,
+                )
+            },
+        );
+        if result.is_ok() {
+            self.charge_database_units(&auth.database_id, SQL_EXECUTE_BILLING_UNITS)?;
+            self.refresh_logical_size(&auth.database_id)?;
+        }
+        result
+    }
+
     fn with_database_store<T>(
         &self,
         database_id: &str,
@@ -1073,6 +1599,38 @@ impl VfsService {
         let meta = self.database_meta(database_id)?;
         let store = FsStore::new(PathBuf::from(meta.db_file_name));
         f(&store)
+    }
+
+    fn with_database_path<T>(
+        &self,
+        database_id: &str,
+        caller: &str,
+        required_role: RequiredRole,
+        f: impl FnOnce(&Path, u64) -> Result<T, String>,
+    ) -> Result<T, String> {
+        self.require_role(database_id, caller, required_role)?;
+        let meta = self.database_meta(database_id)?;
+        f(
+            Path::new(&meta.db_file_name),
+            self.database_quota(database_id)?,
+        )
+    }
+
+    fn with_database_path_for_token<T>(
+        &self,
+        database_id: &str,
+        required_role: RequiredRole,
+        scope: DatabaseTokenScope,
+        f: impl FnOnce(&Path, u64) -> Result<T, String>,
+    ) -> Result<T, String> {
+        if !token_scope_allows(scope, required_role) {
+            return Err("api token scope does not allow this operation".to_string());
+        }
+        let meta = self.database_meta(database_id)?;
+        f(
+            Path::new(&meta.db_file_name),
+            self.database_quota(database_id)?,
+        )
     }
 
     fn require_role(
@@ -1172,6 +1730,83 @@ impl VfsService {
             .map_err(|error| error.to_string())?
             .ok_or_else(|| format!("database not found: {database_id}"))?;
         hash.ok_or_else(|| format!("snapshot_hash is missing: {database_id}"))
+    }
+
+    fn database_quota(&self, database_id: &str) -> Result<u64, String> {
+        let conn = self.open_index()?;
+        conn.query_row(
+            "SELECT max_logical_size_bytes FROM databases WHERE database_id = ?1",
+            params![database_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|quota| quota.max(0) as u64)
+        .optional()
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("database not found: {database_id}"))
+    }
+
+    fn load_database_billing(&self, database_id: &str) -> Result<DatabaseBilling, String> {
+        let conn = self.open_index()?;
+        conn.query_row(
+            "SELECT database_id, billing_status, billing_balance_units, billing_spent_units,
+                    (SELECT COUNT(*) FROM usage_events WHERE database_id = databases.database_id)
+             FROM databases
+             WHERE database_id = ?1",
+            params![database_id],
+            |row| {
+                let balance_units: i64 = row.get(2)?;
+                let spent_units: i64 = row.get(3)?;
+                let usage_event_count: i64 = row.get(4)?;
+                Ok(DatabaseBilling {
+                    database_id: row.get(0)?,
+                    status: billing_status_from_db(&row.get::<_, String>(1)?)?,
+                    balance_units: balance_units.max(0) as u64,
+                    spent_units: spent_units.max(0) as u64,
+                    usage_event_count: usage_event_count.max(0) as u64,
+                })
+            },
+        )
+        .optional()
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("database not found: {database_id}"))
+    }
+
+    fn ensure_database_has_units(&self, database_id: &str, units: u64) -> Result<(), String> {
+        let billing = self.load_database_billing(database_id)?;
+        if billing.status != DatabaseBillingStatus::Active {
+            return Err(format!("database billing is suspended: {database_id}"));
+        }
+        if billing.balance_units < units {
+            let conn = self.open_index()?;
+            conn.execute(
+                "UPDATE databases
+                 SET billing_status = 'suspended'
+                 WHERE database_id = ?1",
+                params![database_id],
+            )
+            .map_err(|error| error.to_string())?;
+            return Err(format!(
+                "database billing balance exhausted: {} < {}",
+                billing.balance_units, units
+            ));
+        }
+        Ok(())
+    }
+
+    fn charge_database_units(&self, database_id: &str, units: u64) -> Result<(), String> {
+        if units == 0 {
+            return Ok(());
+        }
+        let conn = self.open_index()?;
+        conn.execute(
+            "UPDATE databases
+             SET billing_balance_units = MAX(billing_balance_units - ?2, 0),
+                 billing_spent_units = billing_spent_units + ?2
+             WHERE database_id = ?1",
+            params![database_id, i64::try_from(units).unwrap_or(i64::MAX)],
+        )
+        .map_err(|error| error.to_string())?;
+        Ok(())
     }
 
     fn refresh_logical_size(&self, database_id: &str) -> Result<(), String> {
@@ -1311,29 +1946,137 @@ fn run_index_migrations(conn: &mut Connection) -> Result<(), String> {
         .map_err(|error| error.to_string())?;
         tx.commit().map_err(|error| error.to_string())?;
     }
-    if migration_applied(conn, INDEX_SCHEMA_VERSION_MOUNT_HISTORY)? {
-        return Ok(());
+    if !migration_applied(conn, INDEX_SCHEMA_VERSION_MOUNT_HISTORY)? {
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        tx.execute_batch(
+            "CREATE TABLE database_mount_history (
+               database_id TEXT NOT NULL,
+               mount_id INTEGER NOT NULL,
+               reason TEXT NOT NULL,
+               created_at_ms INTEGER NOT NULL,
+               PRIMARY KEY (mount_id)
+             );
+             INSERT OR IGNORE INTO database_mount_history
+               (database_id, mount_id, reason, created_at_ms)
+               SELECT database_id, mount_id, 'create', created_at_ms FROM databases;",
+        )
+        .map_err(|error| error.to_string())?;
+        tx.execute(
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, strftime('%s','now'))",
+            params![INDEX_SCHEMA_VERSION_MOUNT_HISTORY],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())?;
     }
-    let tx = conn.transaction().map_err(|error| error.to_string())?;
-    tx.execute_batch(
-        "CREATE TABLE database_mount_history (
-           database_id TEXT NOT NULL,
-           mount_id INTEGER NOT NULL,
-           reason TEXT NOT NULL,
-           created_at_ms INTEGER NOT NULL,
-           PRIMARY KEY (mount_id)
-         );
-         INSERT OR IGNORE INTO database_mount_history
-           (database_id, mount_id, reason, created_at_ms)
-           SELECT database_id, mount_id, 'create', created_at_ms FROM databases;",
-    )
-    .map_err(|error| error.to_string())?;
-    tx.execute(
-        "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, strftime('%s','now'))",
-        params![INDEX_SCHEMA_VERSION_MOUNT_HISTORY],
-    )
-    .map_err(|error| error.to_string())?;
-    tx.commit().map_err(|error| error.to_string())
+    if !migration_applied(conn, INDEX_SCHEMA_VERSION_QUOTAS)? {
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        tx.execute_batch(&format!(
+            "ALTER TABLE databases
+             ADD COLUMN max_logical_size_bytes INTEGER NOT NULL DEFAULT {DEFAULT_DATABASE_QUOTA_BYTES};"
+        ))
+        .map_err(|error| error.to_string())?;
+        tx.execute(
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, strftime('%s','now'))",
+            params![INDEX_SCHEMA_VERSION_QUOTAS],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())?;
+    }
+    if !migration_applied(conn, INDEX_SCHEMA_VERSION_BILLING)? {
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        tx.execute_batch(&format!(
+            "ALTER TABLE databases
+               ADD COLUMN billing_status TEXT NOT NULL DEFAULT 'active';
+             ALTER TABLE databases
+               ADD COLUMN billing_balance_units INTEGER NOT NULL DEFAULT {DEFAULT_DATABASE_BALANCE_UNITS};
+             ALTER TABLE databases
+               ADD COLUMN billing_spent_units INTEGER NOT NULL DEFAULT 0;"
+        ))
+        .map_err(|error| error.to_string())?;
+        tx.execute(
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, strftime('%s','now'))",
+            params![INDEX_SCHEMA_VERSION_BILLING],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())?;
+    }
+    if !migration_applied(conn, INDEX_SCHEMA_VERSION_TOKENS)? {
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        tx.execute_batch(
+            "CREATE TABLE database_tokens (
+               token_id TEXT PRIMARY KEY,
+               database_id TEXT NOT NULL,
+               name TEXT NOT NULL,
+               scope TEXT NOT NULL,
+               token_hash BLOB NOT NULL UNIQUE,
+               created_at_ms INTEGER NOT NULL,
+               last_used_at_ms INTEGER,
+               revoked_at_ms INTEGER,
+               FOREIGN KEY (database_id) REFERENCES databases(database_id)
+             );
+             CREATE INDEX database_tokens_database_id_idx
+               ON database_tokens(database_id, revoked_at_ms);",
+        )
+        .map_err(|error| error.to_string())?;
+        tx.execute(
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, strftime('%s','now'))",
+            params![INDEX_SCHEMA_VERSION_TOKENS],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())?;
+    }
+    if !migration_applied(conn, INDEX_SCHEMA_VERSION_PAYMENTS)? {
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        tx.execute_batch(
+            "CREATE TABLE payments (
+               payment_id TEXT PRIMARY KEY,
+               database_id TEXT NOT NULL,
+               payer_principal TEXT NOT NULL,
+               amount_e8s INTEGER NOT NULL,
+               credited_units INTEGER NOT NULL,
+               ledger_canister_id TEXT NOT NULL,
+               block_index INTEGER NOT NULL UNIQUE,
+               created_at_ms INTEGER NOT NULL,
+               FOREIGN KEY (database_id) REFERENCES databases(database_id)
+             );
+             CREATE INDEX payments_database_id_created_at_idx
+               ON payments(database_id, created_at_ms DESC);",
+        )
+        .map_err(|error| error.to_string())?;
+        tx.execute(
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, strftime('%s','now'))",
+            params![INDEX_SCHEMA_VERSION_PAYMENTS],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())?;
+    }
+    if !migration_applied(conn, INDEX_SCHEMA_VERSION_BILLING_CONFIG)? {
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        tx.execute_batch(
+            "CREATE TABLE billing_config (
+               key TEXT PRIMARY KEY,
+               value_u64 INTEGER NOT NULL,
+               updated_at_ms INTEGER NOT NULL
+             );",
+        )
+        .map_err(|error| error.to_string())?;
+        tx.execute(
+            "INSERT INTO billing_config (key, value_u64, updated_at_ms)
+             VALUES (?1, ?2, 0)",
+            params![
+                BILLING_CONFIG_ICP_TRANSFER_FEE_E8S,
+                i64::try_from(ICP_TRANSFER_FEE_E8S_DEFAULT).unwrap_or(i64::MAX)
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.execute(
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, strftime('%s','now'))",
+            params![INDEX_SCHEMA_VERSION_BILLING_CONFIG],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
 
 fn migration_applied(conn: &Connection, version: &str) -> Result<bool, String> {
@@ -1401,6 +2144,38 @@ fn validate_database_id(database_id: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_database_token_name(name: &str) -> Result<(), String> {
+    if name.is_empty() || name.len() > 64 {
+        return Err("token name must be 1..64 characters".to_string());
+    }
+    if !name
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err(
+            "token name may only contain ASCII letters, digits, '-', '_' and '.'".to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_token_hash(token_hash: &[u8]) -> Result<(), String> {
+    if token_hash.len() == SHA256_DIGEST_BYTES {
+        Ok(())
+    } else {
+        Err(format!(
+            "token_hash must be a {SHA256_DIGEST_BYTES}-byte SHA-256 digest"
+        ))
+    }
+}
+
+pub fn hash_api_token(token: &str) -> Vec<u8> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"icpdb-api-token-v1");
+    hasher.update(token.as_bytes());
+    hasher.finalize().to_vec()
+}
+
 fn generated_database_id(caller: &str, now: i64, mount_id: u16, attempt: u32) -> String {
     let mut hasher = Sha256::new();
     hasher.update(caller.as_bytes());
@@ -1411,6 +2186,46 @@ fn generated_database_id(caller: &str, now: i64, mount_id: u16, attempt: u32) ->
         "{GENERATED_DATABASE_ID_PREFIX}{}",
         &base32_lower(&hasher.finalize())[..GENERATED_DATABASE_ID_HASH_CHARS]
     )
+}
+
+fn generated_token_id(token_hash: &[u8]) -> String {
+    format!(
+        "{GENERATED_TOKEN_ID_PREFIX}{}",
+        &base32_lower(token_hash)[..GENERATED_TOKEN_ID_HASH_CHARS]
+    )
+}
+
+fn generated_payment_id(
+    database_id: &str,
+    payer_principal: &str,
+    ledger_canister_id: &str,
+    block_index: u64,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"icpdb-payment-v1");
+    hasher.update(database_id.as_bytes());
+    hasher.update(payer_principal.as_bytes());
+    hasher.update(ledger_canister_id.as_bytes());
+    hasher.update(block_index.to_be_bytes());
+    format!(
+        "{GENERATED_PAYMENT_ID_PREFIX}{}",
+        &base32_lower(&hasher.finalize())[..GENERATED_PAYMENT_ID_HASH_CHARS]
+    )
+}
+
+fn credited_units_for_deposit(amount_e8s: u64) -> Result<u64, String> {
+    if amount_e8s < MIN_DEPOSIT_E8S {
+        return Err(format!("minimum ICP deposit is {MIN_DEPOSIT_E8S} e8s"));
+    }
+    amount_e8s
+        .checked_mul(ICPDB_UNITS_PER_ICP)
+        .and_then(|amount| amount.checked_div(ICP_E8S_PER_ICP))
+        .filter(|units| *units > 0)
+        .ok_or_else(|| "deposit amount overflows billing unit conversion".to_string())
+}
+
+fn u64_to_sqlite_i64(value: u64, name: &str) -> Result<i64, String> {
+    i64::try_from(value).map_err(|_| format!("{name} exceeds SQLite integer range"))
 }
 
 fn base32_lower(bytes: &[u8]) -> String {
@@ -1706,6 +2521,109 @@ fn load_member_role(
     .map_err(|error| error.to_string())
 }
 
+fn load_database_tokens(
+    conn: &Connection,
+    database_id: &str,
+) -> Result<Vec<DatabaseTokenInfo>, String> {
+    conn.prepare(
+        "SELECT token_id, database_id, name, scope, created_at_ms, last_used_at_ms, revoked_at_ms
+         FROM database_tokens
+         WHERE database_id = ?1
+         ORDER BY created_at_ms DESC, token_id ASC",
+    )
+    .map_err(|error| error.to_string())?
+    .query_map(params![database_id], map_database_token)
+    .map_err(|error| error.to_string())?
+    .collect::<Result<Vec<_>, _>>()
+    .map_err(|error| error.to_string())
+}
+
+fn load_database_token(
+    conn: &Connection,
+    database_id: &str,
+    token_id: &str,
+) -> Result<Option<DatabaseTokenInfo>, String> {
+    conn.query_row(
+        "SELECT token_id, database_id, name, scope, created_at_ms, last_used_at_ms, revoked_at_ms
+         FROM database_tokens
+         WHERE database_id = ?1 AND token_id = ?2",
+        params![database_id, token_id],
+        map_database_token,
+    )
+    .optional()
+    .map_err(|error| error.to_string())
+}
+
+fn load_payments(conn: &Connection, database_id: &str) -> Result<Vec<PaymentRecord>, String> {
+    conn.prepare(
+        "SELECT payment_id, database_id, payer_principal, amount_e8s, credited_units,
+                block_index, created_at_ms
+         FROM payments
+         WHERE database_id = ?1
+         ORDER BY created_at_ms DESC, block_index DESC",
+    )
+    .map_err(|error| error.to_string())?
+    .query_map(params![database_id], map_payment_record)
+    .map_err(|error| error.to_string())?
+    .collect::<Result<Vec<_>, _>>()
+    .map_err(|error| error.to_string())
+}
+
+fn load_payment_by_block(
+    conn: &Connection,
+    block_index: u64,
+) -> Result<Option<PaymentRecord>, String> {
+    let block_index = u64_to_sqlite_i64(block_index, "block_index")?;
+    conn.query_row(
+        "SELECT payment_id, database_id, payer_principal, amount_e8s, credited_units,
+                block_index, created_at_ms
+         FROM payments
+         WHERE block_index = ?1",
+        params![block_index],
+        map_payment_record,
+    )
+    .optional()
+    .map_err(|error| error.to_string())
+}
+
+fn load_billing_config_u64(conn: &Connection, key: &str) -> Result<Option<u64>, String> {
+    conn.query_row(
+        "SELECT value_u64 FROM billing_config WHERE key = ?1",
+        params![key],
+        |row| row.get::<_, i64>(0),
+    )
+    .optional()
+    .map(|value| value.map(|value| value.max(0) as u64))
+    .map_err(|error| error.to_string())
+}
+
+fn map_payment_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<PaymentRecord> {
+    let amount_e8s: i64 = row.get(3)?;
+    let credited_units: i64 = row.get(4)?;
+    let block_index: i64 = row.get(5)?;
+    Ok(PaymentRecord {
+        payment_id: row.get(0)?,
+        database_id: row.get(1)?,
+        payer_principal: row.get(2)?,
+        amount_e8s: amount_e8s.max(0) as u64,
+        credited_units: credited_units.max(0) as u64,
+        block_index: block_index.max(0) as u64,
+        created_at_ms: row.get(6)?,
+    })
+}
+
+fn map_database_token(row: &rusqlite::Row<'_>) -> rusqlite::Result<DatabaseTokenInfo> {
+    Ok(DatabaseTokenInfo {
+        token_id: row.get(0)?,
+        database_id: row.get(1)?,
+        name: row.get(2)?,
+        scope: token_scope_from_db(&row.get::<_, String>(3)?)?,
+        created_at_ms: row.get(4)?,
+        last_used_at_ms: row.get(5)?,
+        revoked_at_ms: row.get(6)?,
+    })
+}
+
 fn role_from_db(role: &str) -> rusqlite::Result<DatabaseRole> {
     match role {
         "owner" => Ok(DatabaseRole::Owner),
@@ -1720,6 +2638,38 @@ fn role_to_db(role: DatabaseRole) -> &'static str {
         DatabaseRole::Owner => "owner",
         DatabaseRole::Writer => "writer",
         DatabaseRole::Reader => "reader",
+    }
+}
+
+fn billing_status_from_db(status: &str) -> rusqlite::Result<DatabaseBillingStatus> {
+    match status {
+        "active" => Ok(DatabaseBillingStatus::Active),
+        "suspended" => Ok(DatabaseBillingStatus::Suspended),
+        _ => Err(rusqlite::Error::InvalidQuery),
+    }
+}
+
+fn token_scope_from_db(scope: &str) -> rusqlite::Result<DatabaseTokenScope> {
+    match scope {
+        "read" => Ok(DatabaseTokenScope::Read),
+        "write" => Ok(DatabaseTokenScope::Write),
+        _ => Err(rusqlite::Error::InvalidQuery),
+    }
+}
+
+fn token_scope_to_db(scope: DatabaseTokenScope) -> &'static str {
+    match scope {
+        DatabaseTokenScope::Read => "read",
+        DatabaseTokenScope::Write => "write",
+    }
+}
+
+fn token_scope_allows(scope: DatabaseTokenScope, required_role: RequiredRole) -> bool {
+    match scope {
+        DatabaseTokenScope::Read => required_role == RequiredRole::Reader,
+        DatabaseTokenScope::Write => {
+            required_role == RequiredRole::Reader || required_role == RequiredRole::Writer
+        }
     }
 }
 

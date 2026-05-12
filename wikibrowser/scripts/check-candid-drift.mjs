@@ -159,8 +159,11 @@ function normalizeIdlShape(value) {
     .replace(/^Nat32$/, "nat32")
     .replace(/^Nat$/, "nat")
     .replace(/^Float32$/, "float32")
+    .replace(/^Float64$/, "float64")
+    .replace(/^Nat8$/, "nat8")
     .replace(/^Bool$/, "bool")
     .replace(/^Null$/, "null")
+    .replace(/^Vec\(idl\.Nat8\)$/, "blob")
     .replace(/^Opt\((.+)\)$/, (_, inner) => `opt ${normalizeIdlShape(inner)}`)
     .replace(/^Vec\((.+)\)$/, (_, inner) => `vec ${normalizeIdlShape(inner)}`);
 }
@@ -183,18 +186,28 @@ function normalizeShape(value) {
 
 function normalizeResultAlias(value) {
   const normalized = normalizeShape(value);
-  if (normalized === "Result_9") return "ResultLinks";
-  if (normalized === "Result_10") return "ResultChildren";
+  if (normalized === "Result_10") return "ResultBilling";
+  if (normalized === "Result_11") return "ResultDepositQuote";
+  if (normalized === "Result_12") return "ResultUsage";
+  if (normalized === "Result_14") return "ResultLinks";
+  if (normalized === "Result_15") return "ResultChildren";
+  if (normalized === "Result_16") return "ResultMembers";
+  if (normalized === "Result_17") return "ResultTokens";
+  if (normalized === "Result_18") return "ResultDatabases";
   if (normalized === "Result_2") return "ResultUnit";
   if (normalized === "Result_3") return "ResultCreateDatabase";
-  if (normalized === "Result_11") return "ResultMembers";
-  if (normalized === "Result_12") return "ResultDatabases";
-  if (normalized === "Result_16") return "ResultQueryContext";
-  if (normalized === "Result_18") return "ResultNode";
-  if (normalized === "Result_19") return "ResultNodeContext";
-  if (normalized === "Result_20") return "ResultRecent";
-  if (normalized === "Result_21") return "ResultSearch";
-  if (normalized === "Result_22") return "ResultSourceEvidence";
+  if (normalized === "Result_4") return "ResultCreateToken";
+  if (normalized === "Result_6") return "ResultDeposit";
+  if (normalized === "Result_20") return "ResultPayments";
+  if (normalized === "Result_23") return "ResultQueryContext";
+  if (normalized === "Result_25") return "ResultNode";
+  if (normalized === "Result_26") return "ResultNodeContext";
+  if (normalized === "Result_27") return "ResultRecent";
+  if (normalized === "Result_28") return "ResultToken";
+  if (normalized === "Result_29") return "ResultSearch";
+  if (normalized === "Result_30") return "ResultSourceEvidence";
+  if (normalized === "Result_31") return "ResultSqlBatch";
+  if (normalized === "Result_32") return "ResultSql";
   if (normalized === "Result") return "ResultWriteNode";
   return normalized;
 }
