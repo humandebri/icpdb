@@ -2,15 +2,19 @@
 // What: Entry-point level tests for the ICPDB canister surface.
 // Why: SQL hosting, billing, deposit, and lifecycle wrappers need direct coverage.
 use std::future::Future;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::task::{Context, Poll, Wake, Waker};
 
 use candid::Nat;
-use icpdb_runtime::IcpdbService;
+use icpdb_runtime::{IcpdbService, hash_api_token};
 use icpdb_types::{
-    CreateDatabaseTokenRequest, DatabaseBalanceTopUpRequest, DatabaseBillingStatus,
-    DatabaseRestoreChunkRequest, DatabaseRole, DatabaseStatus, DatabaseTokenScope,
-    SqlExecuteRequest,
+    CreateDatabaseShardRequest, CreateDatabaseTokenRequest, DatabaseBalanceTopUpRequest,
+    DatabaseBillingStatus, DatabaseRestoreChunkRequest, DatabaseRole, DatabaseShardStatusRequest,
+    DatabaseStatus, DatabaseTokenScope, MaintainDatabaseShardsRequest,
+    MigrateDatabaseToShardRequest, RoutedOperationRequest, RoutedOperationStatus,
+    ShardOperationReconcileRequest, SqlExecuteRequest, SqlValue, TablePreviewRequest,
+    TopUpDatabaseShardRequest,
 };
 use icrc_ledger_types::icrc2::transfer_from::TransferFromError;
 use sha2::{Digest, Sha256};
@@ -19,13 +23,16 @@ use tempfile::tempdir;
 use super::{
     HeaderField, HttpRequest, PENDING_DEPOSITS, SERVICE, acquire_deposit_guard_for_test,
     bearer_token, begin_database_archive, begin_database_restore, cancel_database_archive,
-    clear_test_icp_transfer_from, create_database, create_database_token, deposit_with_approval,
-    describe_transfer_from_error, fail_next_mount_database_file_for_test,
-    finalize_database_archive, finalize_database_restore, get_billing, get_deposit_quote,
-    grant_database_access, http_error_status, http_request, list_databases, list_payments,
-    read_database_archive_chunk, revoke_database_access, set_test_caller_is_controller,
-    set_test_caller_text, set_test_icp_transfer_from, sql_execute, sql_query,
-    top_up_database_balance, write_database_restore_chunk,
+    clear_test_icp_transfer_from, create_database, create_database_shard, create_database_token,
+    deposit_with_approval, describe_table, describe_transfer_from_error,
+    fail_next_mount_database_file_for_test, finalize_database_archive, finalize_database_restore,
+    get_billing, get_database_shard_status, get_deposit_quote, get_routed_operation,
+    get_usage_event_summaries, grant_database_access, http_error_status, http_request,
+    idempotency_key, list_all_database_placements, list_database_placements, list_databases,
+    list_payments, list_tables, maintain_database_shards, migrate_database_to_shard, preview_table,
+    read_database_archive_chunk, reconcile_shard_operation, revoke_database_access,
+    set_test_caller_is_controller, set_test_caller_text, set_test_icp_transfer_from, sql_execute,
+    sql_query, top_up_database_balance, top_up_database_shard, write_database_restore_chunk,
 };
 
 struct NoopWaker;
@@ -51,7 +58,7 @@ fn install_test_service() {
     PENDING_DEPOSITS.with(|pending| pending.borrow_mut().clear());
     let dir = tempdir().expect("tempdir should create");
     let root = dir.keep();
-    let service = IcpdbService::new(root.join("index.sqlite3"), root.join("databases"));
+    let service = test_service_for_root(&root);
     service
         .run_index_migrations()
         .expect("index migrations should run");
@@ -68,7 +75,7 @@ fn install_empty_test_service() {
     PENDING_DEPOSITS.with(|pending| pending.borrow_mut().clear());
     let dir = tempdir().expect("tempdir should create");
     let root = dir.keep();
-    let service = IcpdbService::new(root.join("index.sqlite3"), root.join("databases"));
+    let service = test_service_for_root(&root);
     service
         .run_index_migrations()
         .expect("index migrations should run");
@@ -87,6 +94,17 @@ fn usage_event_count() -> u64 {
 
 fn sha256_bytes(bytes: &[u8]) -> Vec<u8> {
     Sha256::digest(bytes).to_vec()
+}
+
+fn test_service_for_root(root: &std::path::Path) -> IcpdbService {
+    IcpdbService::new(
+        path_string(root.join("index.sqlite3")),
+        path_string(root.join("databases")),
+    )
+}
+
+fn path_string(path: PathBuf) -> String {
+    path.to_string_lossy().into_owned()
 }
 
 fn sql_request(database_id: &str, sql: &str) -> SqlExecuteRequest {
@@ -108,11 +126,28 @@ fn http_sql_request(method: &str, url: &str) -> HttpRequest {
     }
 }
 
+fn http_update_json(url: &str, token: &str, value: serde_json::Value) -> super::HttpUpdateRequest {
+    super::HttpUpdateRequest {
+        method: "POST".to_string(),
+        url: url.to_string(),
+        headers: vec![("authorization".to_string(), format!("Bearer {token}"))],
+        body: serde_json::to_vec(&value).expect("JSON body should encode"),
+    }
+}
+
+fn json_body(response: &super::HttpUpdateResponse) -> serde_json::Value {
+    serde_json::from_slice(&response.body).expect("response body should be JSON")
+}
+
+fn http_request_update(request: super::HttpUpdateRequest) -> super::HttpUpdateResponse {
+    block_on_ready(super::http_request_update(request))
+}
+
 #[test]
 fn empty_index_does_not_create_default_database() {
     let dir = tempdir().expect("tempdir should create");
     let root = dir.keep();
-    let service = IcpdbService::new(root.join("index.sqlite3"), root.join("databases"));
+    let service = test_service_for_root(&root);
     service
         .run_index_migrations()
         .expect("index migrations should run");
@@ -127,7 +162,7 @@ fn empty_index_does_not_create_default_database() {
 fn existing_database_index_is_loaded_without_implicit_default() {
     let dir = tempdir().expect("tempdir should create");
     let root = dir.keep();
-    let service = IcpdbService::new(root.join("index.sqlite3"), root.join("databases"));
+    let service = test_service_for_root(&root);
     service
         .run_index_migrations()
         .expect("index migrations should run");
@@ -148,11 +183,23 @@ fn canister_list_databases_returns_caller_membership_summaries() {
     install_test_service();
 
     let summaries = list_databases().expect("database summaries should load");
+    let placements = list_database_placements().expect("database placements should load");
+    assert!(list_all_database_placements().is_err());
+    set_test_caller_is_controller(true);
+    let all_placements =
+        list_all_database_placements().expect("all database placements should load");
+    set_test_caller_is_controller(false);
 
     assert_eq!(summaries.len(), 1);
     assert_eq!(summaries[0].database_id, "default");
     assert_eq!(summaries[0].role, DatabaseRole::Owner);
     assert_eq!(summaries[0].status, DatabaseStatus::Hot);
+    assert_eq!(placements.len(), 1);
+    assert_eq!(placements[0].database_id, "default");
+    assert_eq!(placements[0].shard_id, "local");
+    assert_eq!(placements[0].mount_id, Some(11));
+    assert_eq!(all_placements.len(), 1);
+    assert_eq!(all_placements[0].database_id, "default");
 }
 
 #[test]
@@ -160,19 +207,77 @@ fn update_entrypoints_record_usage_events() {
     install_empty_test_service();
     set_test_caller_text(Some("aaaaa-aa"));
 
-    let database_id = create_database().expect("database should create");
+    let database_id = block_on_ready(create_database()).expect("database should create");
     assert_eq!(usage_event_count(), 1);
 
     let failed = sql_execute(sql_request(&database_id, ""));
     assert!(failed.is_err());
     assert_eq!(usage_event_count(), 2);
+
+    sql_execute(sql_request(
+        &database_id,
+        "CREATE TABLE usage_probe (body TEXT)",
+    ))
+    .expect("table should create");
+    sql_execute(sql_request(
+        &database_id,
+        "INSERT INTO usage_probe (body) VALUES ('tracked')",
+    ))
+    .expect("row should insert");
+    let events = get_usage_event_summaries(database_id).expect("usage event summaries should load");
+    assert!(events.iter().any(|event| event.method == "sql_execute"
+        && event.operation.as_deref() == Some("INSERT")
+        && event.success
+        && event.total_rows_affected == 1));
+}
+
+#[test]
+fn table_editor_queries_use_caller_role() {
+    install_test_service();
+
+    sql_execute(SqlExecuteRequest {
+        database_id: "default".to_string(),
+        sql: "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL)".to_string(),
+        params: Vec::new(),
+        max_rows: None,
+    })
+    .expect("table should create");
+    sql_execute(SqlExecuteRequest {
+        database_id: "default".to_string(),
+        sql: "INSERT INTO notes (body) VALUES ('hello')".to_string(),
+        params: Vec::new(),
+        max_rows: None,
+    })
+    .expect("row should insert");
+
+    let tables = list_tables("default".to_string()).expect("tables should list");
+    assert_eq!(tables[0].name, "notes");
+
+    let description =
+        describe_table("default".to_string(), "notes".to_string()).expect("table should describe");
+    assert_eq!(description.columns[1].name, "body");
+    assert_eq!(description.columns[1].hidden, 0);
+
+    let preview = preview_table(TablePreviewRequest {
+        database_id: "default".to_string(),
+        table_name: "notes".to_string(),
+        limit: Some(10),
+        offset: None,
+    })
+    .expect("preview should load");
+    assert_eq!(preview.rows[0][1], SqlValue::Text("hello".to_string()));
+    assert_eq!(preview.total_count, 1);
+
+    set_test_caller_text(Some("aaaaa-aa"));
+    let error = list_tables("default".to_string()).expect_err("non-member should be rejected");
+    assert!(error.contains("principal has no access"));
 }
 
 #[test]
 fn anonymous_create_database_is_rejected() {
     install_empty_test_service();
 
-    let error = create_database().expect_err("anonymous create should fail");
+    let error = block_on_ready(create_database()).expect_err("anonymous create should fail");
 
     assert_eq!(error, "anonymous caller not allowed");
     assert!(
@@ -325,6 +430,160 @@ fn manual_top_up_requires_controller() {
 }
 
 #[test]
+fn create_database_shard_requires_controller_before_management_calls() {
+    install_empty_test_service();
+    set_test_caller_text(Some("aaaaa-aa"));
+
+    let error = block_on_ready(create_database_shard(CreateDatabaseShardRequest {
+        max_databases: 8,
+        initial_cycles: 1,
+    }))
+    .expect_err("non-controller should not create shards");
+
+    assert_eq!(error, "caller is not a controller");
+}
+
+#[test]
+fn top_up_database_shard_requires_registered_shard_before_deposit() {
+    install_empty_test_service();
+    set_test_caller_text(Some("aaaaa-aa"));
+    set_test_caller_is_controller(true);
+
+    let error = block_on_ready(top_up_database_shard(TopUpDatabaseShardRequest {
+        database_canister_id: "ryjl3-tyaaa-aaaaa-aaaba-cai".to_string(),
+        cycles: 1,
+    }))
+    .expect_err("unregistered shard should fail before deposit");
+
+    assert_eq!(error, "database shard is not registered");
+}
+
+#[test]
+fn get_database_shard_status_requires_registered_shard_before_management_call() {
+    install_empty_test_service();
+    set_test_caller_text(Some("aaaaa-aa"));
+    set_test_caller_is_controller(true);
+
+    let error = block_on_ready(get_database_shard_status(DatabaseShardStatusRequest {
+        database_canister_id: "ryjl3-tyaaa-aaaaa-aaaba-cai".to_string(),
+    }))
+    .expect_err("unregistered shard should fail before status call");
+
+    assert_eq!(error, "database shard is not registered");
+}
+
+#[test]
+fn maintain_database_shards_requires_controller_before_status_calls() {
+    install_empty_test_service();
+    set_test_caller_text(Some("aaaaa-aa"));
+
+    let error = block_on_ready(maintain_database_shards(MaintainDatabaseShardsRequest {
+        min_available_slots: 1,
+        min_cycles_balance: 0,
+        top_up_cycles: 0,
+        max_new_shards: 1,
+        new_shard_max_databases: 8,
+        new_shard_initial_cycles: 1,
+    }))
+    .expect_err("non-controller should not maintain shards");
+
+    assert_eq!(error, "caller is not a controller");
+}
+
+#[test]
+fn reconcile_shard_operation_requires_controller_and_unknown_status() {
+    install_empty_test_service();
+    set_test_caller_text(Some("aaaaa-aa"));
+
+    let request = ShardOperationReconcileRequest {
+        operation_id: "op_create_shard".to_string(),
+        status: RoutedOperationStatus::Applied,
+        error: None,
+    };
+    let error = reconcile_shard_operation(request.clone())
+        .expect_err("non-controller should not reconcile shard operations");
+    assert_eq!(error, "caller is not a controller");
+
+    set_test_caller_is_controller(true);
+    SERVICE.with(|slot| {
+        let service = slot.borrow();
+        let service = service.as_ref().expect("service should be installed");
+        service
+            .begin_shard_operation(
+                "op_create_shard",
+                "create_shard",
+                Some("database:aaaaa-aa"),
+                sha256_bytes(b"create shard"),
+                1,
+            )
+            .expect("operation should begin");
+    });
+    let not_unknown =
+        reconcile_shard_operation(request).expect_err("pending operation should not reconcile");
+    assert!(not_unknown.contains("shard operation is not unknown"));
+
+    SERVICE.with(|slot| {
+        let service = slot.borrow();
+        let service = service.as_ref().expect("service should be installed");
+        service
+            .update_shard_operation_status(
+                "op_create_shard",
+                RoutedOperationStatus::Unknown,
+                Some("bounded wait timed out"),
+                2,
+            )
+            .expect("operation should become unknown");
+    });
+    let reconciled = reconcile_shard_operation(ShardOperationReconcileRequest {
+        operation_id: "op_create_shard".to_string(),
+        status: RoutedOperationStatus::Failed,
+        error: Some("operator verified no shard was created".to_string()),
+    })
+    .expect("controller should reconcile unknown operation");
+    assert_eq!(reconciled.status, RoutedOperationStatus::Failed);
+    assert_eq!(
+        reconciled.error.as_deref(),
+        Some("operator verified no shard was created")
+    );
+}
+
+#[test]
+fn maintain_database_shards_validates_capacity_policy_before_management_calls() {
+    install_empty_test_service();
+    set_test_caller_text(Some("aaaaa-aa"));
+    set_test_caller_is_controller(true);
+
+    let error = block_on_ready(maintain_database_shards(MaintainDatabaseShardsRequest {
+        min_available_slots: 1,
+        min_cycles_balance: 0,
+        top_up_cycles: 0,
+        max_new_shards: 0,
+        new_shard_max_databases: 8,
+        new_shard_initial_cycles: 1,
+    }))
+    .expect_err("invalid autoscale policy should fail before management calls");
+
+    assert_eq!(
+        error,
+        "max_new_shards must be greater than zero when min_available_slots is set"
+    );
+}
+
+#[test]
+fn migrate_database_to_shard_requires_controller_before_remote_calls() {
+    install_empty_test_service();
+    set_test_caller_text(Some("aaaaa-aa"));
+
+    let error = block_on_ready(migrate_database_to_shard(MigrateDatabaseToShardRequest {
+        database_id: "default".to_string(),
+        database_canister_id: "ryjl3-tyaaa-aaaaa-aaaba-cai".to_string(),
+    }))
+    .expect_err("non-controller should not migrate databases");
+
+    assert_eq!(error, "caller is not a controller");
+}
+
+#[test]
 fn transfer_from_errors_are_user_actionable() {
     assert!(
         describe_transfer_from_error(&TransferFromError::BadFee {
@@ -349,10 +608,62 @@ fn http_request_upgrades_only_supported_post_sql_endpoints() {
     let upgraded = http_request(http_sql_request("POST", "/v1/sql/query"));
     assert_eq!(upgraded.status_code, 200);
     assert_eq!(upgraded.upgrade, Some(true));
+    assert!(
+        upgraded
+            .headers
+            .iter()
+            .any(|(name, value)| { name == "access-control-allow-origin" && value == "*" })
+    );
+
+    for endpoint in [
+        "/v1/sql/execute",
+        "/v1/sql/batch",
+        "/v1/session",
+        "/v1/tables/list",
+        "/v1/tables/describe",
+        "/v1/tables/preview",
+        "/v1/usage",
+        "/v1/placements/get",
+        "/v1/billing",
+        "/v1/payments/list",
+        "/v1/quota/set",
+        "/v1/tokens/create",
+        "/v1/tokens/list",
+        "/v1/tokens/revoke",
+        "/v1/archive/begin",
+        "/v1/archive/read",
+        "/v1/archive/finalize",
+        "/v1/archive/cancel",
+        "/v1/restore/begin",
+        "/v1/restore/write",
+        "/v1/restore/finalize",
+        "/v1/members/list",
+        "/v1/members/grant",
+        "/v1/members/revoke",
+        "/v1/operations/get",
+        "/v1/database/delete",
+    ] {
+        let upgraded = http_request(http_sql_request("POST", endpoint));
+        assert_eq!(upgraded.status_code, 200);
+        assert_eq!(upgraded.upgrade, Some(true));
+    }
 
     let get_rejected = http_request(http_sql_request("GET", "/v1/sql/query"));
     assert_eq!(get_rejected.status_code, 405);
     assert_eq!(get_rejected.upgrade, None);
+
+    let preflight = http_request(http_sql_request("OPTIONS", "/v1/sql/query"));
+    assert_eq!(preflight.status_code, 204);
+    assert_eq!(preflight.upgrade, None);
+    assert!(preflight.headers.iter().any(|(name, value)| {
+        name == "access-control-allow-methods" && value.contains("OPTIONS")
+    }));
+    assert!(preflight.headers.iter().any(|(name, value)| {
+        name == "access-control-allow-headers" && value.contains("authorization")
+    }));
+    assert!(preflight.headers.iter().any(|(name, value)| {
+        name == "access-control-allow-headers" && value.contains("idempotency-key")
+    }));
 
     let unknown_rejected = http_request(http_sql_request("POST", "/unknown"));
     assert_eq!(unknown_rejected.status_code, 404);
@@ -367,6 +678,14 @@ fn bearer_token_scheme_is_case_insensitive_and_scope_error_is_forbidden() {
     )];
 
     assert_eq!(bearer_token(&headers), Some("icpdb_token"));
+    let idempotency_headers: Vec<HeaderField> = vec![(
+        "Idempotency-Key".to_string(),
+        "  op_remote_write_1  ".to_string(),
+    )];
+    assert_eq!(
+        idempotency_key(&idempotency_headers),
+        Some("op_remote_write_1")
+    );
     assert_eq!(
         http_error_status("api token scope does not allow this operation"),
         403
@@ -375,11 +694,679 @@ fn bearer_token_scheme_is_case_insensitive_and_scope_error_is_forbidden() {
 }
 
 #[test]
+fn http_token_can_get_routed_operation_status() {
+    install_test_service();
+    SERVICE.with(|slot| {
+        let service = slot.borrow();
+        let service = service.as_ref().expect("service should be installed");
+        service
+            .create_database_token(
+                "2vxsx-fae",
+                CreateDatabaseTokenRequest {
+                    database_id: "default".to_string(),
+                    name: "http-read".to_string(),
+                    scope: DatabaseTokenScope::Read,
+                },
+                hash_api_token("secret-read"),
+                10,
+            )
+            .expect("read token should create");
+        service
+            .begin_routed_operation(
+                "op_remote_1",
+                "default",
+                "aaaaa-aa",
+                "sql_execute_internal",
+                sha256_bytes(b"remote write"),
+                11,
+            )
+            .expect("routed operation should begin");
+    });
+
+    let response = http_request_update(http_update_json(
+        "/v1/operations/get",
+        "secret-read",
+        serde_json::json!({ "database_id": "default", "operation_id": "op_remote_1" }),
+    ));
+    assert_eq!(response.status_code, 200);
+    let body = json_body(&response);
+    assert_eq!(body["operation_id"], "op_remote_1");
+    assert_eq!(body["database_id"], "default");
+    assert_eq!(body["method"], "sql_execute_internal");
+    assert_eq!(body["status"], "pending");
+
+    set_test_caller_text(Some("2vxsx-fae"));
+    let candid = get_routed_operation(RoutedOperationRequest {
+        database_id: "default".to_string(),
+        operation_id: "op_remote_1".to_string(),
+    })
+    .expect("caller should get routed operation");
+    assert_eq!(candid.operation_id, "op_remote_1");
+}
+
+#[test]
+fn http_token_can_inspect_tables() {
+    install_test_service();
+    sql_execute(SqlExecuteRequest {
+        database_id: "default".to_string(),
+        sql: "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL)".to_string(),
+        params: Vec::new(),
+        max_rows: None,
+    })
+    .expect("table should create");
+    sql_execute(SqlExecuteRequest {
+        database_id: "default".to_string(),
+        sql: "INSERT INTO notes (body) VALUES ('hello')".to_string(),
+        params: Vec::new(),
+        max_rows: None,
+    })
+    .expect("row should insert");
+    SERVICE.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .expect("service should be installed")
+            .create_database_token(
+                "2vxsx-fae",
+                CreateDatabaseTokenRequest {
+                    database_id: "default".to_string(),
+                    name: "http-read".to_string(),
+                    scope: DatabaseTokenScope::Read,
+                },
+                hash_api_token("secret-read"),
+                10,
+            )
+            .expect("read token should create");
+        slot.borrow()
+            .as_ref()
+            .expect("service should be installed")
+            .create_database_token(
+                "2vxsx-fae",
+                CreateDatabaseTokenRequest {
+                    database_id: "default".to_string(),
+                    name: "http-owner".to_string(),
+                    scope: DatabaseTokenScope::Owner,
+                },
+                hash_api_token("secret-owner"),
+                11,
+            )
+            .expect("owner token should create");
+    });
+
+    let list = http_request_update(http_update_json(
+        "/v1/tables/list",
+        "secret-read",
+        serde_json::json!({ "database_id": "default" }),
+    ));
+    assert_eq!(list.status_code, 200);
+    assert_eq!(json_body(&list)[0]["name"], "notes");
+
+    let description = http_request_update(http_update_json(
+        "/v1/tables/describe",
+        "secret-read",
+        serde_json::json!({ "database_id": "default", "table_name": "notes" }),
+    ));
+    assert_eq!(description.status_code, 200);
+    assert_eq!(json_body(&description)["columns"][1]["name"], "body");
+    assert_eq!(json_body(&description)["columns"][1]["hidden"], 0);
+
+    let preview = http_request_update(http_update_json(
+        "/v1/tables/preview",
+        "secret-read",
+        serde_json::json!({ "database_id": "default", "table_name": "notes", "limit": 10, "offset": 0 }),
+    ));
+    assert_eq!(preview.status_code, 200);
+    assert_eq!(json_body(&preview)["rows"][0][1]["text"], "hello");
+
+    let usage = http_request_update(http_update_json(
+        "/v1/usage",
+        "secret-read",
+        serde_json::json!({ "database_id": "default" }),
+    ));
+    assert_eq!(usage.status_code, 200);
+    assert_eq!(json_body(&usage)["database_id"], "default");
+
+    let usage_events = http_request_update(http_update_json(
+        "/v1/usage/events",
+        "secret-read",
+        serde_json::json!({ "database_id": "default" }),
+    ));
+    assert_eq!(usage_events.status_code, 200);
+    assert!(
+        json_body(&usage_events)
+            .as_array()
+            .expect("usage events should be array")
+            .iter()
+            .any(|event| event["method"] == "sql_execute" && event["success"] == true)
+    );
+
+    let placement = http_request_update(http_update_json(
+        "/v1/placements/get",
+        "secret-read",
+        serde_json::json!({ "database_id": "default" }),
+    ));
+    assert_eq!(placement.status_code, 200);
+    assert_eq!(json_body(&placement)["database_id"], "default");
+    assert_eq!(json_body(&placement)["shard_id"], "local");
+
+    let billing = http_request_update(http_update_json(
+        "/v1/billing",
+        "secret-read",
+        serde_json::json!({ "database_id": "default" }),
+    ));
+    assert_eq!(billing.status_code, 403);
+
+    let owner_billing = http_request_update(http_update_json(
+        "/v1/billing",
+        "secret-owner",
+        serde_json::json!({ "database_id": "default" }),
+    ));
+    assert_eq!(owner_billing.status_code, 200);
+    assert_eq!(json_body(&owner_billing)["database_id"], "default");
+}
+
+#[test]
+fn http_token_can_run_sql_batch() {
+    install_test_service();
+    SERVICE.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .expect("service should be installed")
+            .create_database_token(
+                "2vxsx-fae",
+                CreateDatabaseTokenRequest {
+                    database_id: "default".to_string(),
+                    name: "http-write".to_string(),
+                    scope: DatabaseTokenScope::Write,
+                },
+                hash_api_token("secret-write"),
+                10,
+            )
+            .expect("write token should create");
+    });
+
+    let response = http_request_update(http_update_json(
+        "/v1/sql/batch",
+        "secret-write",
+        serde_json::json!({
+            "database_id": "default",
+            "statements": [
+                { "sql": "CREATE TABLE batch_notes (id INTEGER PRIMARY KEY, body TEXT)", "params": [] },
+                { "sql": "INSERT INTO batch_notes (body) VALUES ('batched')", "params": [] },
+                { "sql": "SELECT body FROM batch_notes", "params": [] }
+            ],
+            "max_rows": 10
+        }),
+    ));
+    assert_eq!(response.status_code, 200);
+    let body = json_body(&response);
+    assert_eq!(body[2]["rows"][0][0]["text"], "batched");
+
+    let usage_events = http_request_update(http_update_json(
+        "/v1/usage/events",
+        "secret-write",
+        serde_json::json!({ "database_id": "default" }),
+    ));
+    assert_eq!(usage_events.status_code, 200);
+    assert!(
+        json_body(&usage_events)
+            .as_array()
+            .expect("usage events should be array")
+            .iter()
+            .any(|event| event["method"] == "sql_batch"
+                && event["operation"] == "CREATE+INSERT+SELECT"
+                && event["success"] == true
+                && event["total_rows_returned"] == 1
+                && event["total_rows_affected"] == 1)
+    );
+}
+
+#[test]
+fn http_owner_token_can_list_payments() {
+    install_test_service();
+    set_test_icp_transfer_from(Ok(202));
+    block_on_ready(deposit_with_approval("default".to_string(), 1_000_000))
+        .expect("deposit should record");
+    SERVICE.with(|slot| {
+        let service = slot.borrow();
+        let service = service.as_ref().expect("service should be installed");
+        service
+            .create_database_token(
+                "2vxsx-fae",
+                CreateDatabaseTokenRequest {
+                    database_id: "default".to_string(),
+                    name: "http-owner".to_string(),
+                    scope: DatabaseTokenScope::Owner,
+                },
+                hash_api_token("secret-owner"),
+                10,
+            )
+            .expect("owner token should create");
+        service
+            .create_database_token(
+                "2vxsx-fae",
+                CreateDatabaseTokenRequest {
+                    database_id: "default".to_string(),
+                    name: "http-read".to_string(),
+                    scope: DatabaseTokenScope::Read,
+                },
+                hash_api_token("secret-read"),
+                11,
+            )
+            .expect("read token should create");
+    });
+
+    let rejected = http_request_update(http_update_json(
+        "/v1/payments/list",
+        "secret-read",
+        serde_json::json!({ "database_id": "default" }),
+    ));
+    assert_eq!(rejected.status_code, 403);
+
+    let listed = http_request_update(http_update_json(
+        "/v1/payments/list",
+        "secret-owner",
+        serde_json::json!({ "database_id": "default" }),
+    ));
+    assert_eq!(listed.status_code, 200);
+    let payments = json_body(&listed);
+    assert_eq!(
+        payments.as_array().expect("payments should be array").len(),
+        1
+    );
+    assert_eq!(payments[0]["block_index"], 202);
+    assert_eq!(payments[0]["credited_units"], 1_000);
+}
+
+#[test]
+fn http_owner_token_can_update_quota() {
+    install_test_service();
+    SERVICE.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .expect("service should be installed")
+            .create_database_token(
+                "2vxsx-fae",
+                CreateDatabaseTokenRequest {
+                    database_id: "default".to_string(),
+                    name: "http-owner".to_string(),
+                    scope: DatabaseTokenScope::Owner,
+                },
+                hash_api_token("secret-owner"),
+                10,
+            )
+            .expect("owner token should create");
+        slot.borrow()
+            .as_ref()
+            .expect("service should be installed")
+            .create_database_token(
+                "2vxsx-fae",
+                CreateDatabaseTokenRequest {
+                    database_id: "default".to_string(),
+                    name: "http-read".to_string(),
+                    scope: DatabaseTokenScope::Read,
+                },
+                hash_api_token("secret-read"),
+                10,
+            )
+            .expect("read token should create");
+    });
+
+    let rejected = http_request_update(http_update_json(
+        "/v1/quota/set",
+        "secret-read",
+        serde_json::json!({ "database_id": "default", "max_logical_size_bytes": 134217728 }),
+    ));
+    assert_eq!(rejected.status_code, 403);
+
+    let accepted = http_request_update(http_update_json(
+        "/v1/quota/set",
+        "secret-owner",
+        serde_json::json!({ "database_id": "default", "max_logical_size_bytes": 134217728 }),
+    ));
+    assert_eq!(accepted.status_code, 200);
+    assert_eq!(json_body(&accepted)["max_logical_size_bytes"], 134217728);
+}
+
+#[test]
+fn http_owner_token_can_list_and_revoke_tokens() {
+    install_test_service();
+    let read_token_id = SERVICE.with(|slot| {
+        let service = slot.borrow();
+        let service = service.as_ref().expect("service should be installed");
+        service
+            .create_database_token(
+                "2vxsx-fae",
+                CreateDatabaseTokenRequest {
+                    database_id: "default".to_string(),
+                    name: "http-owner".to_string(),
+                    scope: DatabaseTokenScope::Owner,
+                },
+                hash_api_token("secret-owner"),
+                10,
+            )
+            .expect("owner token should create");
+        service
+            .create_database_token(
+                "2vxsx-fae",
+                CreateDatabaseTokenRequest {
+                    database_id: "default".to_string(),
+                    name: "http-read".to_string(),
+                    scope: DatabaseTokenScope::Read,
+                },
+                hash_api_token("secret-read"),
+                11,
+            )
+            .expect("read token should create")
+            .token_id
+    });
+
+    let rejected = http_request_update(http_update_json(
+        "/v1/tokens/list",
+        "secret-read",
+        serde_json::json!({ "database_id": "default" }),
+    ));
+    assert_eq!(rejected.status_code, 403);
+
+    let listed = http_request_update(http_update_json(
+        "/v1/tokens/list",
+        "secret-owner",
+        serde_json::json!({ "database_id": "default" }),
+    ));
+    assert_eq!(listed.status_code, 200);
+    let listed_body = json_body(&listed);
+    assert_eq!(
+        listed_body
+            .as_array()
+            .expect("tokens should be array")
+            .len(),
+        2
+    );
+    assert!(
+        listed_body
+            .as_array()
+            .expect("tokens should be array")
+            .iter()
+            .any(|token| token["name"] == "http-read")
+    );
+
+    let revoked = http_request_update(http_update_json(
+        "/v1/tokens/revoke",
+        "secret-owner",
+        serde_json::json!({ "database_id": "default", "token_id": read_token_id }),
+    ));
+    assert_eq!(revoked.status_code, 200);
+    assert_eq!(json_body(&revoked)["name"], "http-read");
+    assert!(json_body(&revoked)["revoked_at_ms"].is_number());
+
+    let blocked = http_request_update(http_update_json(
+        "/v1/usage",
+        "secret-read",
+        serde_json::json!({ "database_id": "default" }),
+    ));
+    assert_eq!(blocked.status_code, 401);
+}
+
+#[test]
+fn http_token_create_rejects_non_owner_before_randomness() {
+    install_test_service();
+    SERVICE.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .expect("service should be installed")
+            .create_database_token(
+                "2vxsx-fae",
+                CreateDatabaseTokenRequest {
+                    database_id: "default".to_string(),
+                    name: "http-read".to_string(),
+                    scope: DatabaseTokenScope::Read,
+                },
+                hash_api_token("secret-read"),
+                10,
+            )
+            .expect("read token should create");
+    });
+
+    let rejected = http_request_update(http_update_json(
+        "/v1/tokens/create",
+        "secret-read",
+        serde_json::json!({ "database_id": "default", "name": "http-write", "scope": "write" }),
+    ));
+    assert_eq!(rejected.status_code, 403);
+}
+
+#[test]
+fn http_owner_token_can_archive_and_restore_database() {
+    install_test_service();
+    sql_execute(sql_request(
+        "default",
+        "CREATE TABLE http_archive_smoke (body TEXT NOT NULL)",
+    ))
+    .expect("table should create");
+    sql_execute(sql_request(
+        "default",
+        "INSERT INTO http_archive_smoke (body) VALUES ('archived')",
+    ))
+    .expect("row should insert");
+    SERVICE.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .expect("service should be installed")
+            .create_database_token(
+                "2vxsx-fae",
+                CreateDatabaseTokenRequest {
+                    database_id: "default".to_string(),
+                    name: "http-owner".to_string(),
+                    scope: DatabaseTokenScope::Owner,
+                },
+                hash_api_token("secret-owner"),
+                10,
+            )
+            .expect("owner token should create");
+    });
+
+    let begin = http_request_update(http_update_json(
+        "/v1/archive/begin",
+        "secret-owner",
+        serde_json::json!({ "database_id": "default" }),
+    ));
+    assert_eq!(begin.status_code, 200);
+    let size = json_body(&begin)["size_bytes"]
+        .as_u64()
+        .expect("archive size should be u64");
+    assert!(size > 0);
+
+    let chunk = http_request_update(http_update_json(
+        "/v1/archive/read",
+        "secret-owner",
+        serde_json::json!({ "database_id": "default", "offset": 0, "max_bytes": size }),
+    ));
+    assert_eq!(chunk.status_code, 200);
+    let bytes = json_body(&chunk)["bytes"]
+        .as_array()
+        .expect("chunk bytes should be array")
+        .iter()
+        .map(|value| value.as_u64().expect("byte should be u64") as u8)
+        .collect::<Vec<_>>();
+    assert_eq!(bytes.len() as u64, size);
+    let snapshot_hash = sha256_bytes(&bytes);
+
+    let finalized_archive = http_request_update(http_update_json(
+        "/v1/archive/finalize",
+        "secret-owner",
+        serde_json::json!({ "database_id": "default", "snapshot_hash": snapshot_hash }),
+    ));
+    assert_eq!(finalized_archive.status_code, 200);
+
+    let restore_begin = http_request_update(http_update_json(
+        "/v1/restore/begin",
+        "secret-owner",
+        serde_json::json!({
+            "database_id": "default",
+            "snapshot_hash": sha256_bytes(&bytes),
+            "size_bytes": size
+        }),
+    ));
+    assert_eq!(restore_begin.status_code, 200);
+
+    let write = http_request_update(http_update_json(
+        "/v1/restore/write",
+        "secret-owner",
+        serde_json::json!({ "database_id": "default", "offset": 0, "bytes": bytes }),
+    ));
+    assert_eq!(write.status_code, 200);
+
+    let finalized_restore = http_request_update(http_update_json(
+        "/v1/restore/finalize",
+        "secret-owner",
+        serde_json::json!({ "database_id": "default" }),
+    ));
+    assert_eq!(finalized_restore.status_code, 200);
+
+    let response = sql_query(sql_request(
+        "default",
+        "SELECT body FROM http_archive_smoke",
+    ))
+    .expect("restored database should query");
+    assert_eq!(response.rows[0][0], SqlValue::Text("archived".to_string()));
+}
+
+#[test]
+fn http_owner_token_can_manage_database_members() {
+    install_test_service();
+    SERVICE.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .expect("service should be installed")
+            .create_database_token(
+                "2vxsx-fae",
+                CreateDatabaseTokenRequest {
+                    database_id: "default".to_string(),
+                    name: "http-owner".to_string(),
+                    scope: DatabaseTokenScope::Owner,
+                },
+                hash_api_token("secret-owner"),
+                10,
+            )
+            .expect("owner token should create");
+        slot.borrow()
+            .as_ref()
+            .expect("service should be installed")
+            .create_database_token(
+                "2vxsx-fae",
+                CreateDatabaseTokenRequest {
+                    database_id: "default".to_string(),
+                    name: "http-read".to_string(),
+                    scope: DatabaseTokenScope::Read,
+                },
+                hash_api_token("secret-read"),
+                11,
+            )
+            .expect("read token should create");
+    });
+
+    let rejected = http_request_update(http_update_json(
+        "/v1/members/list",
+        "secret-read",
+        serde_json::json!({ "database_id": "default" }),
+    ));
+    assert_eq!(rejected.status_code, 403);
+
+    let granted = http_request_update(http_update_json(
+        "/v1/members/grant",
+        "secret-owner",
+        serde_json::json!({
+            "database_id": "default",
+            "principal": "aaaaa-aa",
+            "role": "reader"
+        }),
+    ));
+    assert_eq!(granted.status_code, 200);
+
+    let listed = http_request_update(http_update_json(
+        "/v1/members/list",
+        "secret-owner",
+        serde_json::json!({ "database_id": "default" }),
+    ));
+    assert_eq!(listed.status_code, 200);
+    assert!(
+        json_body(&listed)
+            .as_array()
+            .expect("members should be array")
+            .iter()
+            .any(|member| member["principal"] == "aaaaa-aa" && member["role"] == "reader")
+    );
+
+    let revoked = http_request_update(http_update_json(
+        "/v1/members/revoke",
+        "secret-owner",
+        serde_json::json!({ "database_id": "default", "principal": "aaaaa-aa" }),
+    ));
+    assert_eq!(revoked.status_code, 200);
+}
+
+#[test]
+fn http_owner_token_can_delete_database() {
+    install_test_service();
+    SERVICE.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .expect("service should be installed")
+            .create_database_token(
+                "2vxsx-fae",
+                CreateDatabaseTokenRequest {
+                    database_id: "default".to_string(),
+                    name: "http-owner".to_string(),
+                    scope: DatabaseTokenScope::Owner,
+                },
+                hash_api_token("secret-owner"),
+                10,
+            )
+            .expect("owner token should create");
+        slot.borrow()
+            .as_ref()
+            .expect("service should be installed")
+            .create_database_token(
+                "2vxsx-fae",
+                CreateDatabaseTokenRequest {
+                    database_id: "default".to_string(),
+                    name: "http-read".to_string(),
+                    scope: DatabaseTokenScope::Read,
+                },
+                hash_api_token("secret-read"),
+                11,
+            )
+            .expect("read token should create");
+    });
+
+    let rejected = http_request_update(http_update_json(
+        "/v1/database/delete",
+        "secret-read",
+        serde_json::json!({ "database_id": "default" }),
+    ));
+    assert_eq!(rejected.status_code, 403);
+
+    let deleted = http_request_update(http_update_json(
+        "/v1/database/delete",
+        "secret-owner",
+        serde_json::json!({ "database_id": "default" }),
+    ));
+    assert_eq!(deleted.status_code, 200);
+
+    let usage = http_request_update(http_update_json(
+        "/v1/usage",
+        "secret-owner",
+        serde_json::json!({ "database_id": "default" }),
+    ));
+    assert_eq!(usage.status_code, 200);
+    assert_eq!(json_body(&usage)["status"], "deleted");
+}
+
+#[test]
 fn canister_create_database_returns_generated_id_for_followup_reads() {
     install_empty_test_service();
     set_test_caller_text(Some("aaaaa-aa"));
 
-    let database_id = create_database().expect("database should create");
+    let database_id = block_on_ready(create_database()).expect("database should create");
     assert!(database_id.starts_with("db_"));
     assert_eq!(database_id.len(), 15);
 
@@ -438,7 +1425,7 @@ fn revoke_database_access_validates_and_canonicalizes_principal() {
 fn anonymous_reader_grant_allows_public_query() {
     let dir = tempdir().expect("tempdir should create");
     let root = dir.keep();
-    let service = IcpdbService::new(root.join("index.sqlite3"), root.join("databases"));
+    let service = test_service_for_root(&root);
     service
         .run_index_migrations()
         .expect("index migrations should run");
@@ -621,7 +1608,7 @@ fn cancel_database_archive_entrypoint_returns_database_to_hot() {
 fn cancel_database_archive_entrypoint_rejects_non_owner() {
     let dir = tempdir().expect("tempdir should create");
     let root = dir.keep();
-    let service = IcpdbService::new(root.join("index.sqlite3"), root.join("databases"));
+    let service = test_service_for_root(&root);
     service
         .run_index_migrations()
         .expect("index migrations should run");

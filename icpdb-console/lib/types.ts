@@ -14,12 +14,73 @@ export type DatabaseSummary = {
   deletedAtMs: string | null;
 };
 
+export type DatabaseShardPlacement = {
+  databaseId: string;
+  shardId: string;
+  canisterId: string | null;
+  mountId: number | null;
+  status: DatabaseStatus;
+  schemaVersion: string;
+  createdAtMs: string;
+  updatedAtMs: string;
+};
+
+export type RoutedOperationStatus = "pending" | "applied" | "failed" | "unknown";
+export type ShardOperationReconcileStatus = "applied" | "failed";
+
+export type RoutedOperationInfo = {
+  operationId: string;
+  databaseId: string;
+  databaseCanisterId: string;
+  method: string;
+  requestHash: number[];
+  status: RoutedOperationStatus;
+  error: string | null;
+  createdAtMs: string;
+  updatedAtMs: string;
+};
+
+export type ShardOperationInfo = {
+  operationId: string;
+  operationKind: string;
+  target: string | null;
+  requestHash: number[];
+  status: RoutedOperationStatus;
+  error: string | null;
+  createdAtMs: string;
+  updatedAtMs: string;
+};
+
+export type ShardOperationReconcileRequest = {
+  operationId: string;
+  status: ShardOperationReconcileStatus;
+  error: string | null;
+};
+
+export type DatabaseMember = {
+  databaseId: string;
+  principal: string;
+  role: DatabaseRole;
+  createdAtMs: string;
+};
+
 export type DatabaseUsage = {
   databaseId: string;
   status: DatabaseStatus;
   logicalSizeBytes: string;
   maxLogicalSizeBytes: string;
   usageEventCount: string;
+};
+
+export type DatabaseUsageEventSummary = {
+  method: string;
+  operation: string | null;
+  success: boolean;
+  eventCount: string;
+  totalCyclesDelta: string;
+  totalRowsReturned: string;
+  totalRowsAffected: string;
+  lastCreatedAtMs: string;
 };
 
 export type DatabaseBillingStatus = "active" | "suspended";
@@ -30,6 +91,11 @@ export type DatabaseBilling = {
   balanceUnits: string;
   spentUnits: string;
   usageEventCount: string;
+};
+
+export type DatabaseArchiveInfo = {
+  databaseId: string;
+  sizeBytes: string;
 };
 
 export type DepositQuote = {
@@ -59,7 +125,7 @@ export type PaymentRecord = {
   createdAtMs: string;
 };
 
-export type DatabaseTokenScope = "read" | "write";
+export type DatabaseTokenScope = "read" | "write" | "owner";
 
 export type DatabaseTokenInfo = {
   tokenId: string;
@@ -76,6 +142,89 @@ export type CreateDatabaseTokenResponse = {
   info: DatabaseTokenInfo;
 };
 
+export type DatabaseObjectType = "table" | "view";
+
+export type DatabaseTable = {
+  name: string;
+  objectType: DatabaseObjectType;
+  schemaSql: string | null;
+};
+
+export type DatabaseColumn = {
+  cid: number;
+  name: string;
+  declaredType: string;
+  notNull: boolean;
+  defaultValue: string | null;
+  primaryKeyPosition: number;
+  hidden: number;
+};
+
+export type DatabaseIndex = {
+  name: string;
+  tableName: string;
+  unique: boolean;
+  origin: string;
+  partial: boolean;
+  columns: DatabaseIndexColumn[];
+  schemaSql: string | null;
+};
+
+export type DatabaseIndexColumn = {
+  seqno: number;
+  cid: string;
+  name: string | null;
+  descending: boolean;
+  collation: string;
+  key: boolean;
+};
+
+export type DatabaseTrigger = {
+  name: string;
+  tableName: string;
+  schemaSql: string | null;
+};
+
+export type DatabaseForeignKey = {
+  id: number;
+  seq: number;
+  tableName: string;
+  fromColumn: string;
+  toColumn: string | null;
+  onUpdate: string;
+  onDelete: string;
+  matchClause: string;
+};
+
+export type TableDescription = {
+  databaseId: string;
+  tableName: string;
+  objectType: DatabaseObjectType;
+  schemaSql: string | null;
+  columns: DatabaseColumn[];
+  indexes: DatabaseIndex[];
+  triggers: DatabaseTrigger[];
+  foreignKeys: DatabaseForeignKey[];
+};
+
+export type TablePreviewRequest = {
+  databaseId: string;
+  tableName: string;
+  limit: number | null;
+  offset: number | null;
+};
+
+export type TablePreviewResponse = {
+  databaseId: string;
+  tableName: string;
+  columns: string[];
+  rows: SqlValue[][];
+  offset: number;
+  limit: number;
+  totalCount: string;
+  truncated: boolean;
+};
+
 export type SqlValue =
   | { kind: "null" }
   | { kind: "integer"; value: string }
@@ -87,6 +236,17 @@ export type SqlExecuteRequest = {
   databaseId: string;
   sql: string;
   params: SqlValue[];
+  maxRows: number | null;
+};
+
+export type SqlStatement = {
+  sql: string;
+  params: SqlValue[];
+};
+
+export type SqlBatchRequest = {
+  databaseId: string;
+  statements: SqlStatement[];
   maxRows: number | null;
 };
 

@@ -20,12 +20,68 @@ export const idlFactory: ActorInterfaceFactory = ({ IDL: idl }) => {
     archived_at_ms: idl.Opt(idl.Int64),
     deleted_at_ms: idl.Opt(idl.Int64)
   });
+  const DatabaseShardPlacement = idl.Record({
+    status: DatabaseStatus,
+    shard_id: idl.Text,
+    updated_at_ms: idl.Int64,
+    database_id: idl.Text,
+    created_at_ms: idl.Int64,
+    schema_version: idl.Text,
+    canister_id: idl.Opt(idl.Text),
+    mount_id: idl.Opt(idl.Nat16)
+  });
+  const RoutedOperationStatus = idl.Variant({
+    Applied: idl.Null,
+    Failed: idl.Null,
+    Unknown: idl.Null,
+    Pending: idl.Null
+  });
+  const ShardOperationInfo = idl.Record({
+    request_hash: idl.Vec(idl.Nat8),
+    status: RoutedOperationStatus,
+    operation_kind: idl.Text,
+    updated_at_ms: idl.Int64,
+    operation_id: idl.Text,
+    error: idl.Opt(idl.Text),
+    created_at_ms: idl.Int64,
+    target: idl.Opt(idl.Text)
+  });
+  const RoutedOperationInfo = idl.Record({
+    request_hash: idl.Vec(idl.Nat8),
+    status: RoutedOperationStatus,
+    method: idl.Text,
+    database_canister_id: idl.Text,
+    updated_at_ms: idl.Int64,
+    operation_id: idl.Text,
+    error: idl.Opt(idl.Text),
+    created_at_ms: idl.Int64,
+    database_id: idl.Text
+  });
+  const RoutedOperationRequest = idl.Record({
+    operation_id: idl.Text,
+    database_id: idl.Text
+  });
+  const ShardOperationReconcileRequest = idl.Record({
+    status: RoutedOperationStatus,
+    operation_id: idl.Text,
+    error: idl.Opt(idl.Text)
+  });
   const DatabaseUsage = idl.Record({
     status: DatabaseStatus,
     max_logical_size_bytes: idl.Nat64,
     logical_size_bytes: idl.Nat64,
     usage_event_count: idl.Nat64,
     database_id: idl.Text
+  });
+  const DatabaseUsageEventSummary = idl.Record({
+    method: idl.Text,
+    operation: idl.Opt(idl.Text),
+    success: idl.Bool,
+    total_cycles_delta: idl.Nat64,
+    total_rows_returned: idl.Nat64,
+    total_rows_affected: idl.Nat64,
+    event_count: idl.Nat64,
+    last_created_at_ms: idl.Int64
   });
   const DatabaseBillingStatus = idl.Variant({ Active: idl.Null, Suspended: idl.Null });
   const DatabaseBilling = idl.Record({
@@ -34,6 +90,70 @@ export const idlFactory: ActorInterfaceFactory = ({ IDL: idl }) => {
     usage_event_count: idl.Nat64,
     database_id: idl.Text,
     balance_units: idl.Nat64
+  });
+  const DatabaseArchiveInfo = idl.Record({ size_bytes: idl.Nat64, database_id: idl.Text });
+  const DatabaseArchiveChunk = idl.Record({ bytes: idl.Vec(idl.Nat8) });
+  const DatabaseQuotaRequest = idl.Record({
+    max_logical_size_bytes: idl.Nat64,
+    database_id: idl.Text
+  });
+  const DatabaseMember = idl.Record({
+    principal: idl.Text,
+    role: DatabaseRole,
+    created_at_ms: idl.Int64,
+    database_id: idl.Text
+  });
+  const DatabaseRestoreChunkRequest = idl.Record({
+    offset: idl.Nat64,
+    database_id: idl.Text,
+    bytes: idl.Vec(idl.Nat8)
+  });
+  const DatabaseColumn = idl.Record({
+    cid: idl.Nat32,
+    name: idl.Text,
+    primary_key_position: idl.Nat32,
+    declared_type: idl.Text,
+    default_value: idl.Opt(idl.Text),
+    not_null: idl.Bool,
+    hidden: idl.Nat32
+  });
+  const DatabaseForeignKey = idl.Record({
+    id: idl.Nat32,
+    seq: idl.Nat32,
+    match_clause: idl.Text,
+    to_column: idl.Opt(idl.Text),
+    table_name: idl.Text,
+    on_delete: idl.Text,
+    on_update: idl.Text,
+    from_column: idl.Text
+  });
+  const DatabaseIndexColumn = idl.Record({
+    cid: idl.Int64,
+    key: idl.Bool,
+    descending: idl.Bool,
+    collation: idl.Text,
+    name: idl.Opt(idl.Text),
+    seqno: idl.Nat32
+  });
+  const DatabaseIndex = idl.Record({
+    schema_sql: idl.Opt(idl.Text),
+    name: idl.Text,
+    origin: idl.Text,
+    unique: idl.Bool,
+    table_name: idl.Text,
+    partial: idl.Bool,
+    columns: idl.Vec(DatabaseIndexColumn)
+  });
+  const DatabaseTrigger = idl.Record({
+    schema_sql: idl.Opt(idl.Text),
+    name: idl.Text,
+    table_name: idl.Text
+  });
+  const DatabaseObjectType = idl.Variant({ View: idl.Null, Table: idl.Null });
+  const DatabaseTable = idl.Record({
+    schema_sql: idl.Opt(idl.Text),
+    name: idl.Text,
+    object_type: DatabaseObjectType
   });
   const DepositQuote = idl.Record({
     spender_principal: idl.Text,
@@ -59,7 +179,7 @@ export const idlFactory: ActorInterfaceFactory = ({ IDL: idl }) => {
     payer_principal: idl.Text,
     payment_id: idl.Text
   });
-  const DatabaseTokenScope = idl.Variant({ Read: idl.Null, Write: idl.Null });
+  const DatabaseTokenScope = idl.Variant({ Read: idl.Null, Write: idl.Null, Owner: idl.Null });
   const DatabaseTokenInfo = idl.Record({
     last_used_at_ms: idl.Opt(idl.Int64),
     token_id: idl.Text,
@@ -104,31 +224,93 @@ export const idlFactory: ActorInterfaceFactory = ({ IDL: idl }) => {
     last_insert_rowid: idl.Int64,
     columns: idl.Vec(idl.Text)
   });
+  const TableDescription = idl.Record({
+    foreign_keys: idl.Vec(DatabaseForeignKey),
+    schema_sql: idl.Opt(idl.Text),
+    database_id: idl.Text,
+    object_type: DatabaseObjectType,
+    table_name: idl.Text,
+    indexes: idl.Vec(DatabaseIndex),
+    columns: idl.Vec(DatabaseColumn),
+    triggers: idl.Vec(DatabaseTrigger)
+  });
+  const TablePreviewRequest = idl.Record({
+    offset: idl.Opt(idl.Nat32),
+    limit: idl.Opt(idl.Nat32),
+    database_id: idl.Text,
+    table_name: idl.Text
+  });
+  const TablePreviewResponse = idl.Record({
+    truncated: idl.Bool,
+    rows: idl.Vec(idl.Vec(SqlValue)),
+    offset: idl.Nat32,
+    limit: idl.Nat32,
+    database_id: idl.Text,
+    total_count: idl.Nat64,
+    table_name: idl.Text,
+    columns: idl.Vec(idl.Text)
+  });
   const ResultSql = idl.Variant({ Ok: SqlExecuteResponse, Err: idl.Text });
+  const ResultUnit = idl.Variant({ Ok: idl.Null, Err: idl.Text });
+  const ResultArchiveInfo = idl.Variant({ Ok: DatabaseArchiveInfo, Err: idl.Text });
+  const ResultArchiveChunk = idl.Variant({ Ok: DatabaseArchiveChunk, Err: idl.Text });
   const ResultSqlBatch = idl.Variant({ Ok: idl.Vec(SqlExecuteResponse), Err: idl.Text });
   const ResultCreateDatabase = idl.Variant({ Ok: idl.Text, Err: idl.Text });
   const ResultDatabases = idl.Variant({ Ok: idl.Vec(DatabaseSummary), Err: idl.Text });
+  const ResultShardPlacements = idl.Variant({ Ok: idl.Vec(DatabaseShardPlacement), Err: idl.Text });
+  const ResultShardOperations = idl.Variant({ Ok: idl.Vec(ShardOperationInfo), Err: idl.Text });
+  const ResultShardOperation = idl.Variant({ Ok: ShardOperationInfo, Err: idl.Text });
+  const ResultRoutedOperation = idl.Variant({ Ok: RoutedOperationInfo, Err: idl.Text });
   const ResultUsage = idl.Variant({ Ok: DatabaseUsage, Err: idl.Text });
+  const ResultUsageEvents = idl.Variant({ Ok: idl.Vec(DatabaseUsageEventSummary), Err: idl.Text });
   const ResultBilling = idl.Variant({ Ok: DatabaseBilling, Err: idl.Text });
   const ResultDepositQuote = idl.Variant({ Ok: DepositQuote, Err: idl.Text });
   const ResultDeposit = idl.Variant({ Ok: DepositResult, Err: idl.Text });
   const ResultPayments = idl.Variant({ Ok: idl.Vec(PaymentRecord), Err: idl.Text });
   const ResultTokens = idl.Variant({ Ok: idl.Vec(DatabaseTokenInfo), Err: idl.Text });
   const ResultCreateToken = idl.Variant({ Ok: CreateDatabaseTokenResponse, Err: idl.Text });
+  const ResultMembers = idl.Variant({ Ok: idl.Vec(DatabaseMember), Err: idl.Text });
+  const ResultRevokedToken = idl.Variant({ Ok: DatabaseTokenInfo, Err: idl.Text });
+  const ResultTables = idl.Variant({ Ok: idl.Vec(DatabaseTable), Err: idl.Text });
+  const ResultTableDescription = idl.Variant({ Ok: TableDescription, Err: idl.Text });
+  const ResultTablePreview = idl.Variant({ Ok: TablePreviewResponse, Err: idl.Text });
 
   return idl.Service({
+    begin_database_archive: idl.Func([idl.Text], [ResultArchiveInfo], []),
+    begin_database_restore: idl.Func([idl.Text, idl.Vec(idl.Nat8), idl.Nat64], [ResultUnit], []),
+    cancel_database_archive: idl.Func([idl.Text], [ResultUnit], []),
     canister_health: idl.Func([], [CanisterHealth], ["query"]),
     create_database: idl.Func([], [ResultCreateDatabase], []),
     create_database_token: idl.Func([CreateDatabaseTokenRequest], [ResultCreateToken], []),
+    delete_database: idl.Func([idl.Text], [ResultUnit], []),
     deposit_with_approval: idl.Func([idl.Text, idl.Nat64], [ResultDeposit], []),
+    describe_table: idl.Func([idl.Text, idl.Text], [ResultTableDescription], ["query"]),
     get_billing: idl.Func([idl.Text], [ResultBilling], ["query"]),
     get_deposit_quote: idl.Func([idl.Text, idl.Nat64], [ResultDepositQuote], []),
+    get_routed_operation: idl.Func([RoutedOperationRequest], [ResultRoutedOperation], ["query"]),
     get_usage: idl.Func([idl.Text], [ResultUsage], ["query"]),
+    get_usage_event_summaries: idl.Func([idl.Text], [ResultUsageEvents], ["query"]),
+    grant_database_access: idl.Func([idl.Text, idl.Text, DatabaseRole], [ResultUnit], []),
+    list_database_members: idl.Func([idl.Text], [ResultMembers], ["query"]),
+    list_all_database_placements: idl.Func([], [ResultShardPlacements], ["query"]),
+    list_database_placements: idl.Func([], [ResultShardPlacements], ["query"]),
     list_databases: idl.Func([], [ResultDatabases], ["query"]),
     list_database_tokens: idl.Func([idl.Text], [ResultTokens], ["query"]),
     list_payments: idl.Func([idl.Text], [ResultPayments], ["query"]),
+    list_shard_operations: idl.Func([], [ResultShardOperations], ["query"]),
+    list_tables: idl.Func([idl.Text], [ResultTables], ["query"]),
+    preview_table: idl.Func([TablePreviewRequest], [ResultTablePreview], ["query"]),
+    read_database_archive_chunk: idl.Func([idl.Text, idl.Nat64, idl.Nat32], [ResultArchiveChunk], ["query"]),
+    reconcile_routed_operation: idl.Func([RoutedOperationRequest], [ResultRoutedOperation], []),
+    reconcile_shard_operation: idl.Func([ShardOperationReconcileRequest], [ResultShardOperation], []),
+    revoke_database_access: idl.Func([idl.Text, idl.Text], [ResultUnit], []),
+    revoke_database_token: idl.Func([idl.Text, idl.Text], [ResultRevokedToken], []),
+    set_database_quota: idl.Func([DatabaseQuotaRequest], [ResultUsage], []),
+    finalize_database_archive: idl.Func([idl.Text, idl.Vec(idl.Nat8)], [ResultUnit], []),
+    finalize_database_restore: idl.Func([idl.Text], [ResultUnit], []),
     sql_batch: idl.Func([SqlBatchRequest], [ResultSqlBatch], []),
     sql_execute: idl.Func([SqlExecuteRequest], [ResultSql], []),
-    sql_query: idl.Func([SqlExecuteRequest], [ResultSql], ["query"])
+    sql_query: idl.Func([SqlExecuteRequest], [ResultSql], ["query"]),
+    write_database_restore_chunk: idl.Func([DatabaseRestoreChunkRequest], [ResultUnit], [])
   });
 };

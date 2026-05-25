@@ -1,0 +1,196 @@
+type CreateDatabaseSlotRequest = record { database_id : text };
+type DataPlaneOperationInfo = record {
+  request_hash : blob;
+  method : text;
+  operation_id : text;
+  created_at_ms : int64;
+  database_id : text;
+};
+type DataPlaneSqlBatchRequest = record {
+  request : SqlBatchRequest;
+  operation_id : text;
+};
+type DataPlaneSqlExecuteRequest = record {
+  request : SqlExecuteRequest;
+  operation_id : text;
+};
+type DatabaseArchiveChunk = record { bytes : blob };
+type DatabaseArchiveFinalizeRequest = record {
+  database_id : text;
+  snapshot_hash : blob;
+};
+type DatabaseArchiveInfo = record { size_bytes : nat64; database_id : text };
+type DatabaseArchiveReadRequest = record {
+  offset : nat64;
+  database_id : text;
+  max_bytes : nat32;
+};
+type DatabaseCanisterInitArgs = record { control_canister_id : text };
+type DatabaseColumn = record {
+  cid : nat32;
+  name : text;
+  hidden : nat32;
+  primary_key_position : nat32;
+  declared_type : text;
+  default_value : opt text;
+  not_null : bool;
+};
+type DatabaseForeignKey = record {
+  id : nat32;
+  seq : nat32;
+  match_clause : text;
+  to_column : opt text;
+  table_name : text;
+  on_delete : text;
+  on_update : text;
+  from_column : text;
+};
+type DatabaseIndex = record {
+  schema_sql : opt text;
+  name : text;
+  origin : text;
+  unique : bool;
+  table_name : text;
+  partial : bool;
+  columns : vec DatabaseIndexColumn;
+};
+type DatabaseIndexColumn = record {
+  cid : int64;
+  key : bool;
+  descending : bool;
+  collation : text;
+  name : opt text;
+  seqno : nat32;
+};
+type DatabaseInfo = record {
+  status : DatabaseStatus;
+  logical_size_bytes : nat64;
+  schema_version : text;
+  database_id : text;
+  archived_at_ms : opt int64;
+  mount_id : opt nat16;
+  snapshot_hash : opt blob;
+  deleted_at_ms : opt int64;
+};
+type DatabaseObjectType = variant { View; Table };
+type DatabaseRestoreBeginRequest = record {
+  size_bytes : nat64;
+  database_id : text;
+  snapshot_hash : blob;
+};
+type DatabaseRestoreChunkRequest = record {
+  offset : nat64;
+  database_id : text;
+  bytes : blob;
+};
+type DatabaseStatus = variant { Hot; Restoring; Archiving; Archived; Deleted };
+type DatabaseTable = record {
+  schema_sql : opt text;
+  name : text;
+  object_type : DatabaseObjectType;
+};
+type DatabaseTrigger = record {
+  schema_sql : opt text;
+  name : text;
+  table_name : text;
+};
+type DatabaseUsage = record {
+  status : DatabaseStatus;
+  max_logical_size_bytes : nat64;
+  logical_size_bytes : nat64;
+  usage_event_count : nat64;
+  database_id : text;
+};
+type Result = variant { Ok : DatabaseArchiveInfo; Err : text };
+type Result_1 = variant { Ok : DatabaseInfo; Err : text };
+type Result_10 = variant { Ok : SqlExecuteResponse; Err : text };
+type Result_2 = variant { Ok; Err : text };
+type Result_3 = variant { Ok : DatabaseUsage; Err : text };
+type Result_4 = variant { Ok : TableDescription; Err : text };
+type Result_5 = variant { Ok : opt DataPlaneOperationInfo; Err : text };
+type Result_6 = variant { Ok : vec DatabaseTable; Err : text };
+type Result_7 = variant { Ok : TablePreviewResponse; Err : text };
+type Result_8 = variant { Ok : DatabaseArchiveChunk; Err : text };
+type Result_9 = variant { Ok : vec SqlExecuteResponse; Err : text };
+type RoutedOperationRequest = record {
+  operation_id : text;
+  database_id : text;
+};
+type SqlBatchRequest = record {
+  max_rows : opt nat32;
+  database_id : text;
+  statements : vec SqlStatement;
+};
+type SqlExecuteRequest = record {
+  sql : text;
+  max_rows : opt nat32;
+  database_id : text;
+  params : vec SqlValue;
+};
+type SqlExecuteResponse = record {
+  truncated : bool;
+  rows : vec vec SqlValue;
+  rows_affected : nat64;
+  last_insert_rowid : int64;
+  columns : vec text;
+};
+type SqlStatement = record { sql : text; params : vec SqlValue };
+type SqlValue = variant {
+  Blob : blob;
+  Null;
+  Real : float64;
+  Text : text;
+  Integer : int64;
+};
+type TableDescription = record {
+  foreign_keys : vec DatabaseForeignKey;
+  schema_sql : opt text;
+  database_id : text;
+  object_type : DatabaseObjectType;
+  table_name : text;
+  indexes : vec DatabaseIndex;
+  columns : vec DatabaseColumn;
+  triggers : vec DatabaseTrigger;
+};
+type TablePreviewRequest = record {
+  offset : opt nat32;
+  limit : opt nat32;
+  database_id : text;
+  table_name : text;
+};
+type TablePreviewResponse = record {
+  truncated : bool;
+  rows : vec vec SqlValue;
+  offset : nat32;
+  limit : nat32;
+  database_id : text;
+  total_count : nat64;
+  table_name : text;
+  columns : vec text;
+};
+service : (DatabaseCanisterInitArgs) -> {
+  begin_database_archive_internal : (text) -> (Result);
+  begin_database_restore_internal : (DatabaseRestoreBeginRequest) -> (Result_1);
+  cancel_database_archive_internal : (text) -> (Result_2);
+  create_database_slot : (CreateDatabaseSlotRequest) -> (Result_1);
+  database_usage_internal : (text) -> (Result_3);
+  delete_database_slot : (text) -> (Result_2);
+  describe_table_internal : (text, text) -> (Result_4);
+  discard_database_slot_internal : (text) -> (Result_2);
+  finalize_database_archive_internal : (DatabaseArchiveFinalizeRequest) -> (
+      Result_2,
+    );
+  finalize_database_restore_internal : (text) -> (Result_1);
+  get_data_plane_operation_internal : (RoutedOperationRequest) -> (Result_5);
+  list_tables_internal : (text) -> (Result_6);
+  preview_table_internal : (TablePreviewRequest) -> (Result_7);
+  read_database_archive_chunk_internal : (DatabaseArchiveReadRequest) -> (
+      Result_8,
+    );
+  sql_batch_internal : (DataPlaneSqlBatchRequest) -> (Result_9);
+  sql_execute_internal : (DataPlaneSqlExecuteRequest) -> (Result_10);
+  sql_query_internal : (SqlExecuteRequest) -> (Result_10);
+  write_database_restore_chunk_internal : (DatabaseRestoreChunkRequest) -> (
+      Result_2,
+    );
+}

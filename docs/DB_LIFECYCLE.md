@@ -17,15 +17,15 @@ Grant anonymous reader access with principal `2vxsx-fae` only when public SQL re
 
 ## Memory Layout
 
-Stable-memory mount IDs are partitioned by purpose:
+Stable-memory IDs are partitioned by purpose:
 
-- `0..9`: WASI filesystem memory for tmp files and directory metadata
+- `0..9`: reserved for non-DB stable structures
 - `10`: index DB
-- `11..=32767`: user DB slots
-- `32768..=65534`: reserved
+- `11..=254`: user DB slots
+- `255`: reserved by the `ic-sqlite-vfs` MemoryManager-compatible layout
 
 The index DB tracks database metadata, membership, quota, billing, tokens, payments, and usage events.
-Each user DB is a raw SQLite file owned by one mount slot.
+Each user DB is one independent `ic-sqlite-vfs` image owned by one stable-memory ID.
 
 Hot, archiving, or restoring DBs consume one active user DB slot. Archived and deleted DBs release their active mount, but v1 does not recycle stable-memory mount IDs for another database.
 
@@ -53,7 +53,8 @@ Deleting or archiving a DB releases the active mount. It does not imply that can
 
 `usage_events` records update calls and charged SQL write calls.
 
-Each event stores method, database ID when present, caller principal, success flag, observed cycle delta, error text, and timestamp.
+Each event stores method, SQL operation label when present, database ID when present, caller principal, success flag, observed cycle delta, row totals, error text, and timestamp.
+SQL text is not stored in usage events.
 The cycle delta is an operational observation from canister balance before and after the call, not a guaranteed one-to-one IC billing statement.
 Only the latest 100,000 events are retained.
 
@@ -106,7 +107,7 @@ Restore finalize also hashes the whole restored SQLite file in one update.
 
 ## Current Limits
 
-- At most 32757 lifetime user DB slots per canister: mount IDs `11..=32767`.
+- At most 244 lifetime user DB slots per canister: stable-memory IDs `11..=254`.
 - Archive export and restore import chunks are limited to 1 MiB.
 - Declared restore DB size must fit the runtime database size limit, currently `i64::MAX`.
 - v1 does not treat archived or deleted slots as reusable concurrent capacity.

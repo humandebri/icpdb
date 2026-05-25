@@ -8,15 +8,17 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-# shellcheck source=../scripts/wasi-env.sh
-source "${REPO_ROOT}/scripts/wasi-env.sh"
-configure_wasi_cc_env
-
 cd "${REPO_ROOT}"
 
 cargo fmt --all -- --check
-cargo test --workspace --locked
+node scripts/check-icpdb-http-cli.mjs
+node scripts/check-icpdb-goal.mjs
+node scripts/icpdb-mainnet-preflight.mjs --skip-build
+cargo test --workspace --locked -- --test-threads=1
 cargo clippy --workspace --all-targets --locked -- -D warnings
 
 ICP_WASM_OUTPUT_PATH="${TMPDIR:-/tmp}/icpdb_canister.wasm" \
   bash scripts/build-icpdb-canister.sh
+
+ICP_WASM_OUTPUT_PATH="${TMPDIR:-/tmp}/icpdb_database_canister.wasm" \
+  bash scripts/build-icpdb-database-canister.sh

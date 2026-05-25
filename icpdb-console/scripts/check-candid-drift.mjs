@@ -157,6 +157,7 @@ function normalizeIdlShape(value) {
     .replace(/^Int64$/, "int64")
     .replace(/^Nat64$/, "nat64")
     .replace(/^Nat32$/, "nat32")
+    .replace(/^Nat16$/, "nat16")
     .replace(/^Nat$/, "nat")
     .replace(/^Float32$/, "float32")
     .replace(/^Float64$/, "float64")
@@ -186,17 +187,30 @@ function normalizeShape(value) {
 
 function normalizeResultAlias(value) {
   const normalized = normalizeShape(value);
+  if (normalized === "Result") return "ResultArchiveInfo";
+  if (normalized === "Result_1") return "ResultUnit";
   if (normalized === "Result_2") return "ResultCreateDatabase";
-  if (normalized === "Result_3") return "ResultCreateToken";
-  if (normalized === "Result_4") return "ResultDeposit";
-  if (normalized === "Result_5") return "ResultBilling";
-  if (normalized === "Result_6") return "ResultDepositQuote";
-  if (normalized === "Result_7") return "ResultUsage";
-  if (normalized === "Result_9") return "ResultTokens";
-  if (normalized === "Result_10") return "ResultDatabases";
-  if (normalized === "Result_11") return "ResultPayments";
-  if (normalized === "Result_14") return "ResultSqlBatch";
-  if (normalized === "Result_15") return "ResultSql";
+  if (normalized === "Result_4") return "ResultCreateToken";
+  if (normalized === "Result_6") return "ResultDeposit";
+  if (normalized === "Result_7") return "ResultTableDescription";
+  if (normalized === "Result_8") return "ResultBilling";
+  if (normalized === "Result_10") return "ResultDepositQuote";
+  if (normalized === "Result_11") return "ResultRoutedOperation";
+  if (normalized === "Result_12") return "ResultUsage";
+  if (normalized === "Result_13") return "ResultUsageEvents";
+  if (normalized === "Result_14") return "ResultShardPlacements";
+  if (normalized === "Result_15") return "ResultMembers";
+  if (normalized === "Result_17") return "ResultTokens";
+  if (normalized === "Result_18") return "ResultDatabases";
+  if (normalized === "Result_19") return "ResultPayments";
+  if (normalized === "Result_20") return "ResultShardOperations";
+  if (normalized === "Result_21") return "ResultTables";
+  if (normalized === "Result_24") return "ResultTablePreview";
+  if (normalized === "Result_25") return "ResultArchiveChunk";
+  if (normalized === "Result_26") return "ResultShardOperation";
+  if (normalized === "Result_27") return "ResultRevokedToken";
+  if (normalized === "Result_28") return "ResultSqlBatch";
+  if (normalized === "Result_29") return "ResultSql";
   return normalized;
 }
 

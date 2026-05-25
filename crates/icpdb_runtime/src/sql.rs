@@ -1,13 +1,14 @@
 // Where: crates/icpdb_runtime/src/sql.rs
 // What: Bounded raw SQLite execution for canister-hosted databases.
 // Why: ICPDB exposes SQLite directly while keeping read/write calls and response size constrained.
-use std::path::Path;
 
-use icpdb_types::{SqlExecuteRequest, SqlExecuteResponse, SqlStatement, SqlValue};
-use rusqlite::{
-    Connection, OpenFlags, Statement, params_from_iter,
+use crate::sql_guard::{is_read_only_sql, row_limit, validate_sql_request};
+use crate::sql_snapshot::DatabaseSnapshot;
+use crate::sqlite_facade::{
+    Connection, OpenFlags, Statement, params, params_from_iter,
     types::{Value, ValueRef},
 };
+use icpdb_types::{SqlExecuteRequest, SqlExecuteResponse, SqlStatement, SqlValue};
 
 pub const DEFAULT_SQL_MAX_ROWS: u32 = 100;
 pub const MAX_SQL_ROWS: u32 = 500;
@@ -23,7 +24,7 @@ pub enum SqlMode {
 }
 
 pub fn execute_sql_file(
-    database_path: &Path,
+    database_path: &str,
     request: SqlExecuteRequest,
     mode: SqlMode,
     max_database_size_bytes: u64,
@@ -32,7 +33,7 @@ pub fn execute_sql_file(
     if mode == SqlMode::ReadOnly && !is_read_only_sql(&request.sql) {
         return Err("sql_query only accepts read-only SQL".to_string());
     }
-    let mut conn = open_sql_connection(database_path, mode)?;
+    let conn = open_sql_connection(database_path, mode)?;
     if mode == SqlMode::ReadOnly {
         return execute_prepared(
             &conn,
@@ -41,20 +42,25 @@ pub fn execute_sql_file(
             row_limit(request.max_rows),
         );
     }
-    let tx = conn.transaction().map_err(|error| error.to_string())?;
-    let response = execute_prepared(
-        &tx,
+    let snapshot = DatabaseSnapshot::capture(database_path)?;
+    let result = execute_prepared(
+        &conn,
         &request.sql,
         &request.params,
         row_limit(request.max_rows),
-    )?;
-    enforce_database_size_quota(&tx, max_database_size_bytes)?;
-    tx.commit().map_err(|error| error.to_string())?;
-    Ok(response)
+    )
+    .and_then(|response| {
+        enforce_database_size_quota(&conn, max_database_size_bytes)?;
+        Ok(response)
+    });
+    if result.is_err() {
+        snapshot.restore(database_path)?;
+    }
+    result
 }
 
 pub fn execute_sql_batch_file(
-    database_path: &Path,
+    database_path: &str,
     statements: Vec<SqlStatement>,
     max_rows: Option<u32>,
     max_database_size_bytes: u64,
@@ -65,25 +71,32 @@ pub fn execute_sql_batch_file(
             statements.len()
         ));
     }
-    let mut conn = open_sql_connection(database_path, SqlMode::ReadWrite)?;
-    let tx = conn.transaction().map_err(|error| error.to_string())?;
     let limit = row_limit(max_rows);
+    for statement in &statements {
+        validate_sql_request(&statement.sql, statement.params.len(), SqlMode::ReadWrite)?;
+    }
+    let conn = open_sql_connection(database_path, SqlMode::ReadWrite)?;
+    let snapshot = DatabaseSnapshot::capture(database_path)?;
     let mut responses = Vec::with_capacity(statements.len());
     for statement in statements {
-        validate_sql_request(&statement.sql, statement.params.len(), SqlMode::ReadWrite)?;
-        responses.push(execute_prepared(
-            &tx,
-            &statement.sql,
-            &statement.params,
-            limit,
-        )?);
-        enforce_database_size_quota(&tx, max_database_size_bytes)?;
+        let result = execute_prepared(&conn, &statement.sql, &statement.params, limit).and_then(
+            |response| {
+                enforce_database_size_quota(&conn, max_database_size_bytes)?;
+                Ok(response)
+            },
+        );
+        match result {
+            Ok(response) => responses.push(response),
+            Err(error) => {
+                snapshot.restore(database_path)?;
+                return Err(error);
+            }
+        }
     }
-    tx.commit().map_err(|error| error.to_string())?;
     Ok(responses)
 }
 
-fn open_sql_connection(database_path: &Path, mode: SqlMode) -> Result<Connection, String> {
+fn open_sql_connection(database_path: &str, mode: SqlMode) -> Result<Connection, String> {
     match mode {
         SqlMode::ReadOnly => Connection::open_with_flags(
             database_path,
@@ -100,7 +113,7 @@ fn execute_prepared(
     params: &[SqlValue],
     max_rows: u32,
 ) -> Result<SqlExecuteResponse, String> {
-    let values = params.iter().map(sql_value_to_rusqlite).collect::<Vec<_>>();
+    let values = params.iter().map(sql_value_to_sqlite).collect::<Vec<_>>();
     let mut statement = conn.prepare(sql).map_err(|error| error.to_string())?;
     if statement.parameter_count() != values.len() {
         return Err(format!(
@@ -174,28 +187,6 @@ fn query_rows(
     })
 }
 
-fn validate_sql_request(sql: &str, param_count: usize, mode: SqlMode) -> Result<(), String> {
-    let trimmed = sql.trim();
-    if trimmed.is_empty() {
-        return Err("sql must not be empty".to_string());
-    }
-    if sql.len() > MAX_SQL_TEXT_BYTES {
-        return Err(format!(
-            "sql text exceeds limit: {} > {MAX_SQL_TEXT_BYTES}",
-            sql.len()
-        ));
-    }
-    if param_count > MAX_SQL_PARAMS {
-        return Err(format!(
-            "sql parameter count exceeds limit: {param_count} > {MAX_SQL_PARAMS}"
-        ));
-    }
-    if mode == SqlMode::ReadWrite && is_forbidden_write_sql(trimmed) {
-        return Err("sql statement is not allowed for hosted databases".to_string());
-    }
-    Ok(())
-}
-
 fn enforce_database_size_quota(
     conn: &Connection,
     max_database_size_bytes: u64,
@@ -212,69 +203,14 @@ fn enforce_database_size_quota(
 }
 
 fn pragma_u64(conn: &Connection, name: &str) -> Result<u64, String> {
-    conn.query_row(&format!("PRAGMA {name}"), [], |row| row.get::<_, i64>(0))
-        .map(|value| value.max(0) as u64)
-        .map_err(|error| error.to_string())
+    conn.query_row(&format!("PRAGMA {name}"), params![], |row| {
+        row.get::<_, i64>(0)
+    })
+    .map(|value| value.max(0) as u64)
+    .map_err(|error| error.to_string())
 }
 
-fn row_limit(max_rows: Option<u32>) -> u32 {
-    max_rows
-        .unwrap_or(DEFAULT_SQL_MAX_ROWS)
-        .clamp(1, MAX_SQL_ROWS)
-}
-
-fn is_read_only_sql(sql: &str) -> bool {
-    let lowered = strip_leading_sql_comments(sql).to_ascii_lowercase();
-    ["select", "with", "pragma", "explain"]
-        .iter()
-        .any(|keyword| lowered.starts_with(keyword))
-}
-
-fn is_forbidden_write_sql(sql: &str) -> bool {
-    ["attach", "detach", "vacuum", "pragma"]
-        .iter()
-        .any(|keyword| starts_with_sql_keyword(strip_leading_sql_comments(sql), keyword))
-}
-
-fn starts_with_sql_keyword(sql: &str, keyword: &str) -> bool {
-    let Some(prefix) = sql.get(..keyword.len()) else {
-        return false;
-    };
-    if !prefix.eq_ignore_ascii_case(keyword) {
-        return false;
-    }
-    match sql
-        .get(keyword.len()..)
-        .and_then(|tail| tail.chars().next())
-    {
-        Some(value) => !value.is_ascii_alphanumeric() && value != '_',
-        None => true,
-    }
-}
-
-fn strip_leading_sql_comments(sql: &str) -> &str {
-    let mut remaining = sql.trim_start();
-    loop {
-        if let Some(after_dash) = remaining.strip_prefix("--") {
-            remaining = after_dash
-                .split_once('\n')
-                .map(|(_, rest)| rest)
-                .unwrap_or("")
-                .trim_start();
-            continue;
-        }
-        if let Some(after_open) = remaining.strip_prefix("/*") {
-            if let Some((_, rest)) = after_open.split_once("*/") {
-                remaining = rest.trim_start();
-                continue;
-            }
-            return "";
-        }
-        return remaining;
-    }
-}
-
-fn sql_value_to_rusqlite(value: &SqlValue) -> Value {
+pub(crate) fn sql_value_to_sqlite(value: &SqlValue) -> Value {
     match value {
         SqlValue::Null => Value::Null,
         SqlValue::Integer(value) => Value::Integer(*value),
@@ -284,7 +220,7 @@ fn sql_value_to_rusqlite(value: &SqlValue) -> Value {
     }
 }
 
-fn sql_value_from_ref(value: ValueRef<'_>) -> SqlValue {
+pub(crate) fn sql_value_from_ref(value: ValueRef<'_>) -> SqlValue {
     match value {
         ValueRef::Null => SqlValue::Null,
         ValueRef::Integer(value) => SqlValue::Integer(value),

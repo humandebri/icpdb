@@ -1,19 +1,28 @@
 // Where: crates/icpdb_runtime/src/lib.rs
 // What: Service orchestration for multiple hosted SQLite databases.
 // Why: One canister can host isolated SQL databases with shared lifecycle, quota, and billing.
+mod database_executor;
 mod sql;
+mod sql_guard;
+mod sql_identifier;
+mod sql_snapshot;
+mod sqlite_facade;
+mod table_inspection;
+pub use sqlite_facade::{register_path_handle, unregister_path_handle};
 
-use std::fs::{File, OpenOptions, create_dir_all, metadata, remove_file};
-use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
-
+use crate::database_executor::{DatabaseExecutor, LocalDatabaseExecutor};
+use crate::sqlite_facade::{Connection, OptionalExtension, params};
 use icpdb_types::{
-    DatabaseArchiveInfo, DatabaseBalanceTopUpRequest, DatabaseBilling, DatabaseBillingStatus,
-    DatabaseInfo, DatabaseMember, DatabaseQuotaRequest, DatabaseRole, DatabaseStatus,
-    DatabaseSummary, DatabaseTokenInfo, DatabaseTokenScope, DatabaseUsage, DepositQuote,
-    DepositResult, PaymentRecord, SqlBatchRequest, SqlExecuteRequest, SqlExecuteResponse,
+    CreateRemoteDatabaseRequest, DataPlaneOperationInfo, DatabaseArchiveInfo,
+    DatabaseBalanceTopUpRequest, DatabaseBilling, DatabaseBillingStatus, DatabaseInfo,
+    DatabaseMember, DatabaseQuotaRequest, DatabaseRole, DatabaseShardInfo, DatabaseShardPlacement,
+    DatabaseStatus, DatabaseSummary, DatabaseTable, DatabaseTokenInfo, DatabaseTokenScope,
+    DatabaseUsage, DatabaseUsageEventSummary, DepositQuote, DepositResult,
+    MigrateDatabaseToShardRequest, PaymentRecord, RegisterDatabaseShardRequest,
+    RoutedOperationInfo, RoutedOperationRequest, RoutedOperationStatus, ShardOperationInfo,
+    SqlBatchRequest, SqlExecuteRequest, SqlExecuteResponse, SqlValue, TableDescription,
+    TablePreviewRequest, TablePreviewResponse,
 };
-use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 
 const INDEX_SCHEMA_VERSION_INITIAL: &str = "database_index:000_initial";
@@ -27,9 +36,24 @@ const INDEX_SCHEMA_VERSION_BILLING: &str = "database_index:007_billing";
 const INDEX_SCHEMA_VERSION_TOKENS: &str = "database_index:008_tokens";
 const INDEX_SCHEMA_VERSION_PAYMENTS: &str = "database_index:009_payments";
 const INDEX_SCHEMA_VERSION_BILLING_CONFIG: &str = "database_index:010_billing_config";
+const INDEX_SCHEMA_VERSION_RESTORE_CHUNK_BYTES: &str = "database_index:011_restore_chunk_bytes";
+const INDEX_SCHEMA_VERSION_USAGE_EVENT_ROWS: &str = "database_index:012_usage_event_rows";
+const INDEX_SCHEMA_VERSION_USAGE_EVENT_OPERATION: &str = "database_index:013_usage_event_operation";
+const INDEX_SCHEMA_VERSION_SHARD_PLACEMENTS: &str = "database_index:014_shard_placements";
+const INDEX_SCHEMA_VERSION_ROUTED_OPERATIONS: &str = "database_index:015_routed_operations";
+const INDEX_SCHEMA_VERSION_DATABASE_SHARDS: &str = "database_index:016_database_shards";
+const INDEX_SCHEMA_VERSION_SHARD_OPERATIONS: &str = "database_index:017_shard_operations";
+const INDEX_SCHEMA_VERSION_DATA_PLANE_OPERATIONS: &str = "database_index:018_data_plane_operations";
+const INDEX_SCHEMA_VERSION_ROUTED_OPERATION_BILLING: &str =
+    "database_index:019_routed_operation_billing";
 const DATABASE_SCHEMA_VERSION: &str = "sqlite:raw";
+const LOCAL_SHARD_ID: &str = "local";
+const ROUTED_OPERATION_ID_MAX_BYTES: usize = 128;
+const ROUTED_OPERATION_METHOD_MAX_BYTES: usize = 96;
+const SHARD_OPERATION_ID_MAX_BYTES: usize = 128;
+const SHARD_OPERATION_KIND_MAX_BYTES: usize = 96;
 const MIN_DATABASE_MOUNT_ID: u16 = 11;
-const MAX_DATABASE_MOUNT_ID: u16 = 32767;
+const MAX_DATABASE_MOUNT_ID: u16 = 254;
 pub const MAX_ARCHIVE_CHUNK_BYTES: u32 = 1024 * 1024;
 pub const MAX_RESTORE_CHUNK_BYTES: usize = 1024 * 1024;
 pub const MAX_DATABASE_SIZE_BYTES: u64 = i64::MAX as u64;
@@ -82,6 +106,12 @@ pub struct DatabaseRestoreRollback {
     restore_size_bytes: Option<u64>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemoteDatabaseCreatePlan {
+    pub database_id: String,
+    pub database_canister_id: String,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RequiredRole {
     Reader,
@@ -91,10 +121,13 @@ pub enum RequiredRole {
 
 pub struct UsageEvent<'a> {
     pub method: &'a str,
+    pub operation: Option<&'a str>,
     pub database_id: Option<&'a str>,
     pub caller: &'a str,
     pub success: bool,
     pub cycles_delta: u128,
+    pub rows_returned: u64,
+    pub rows_affected: u64,
     pub error: Option<&'a str>,
     pub now: i64,
 }
@@ -106,16 +139,43 @@ pub struct AuthenticatedDatabaseToken {
     pub scope: DatabaseTokenScope,
 }
 
+pub struct RoutedWriteBegin<'a> {
+    pub operation_id: &'a str,
+    pub database_canister_id: &'a str,
+    pub method: &'a str,
+    pub request_hash: Vec<u8>,
+    pub billing_units: u64,
+    pub now: i64,
+}
+
+struct RoutedOperationBegin<'a> {
+    operation_id: &'a str,
+    database_id: &'a str,
+    database_canister_id: &'a str,
+    method: &'a str,
+    request_hash: Vec<u8>,
+    billing_units: u64,
+    now: i64,
+}
+
 pub struct IcpdbService {
-    index_path: PathBuf,
-    databases_dir: PathBuf,
+    index_path: String,
+    databases_dir: String,
+    database_executor: LocalDatabaseExecutor,
+}
+
+impl Drop for IcpdbService {
+    fn drop(&mut self) {
+        sqlite_facade::clear_registered_connections();
+    }
 }
 
 impl IcpdbService {
-    pub fn new(index_path: PathBuf, databases_dir: PathBuf) -> Self {
+    pub fn new(index_path: impl Into<String>, databases_dir: impl Into<String>) -> Self {
         Self {
-            index_path,
-            databases_dir,
+            index_path: index_path.into(),
+            databases_dir: databases_dir.into(),
+            database_executor: LocalDatabaseExecutor,
         }
     }
 
@@ -142,18 +202,767 @@ impl IcpdbService {
         load_database_summaries_for_caller(&conn, caller)
     }
 
+    pub fn list_database_shard_placements_for_caller(
+        &self,
+        caller: &str,
+    ) -> Result<Vec<DatabaseShardPlacement>, String> {
+        let conn = self.open_index()?;
+        load_database_shard_placements_for_caller(&conn, caller)
+    }
+
+    pub fn list_all_database_shard_placements(
+        &self,
+    ) -> Result<Vec<DatabaseShardPlacement>, String> {
+        let conn = self.open_index()?;
+        load_all_database_shard_placements(&conn)
+    }
+
+    pub fn register_database_shard(
+        &self,
+        request: RegisterDatabaseShardRequest,
+        now: i64,
+    ) -> Result<DatabaseShardInfo, String> {
+        validate_database_canister_id(&request.database_canister_id)?;
+        if request.max_databases == 0 {
+            return Err("max_databases must be greater than zero".to_string());
+        }
+        let shard_id = database_shard_id(&request.database_canister_id);
+        let conn = self.open_index()?;
+        conn.execute(
+            "INSERT INTO database_shards
+             (shard_id, canister_id, status, max_databases, created_at_ms, updated_at_ms)
+             VALUES (?1, ?2, 'active', ?3, ?4, ?4)
+             ON CONFLICT(shard_id) DO UPDATE SET
+               canister_id = excluded.canister_id,
+               status = 'active',
+               max_databases = excluded.max_databases,
+               updated_at_ms = excluded.updated_at_ms",
+            params![
+                &shard_id,
+                &request.database_canister_id,
+                i64::from(request.max_databases),
+                now
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+        load_database_shard(&conn, &shard_id)?
+            .ok_or_else(|| "database shard not found after registration".to_string())
+    }
+
+    pub fn list_database_shards(&self) -> Result<Vec<DatabaseShardInfo>, String> {
+        let conn = self.open_index()?;
+        load_database_shards(&conn)
+    }
+
+    pub fn database_shard_for_canister(
+        &self,
+        database_canister_id: &str,
+    ) -> Result<DatabaseShardInfo, String> {
+        validate_database_canister_id(database_canister_id)?;
+        let conn = self.open_index()?;
+        load_database_shard(&conn, &database_shard_id(database_canister_id))?
+            .ok_or_else(|| "database shard is not registered".to_string())
+    }
+
+    pub fn begin_local_database_migration(
+        &self,
+        request: &MigrateDatabaseToShardRequest,
+        now: i64,
+    ) -> Result<DatabaseArchiveInfo, String> {
+        validate_database_id(&request.database_id)?;
+        validate_database_canister_id(&request.database_canister_id)?;
+        let conn = self.open_index()?;
+        let placement =
+            load_database_shard_placement(&conn, &request.database_id)?.ok_or_else(|| {
+                format!(
+                    "database shard placement not found: {}",
+                    request.database_id
+                )
+            })?;
+        if placement.canister_id.is_some() {
+            return Err(format!(
+                "database is already remote: {}",
+                request.database_id
+            ));
+        }
+        if placement.status != DatabaseStatus::Hot {
+            return Err(format!(
+                "database route is {}: {}",
+                status_to_db(placement.status),
+                request.database_id
+            ));
+        }
+        ensure_database_shard_has_capacity(&conn, &request.database_canister_id)?;
+        self.begin_database_archive_unchecked(&request.database_id, now)
+    }
+
+    pub fn cancel_local_database_migration(
+        &self,
+        database_id: &str,
+        now: i64,
+    ) -> Result<DatabaseMeta, String> {
+        let conn = self.open_index()?;
+        let placement = load_database_shard_placement(&conn, database_id)?
+            .ok_or_else(|| format!("database shard placement not found: {database_id}"))?;
+        if placement.canister_id.is_some() {
+            return Err(format!("database is already remote: {database_id}"));
+        }
+        self.cancel_database_archive_unchecked(database_id, now)
+    }
+
+    pub fn read_local_database_migration_chunk(
+        &self,
+        database_id: &str,
+        offset: u64,
+        max_bytes: u32,
+    ) -> Result<Vec<u8>, String> {
+        let conn = self.open_index()?;
+        let placement = load_database_shard_placement(&conn, database_id)?
+            .ok_or_else(|| format!("database shard placement not found: {database_id}"))?;
+        if placement.canister_id.is_some() {
+            return Err(format!("database is already remote: {database_id}"));
+        }
+        if placement.status != DatabaseStatus::Archiving {
+            return Err(format!(
+                "database route is {}: {database_id}",
+                status_to_db(placement.status)
+            ));
+        }
+        self.read_database_archive_chunk_unchecked(database_id, offset, max_bytes)
+    }
+
+    pub fn complete_local_database_migration(
+        &self,
+        request: &MigrateDatabaseToShardRequest,
+        logical_size_bytes: u64,
+        now: i64,
+    ) -> Result<(DatabaseShardPlacement, DatabaseMeta), String> {
+        validate_database_id(&request.database_id)?;
+        validate_database_canister_id(&request.database_canister_id)?;
+        let old_meta =
+            self.database_meta_with_statuses(&request.database_id, &[DatabaseStatus::Archiving])?;
+        let mut conn = self.open_index()?;
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        let placement =
+            load_database_shard_placement(&tx, &request.database_id)?.ok_or_else(|| {
+                format!(
+                    "database shard placement not found: {}",
+                    request.database_id
+                )
+            })?;
+        if placement.canister_id.is_some() {
+            return Err(format!(
+                "database is already remote: {}",
+                request.database_id
+            ));
+        }
+        if placement.status != DatabaseStatus::Archiving {
+            return Err(format!(
+                "database route is {}: {}",
+                status_to_db(placement.status),
+                request.database_id
+            ));
+        }
+        ensure_database_shard_has_capacity(&tx, &request.database_canister_id)?;
+        let remote_file_name = format!(
+            "remote:{}:{}",
+            request.database_canister_id, request.database_id
+        );
+        tx.execute(
+            "UPDATE databases
+             SET db_file_name = ?2,
+                 active_mount_id = NULL,
+                 status = 'hot',
+                 logical_size_bytes = ?3,
+                 snapshot_hash = NULL,
+                 archived_at_ms = NULL,
+                 restore_size_bytes = NULL,
+                 updated_at_ms = ?4
+             WHERE database_id = ?1",
+            params![
+                &request.database_id,
+                remote_file_name,
+                i64::try_from(logical_size_bytes).map_err(|error| error.to_string())?,
+                now
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.execute(
+            "UPDATE database_shard_placements
+             SET shard_id = ?2,
+                 canister_id = ?3,
+                 mount_id = NULL,
+                 status = 'hot',
+                 schema_version = ?4,
+                 updated_at_ms = ?5
+             WHERE database_id = ?1",
+            params![
+                &request.database_id,
+                database_shard_id(&request.database_canister_id),
+                &request.database_canister_id,
+                DATABASE_SCHEMA_VERSION,
+                now
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())?;
+        let placement = self.database_shard_placement_unchecked(&request.database_id)?;
+        Ok((placement, old_meta))
+    }
+
+    pub fn remote_database_create_plan(
+        &self,
+        caller: &str,
+        now: i64,
+    ) -> Result<Option<RemoteDatabaseCreatePlan>, String> {
+        let conn = self.open_index()?;
+        let Some(shard) = select_database_shard_for_create(&conn)? else {
+            return Ok(None);
+        };
+        let mut selected_database_id = None;
+        for attempt in 0_u32..100 {
+            let database_id =
+                generated_remote_database_id(caller, now, &shard.canister_id, attempt);
+            if !database_exists(&conn, &database_id)? {
+                selected_database_id = Some(database_id);
+                break;
+            }
+        }
+        let database_id = selected_database_id
+            .ok_or_else(|| "failed to generate unique database id".to_string())?;
+        Ok(Some(RemoteDatabaseCreatePlan {
+            database_id,
+            database_canister_id: shard.canister_id,
+        }))
+    }
+
+    pub fn begin_routed_operation(
+        &self,
+        operation_id: &str,
+        database_id: &str,
+        database_canister_id: &str,
+        method: &str,
+        request_hash: Vec<u8>,
+        now: i64,
+    ) -> Result<RoutedOperationInfo, String> {
+        self.begin_routed_operation_with_billing(RoutedOperationBegin {
+            operation_id,
+            database_id,
+            database_canister_id,
+            method,
+            request_hash,
+            billing_units: 0,
+            now,
+        })
+    }
+
+    fn begin_routed_operation_with_billing(
+        &self,
+        request: RoutedOperationBegin<'_>,
+    ) -> Result<RoutedOperationInfo, String> {
+        validate_routed_operation_input(
+            request.operation_id,
+            request.database_id,
+            request.database_canister_id,
+            request.method,
+            &request.request_hash,
+        )?;
+        let billing_units_i64 = u64_to_sqlite_i64(request.billing_units, "billing_units")?;
+        let mut conn = self.open_index()?;
+        load_database_status(&conn, request.database_id)?;
+        if let Some(existing) = load_routed_operation(&conn, request.operation_id)? {
+            validate_routed_operation_replay(
+                &existing,
+                request.database_id,
+                request.database_canister_id,
+                request.method,
+                &request.request_hash,
+            )?;
+            return Ok(existing);
+        }
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        tx.execute(
+            "INSERT INTO routed_operations
+             (operation_id, database_id, database_canister_id, method, request_hash,
+              status, error, billing_units, created_at_ms, updated_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'pending', NULL, ?6, ?7, ?7)",
+            params![
+                request.operation_id,
+                request.database_id,
+                request.database_canister_id,
+                request.method,
+                request.request_hash,
+                billing_units_i64,
+                request.now
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())?;
+        load_routed_operation(&conn, request.operation_id)?.ok_or_else(|| {
+            format!(
+                "routed operation not found after insert: {}",
+                request.operation_id
+            )
+        })
+    }
+
+    pub fn update_routed_operation_status(
+        &self,
+        operation_id: &str,
+        status: RoutedOperationStatus,
+        error: Option<&str>,
+        now: i64,
+    ) -> Result<RoutedOperationInfo, String> {
+        validate_routed_operation_id(operation_id)?;
+        let conn = self.open_index()?;
+        let changed = conn
+            .execute(
+                "UPDATE routed_operations
+                 SET status = ?2,
+                     error = ?3,
+                     updated_at_ms = ?4
+                 WHERE operation_id = ?1",
+                params![
+                    operation_id,
+                    routed_operation_status_to_db(status),
+                    error,
+                    now
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        if changed == 0 {
+            return Err(format!("routed operation not found: {operation_id}"));
+        }
+        load_routed_operation(&conn, operation_id)?
+            .ok_or_else(|| format!("routed operation not found after update: {operation_id}"))
+    }
+
+    pub fn begin_routed_write_with_token(
+        &self,
+        auth: &AuthenticatedDatabaseToken,
+        request: RoutedWriteBegin<'_>,
+    ) -> Result<RoutedOperationInfo, String> {
+        if !token_scope_allows(auth.scope, RequiredRole::Writer) {
+            return Err("api token scope does not allow this operation".to_string());
+        }
+        self.ensure_database_has_units(&auth.database_id, request.billing_units)?;
+        self.begin_routed_operation_with_billing(RoutedOperationBegin {
+            operation_id: request.operation_id,
+            database_id: &auth.database_id,
+            database_canister_id: request.database_canister_id,
+            method: request.method,
+            request_hash: request.request_hash,
+            billing_units: request.billing_units,
+            now: request.now,
+        })
+    }
+
+    pub fn complete_routed_write_with_token(
+        &self,
+        auth: &AuthenticatedDatabaseToken,
+        operation_id: &str,
+        billing_units: u64,
+        logical_size_bytes: u64,
+        now: i64,
+    ) -> Result<RoutedOperationInfo, String> {
+        if !token_scope_allows(auth.scope, RequiredRole::Writer) {
+            return Err("api token scope does not allow this operation".to_string());
+        }
+        self.charge_database_units(&auth.database_id, billing_units)?;
+        self.set_logical_size(&auth.database_id, logical_size_bytes)?;
+        self.update_routed_operation_status(operation_id, RoutedOperationStatus::Applied, None, now)
+    }
+
+    pub fn reconcile_routed_write_from_data_plane(
+        &self,
+        operation_id: &str,
+        logical_size_bytes: u64,
+        now: i64,
+    ) -> Result<RoutedOperationInfo, String> {
+        validate_routed_operation_id(operation_id)?;
+        let conn = self.open_index()?;
+        let operation = load_routed_operation(&conn, operation_id)?
+            .ok_or_else(|| format!("routed operation not found: {operation_id}"))?;
+        if operation.status != RoutedOperationStatus::Unknown {
+            return Err(format!("routed operation is not unknown: {operation_id}"));
+        }
+        let billing_units = load_routed_operation_billing_units(&conn, operation_id)?;
+        if billing_units == 0 {
+            return Err(format!(
+                "routed operation has no billable write units: {operation_id}"
+            ));
+        }
+        drop(conn);
+        self.charge_database_units(&operation.database_id, billing_units)?;
+        self.set_logical_size(&operation.database_id, logical_size_bytes)?;
+        self.update_routed_operation_status(operation_id, RoutedOperationStatus::Applied, None, now)
+    }
+
+    pub fn begin_shard_operation(
+        &self,
+        operation_id: &str,
+        operation_kind: &str,
+        target: Option<&str>,
+        request_hash: Vec<u8>,
+        now: i64,
+    ) -> Result<ShardOperationInfo, String> {
+        validate_shard_operation_input(operation_id, operation_kind, target, &request_hash)?;
+        let mut conn = self.open_index()?;
+        if let Some(existing) = load_shard_operation(&conn, operation_id)? {
+            validate_shard_operation_replay(&existing, operation_kind, target, &request_hash)?;
+            return Ok(existing);
+        }
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        tx.execute(
+            "INSERT INTO shard_operations
+             (operation_id, operation_kind, target, request_hash, status,
+              error, created_at_ms, updated_at_ms)
+             VALUES (?1, ?2, ?3, ?4, 'pending', NULL, ?5, ?5)",
+            params![operation_id, operation_kind, target, request_hash, now],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())?;
+        load_shard_operation(&conn, operation_id)?
+            .ok_or_else(|| format!("shard operation not found after insert: {operation_id}"))
+    }
+
+    pub fn update_shard_operation_status(
+        &self,
+        operation_id: &str,
+        status: RoutedOperationStatus,
+        error: Option<&str>,
+        now: i64,
+    ) -> Result<ShardOperationInfo, String> {
+        validate_shard_operation_id(operation_id)?;
+        let conn = self.open_index()?;
+        let changed = conn
+            .execute(
+                "UPDATE shard_operations
+                 SET status = ?2,
+                     error = ?3,
+                     updated_at_ms = ?4
+                 WHERE operation_id = ?1",
+                params![
+                    operation_id,
+                    routed_operation_status_to_db(status),
+                    error,
+                    now
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        if changed == 0 {
+            return Err(format!("shard operation not found: {operation_id}"));
+        }
+        load_shard_operation(&conn, operation_id)?
+            .ok_or_else(|| format!("shard operation not found after update: {operation_id}"))
+    }
+
+    pub fn shard_operation(
+        &self,
+        operation_id: &str,
+    ) -> Result<Option<ShardOperationInfo>, String> {
+        validate_shard_operation_id(operation_id)?;
+        load_shard_operation(&self.open_index()?, operation_id)
+    }
+
+    pub fn reconcile_shard_operation(
+        &self,
+        operation_id: &str,
+        status: RoutedOperationStatus,
+        error: Option<&str>,
+        now: i64,
+    ) -> Result<ShardOperationInfo, String> {
+        validate_shard_operation_id(operation_id)?;
+        validate_shard_operation_reconcile(status, error)?;
+        let conn = self.open_index()?;
+        let existing = load_shard_operation(&conn, operation_id)?
+            .ok_or_else(|| format!("shard operation not found: {operation_id}"))?;
+        if existing.status != RoutedOperationStatus::Unknown {
+            return Err(format!("shard operation is not unknown: {operation_id}"));
+        }
+        let next_error = match status {
+            RoutedOperationStatus::Applied => None,
+            RoutedOperationStatus::Failed => error,
+            RoutedOperationStatus::Pending | RoutedOperationStatus::Unknown => {
+                return Err(
+                    "shard operation reconcile status must be applied or failed".to_string()
+                );
+            }
+        };
+        conn.execute(
+            "UPDATE shard_operations
+             SET status = ?2,
+                 error = ?3,
+                 updated_at_ms = ?4
+             WHERE operation_id = ?1",
+            params![
+                operation_id,
+                routed_operation_status_to_db(status),
+                next_error,
+                now
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+        load_shard_operation(&conn, operation_id)?
+            .ok_or_else(|| format!("shard operation not found after reconcile: {operation_id}"))
+    }
+
+    pub fn list_shard_operations(&self) -> Result<Vec<ShardOperationInfo>, String> {
+        load_shard_operations(&self.open_index()?)
+    }
+
+    pub fn mark_remote_database_archiving_with_token(
+        &self,
+        auth: &AuthenticatedDatabaseToken,
+        database_id: &str,
+        now: i64,
+    ) -> Result<(), String> {
+        self.remote_database_route_with_token(
+            auth,
+            database_id,
+            RequiredRole::Owner,
+            &[DatabaseStatus::Hot],
+        )?;
+        let conn = self.open_index()?;
+        conn.execute(
+            "UPDATE databases
+             SET status = 'archiving',
+                 updated_at_ms = ?2
+             WHERE database_id = ?1",
+            params![database_id, now],
+        )
+        .map_err(|error| error.to_string())?;
+        update_shard_placement_status(&conn, database_id, DatabaseStatus::Archiving, now)
+    }
+
+    pub fn mark_remote_database_archived_with_token(
+        &self,
+        auth: &AuthenticatedDatabaseToken,
+        database_id: &str,
+        snapshot_hash: Vec<u8>,
+        now: i64,
+    ) -> Result<(), String> {
+        validate_snapshot_hash(&snapshot_hash)?;
+        self.remote_database_route_with_token(
+            auth,
+            database_id,
+            RequiredRole::Owner,
+            &[DatabaseStatus::Archiving],
+        )?;
+        let conn = self.open_index()?;
+        conn.execute(
+            "UPDATE databases
+             SET status = 'archived',
+                 active_mount_id = NULL,
+                 snapshot_hash = ?2,
+                 restore_size_bytes = NULL,
+                 archived_at_ms = ?3,
+                 updated_at_ms = ?3
+             WHERE database_id = ?1",
+            params![database_id, snapshot_hash, now],
+        )
+        .map_err(|error| error.to_string())?;
+        update_shard_placement_status(&conn, database_id, DatabaseStatus::Archived, now)
+    }
+
+    pub fn mark_remote_database_restoring_with_token(
+        &self,
+        auth: &AuthenticatedDatabaseToken,
+        database_id: &str,
+        snapshot_hash: Vec<u8>,
+        size_bytes: u64,
+        now: i64,
+    ) -> Result<(), String> {
+        validate_snapshot_hash(&snapshot_hash)?;
+        if size_bytes > MAX_DATABASE_SIZE_BYTES {
+            return Err(format!(
+                "database size exceeds limit: {size_bytes} > {MAX_DATABASE_SIZE_BYTES}"
+            ));
+        }
+        self.remote_database_route_with_token(
+            auth,
+            database_id,
+            RequiredRole::Owner,
+            &[DatabaseStatus::Archived, DatabaseStatus::Deleted],
+        )?;
+        let conn = self.open_index()?;
+        conn.execute(
+            "UPDATE databases
+             SET status = 'restoring',
+                 active_mount_id = NULL,
+                 snapshot_hash = ?2,
+                 archived_at_ms = NULL,
+                 deleted_at_ms = NULL,
+                 restore_size_bytes = ?3,
+                 updated_at_ms = ?4
+             WHERE database_id = ?1",
+            params![
+                database_id,
+                snapshot_hash,
+                i64::try_from(size_bytes).map_err(|error| error.to_string())?,
+                now
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+        update_shard_placement_status(&conn, database_id, DatabaseStatus::Restoring, now)
+    }
+
+    pub fn mark_remote_database_hot_with_token(
+        &self,
+        auth: &AuthenticatedDatabaseToken,
+        database_id: &str,
+        logical_size_bytes: u64,
+        now: i64,
+    ) -> Result<(), String> {
+        self.remote_database_route_with_token(
+            auth,
+            database_id,
+            RequiredRole::Owner,
+            &[DatabaseStatus::Archiving, DatabaseStatus::Restoring],
+        )?;
+        let conn = self.open_index()?;
+        conn.execute(
+            "UPDATE databases
+             SET status = 'hot',
+                 logical_size_bytes = ?2,
+                 restore_size_bytes = NULL,
+                 updated_at_ms = ?3
+             WHERE database_id = ?1",
+            params![
+                database_id,
+                i64::try_from(logical_size_bytes).unwrap_or(i64::MAX),
+                now
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+        update_shard_placement_status(&conn, database_id, DatabaseStatus::Hot, now)
+    }
+
+    pub fn mark_remote_database_deleted_with_token(
+        &self,
+        auth: &AuthenticatedDatabaseToken,
+        database_id: &str,
+        now: i64,
+    ) -> Result<(), String> {
+        self.remote_database_route_with_token(
+            auth,
+            database_id,
+            RequiredRole::Owner,
+            &[DatabaseStatus::Hot, DatabaseStatus::Archived],
+        )?;
+        let mut conn = self.open_index()?;
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        tx.execute(
+            "UPDATE databases
+             SET status = 'deleted',
+                 active_mount_id = NULL,
+                 logical_size_bytes = 0,
+                 restore_size_bytes = NULL,
+                 deleted_at_ms = ?2,
+                 updated_at_ms = ?2
+             WHERE database_id = ?1",
+            params![database_id, now],
+        )
+        .map_err(|error| error.to_string())?;
+        update_shard_placement_status(&tx, database_id, DatabaseStatus::Deleted, now)?;
+        tx.commit().map_err(|error| error.to_string())
+    }
+
+    pub fn routed_operation(
+        &self,
+        operation_id: &str,
+    ) -> Result<Option<RoutedOperationInfo>, String> {
+        validate_routed_operation_id(operation_id)?;
+        let conn = self.open_index()?;
+        load_routed_operation(&conn, operation_id)
+    }
+
+    pub fn record_data_plane_operation(
+        &self,
+        operation_id: &str,
+        database_id: &str,
+        method: &str,
+        request_hash: Vec<u8>,
+        now: i64,
+    ) -> Result<DataPlaneOperationInfo, String> {
+        validate_data_plane_operation_input(operation_id, database_id, method, &request_hash)?;
+        let conn = self.open_index()?;
+        if let Some(existing) = load_data_plane_operation(&conn, operation_id)? {
+            validate_data_plane_operation_replay(&existing, database_id, method, &request_hash)?;
+            return Ok(existing);
+        }
+        conn.execute(
+            "INSERT INTO data_plane_operations
+             (operation_id, database_id, method, request_hash, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![operation_id, database_id, method, request_hash, now],
+        )
+        .map_err(|error| error.to_string())?;
+        load_data_plane_operation(&conn, operation_id)?
+            .ok_or_else(|| format!("data-plane operation not found after insert: {operation_id}"))
+    }
+
+    pub fn data_plane_operation(
+        &self,
+        operation_id: &str,
+    ) -> Result<Option<DataPlaneOperationInfo>, String> {
+        validate_routed_operation_id(operation_id)?;
+        let conn = self.open_index()?;
+        load_data_plane_operation(&conn, operation_id)
+    }
+
+    pub fn routed_operation_for_caller(
+        &self,
+        request: RoutedOperationRequest,
+        caller: &str,
+    ) -> Result<RoutedOperationInfo, String> {
+        self.require_role(&request.database_id, caller, RequiredRole::Reader)?;
+        self.routed_operation_for_database(&request.database_id, &request.operation_id)
+    }
+
+    pub fn routed_operation_with_token(
+        &self,
+        auth: &AuthenticatedDatabaseToken,
+        request: RoutedOperationRequest,
+    ) -> Result<RoutedOperationInfo, String> {
+        if auth.database_id != request.database_id {
+            return Err("api token database_id does not match request".to_string());
+        }
+        if !token_scope_allows(auth.scope, RequiredRole::Reader) {
+            return Err("api token scope does not allow this operation".to_string());
+        }
+        self.routed_operation_for_database(&request.database_id, &request.operation_id)
+    }
+
+    fn routed_operation_for_database(
+        &self,
+        database_id: &str,
+        operation_id: &str,
+    ) -> Result<RoutedOperationInfo, String> {
+        let operation = self
+            .routed_operation(operation_id)?
+            .ok_or_else(|| format!("routed operation not found: {operation_id}"))?;
+        if operation.database_id != database_id {
+            return Err(format!("routed operation not found: {operation_id}"));
+        }
+        Ok(operation)
+    }
+
     pub fn record_usage_event(&self, event: UsageEvent<'_>) -> Result<(), String> {
         let conn = self.open_index()?;
         conn.execute(
             "INSERT INTO usage_events
-             (method, database_id, caller, success, cycles_delta, error, created_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+             (method, operation, database_id, caller, success, cycles_delta, rows_returned, rows_affected, error, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 event.method,
+                event.operation,
                 event.database_id,
                 event.caller,
                 if event.success { 1_i64 } else { 0_i64 },
                 i64::try_from(event.cycles_delta).unwrap_or(i64::MAX),
+                i64::try_from(event.rows_returned).unwrap_or(i64::MAX),
+                i64::try_from(event.rows_affected).unwrap_or(i64::MAX),
                 event.error,
                 event.now
             ],
@@ -168,38 +977,80 @@ impl IcpdbService {
 
     pub fn usage_event_count(&self) -> Result<u64, String> {
         let conn = self.open_index()?;
-        conn.query_row("SELECT COUNT(*) FROM usage_events", [], |row| {
+        conn.query_row("SELECT COUNT(*) FROM usage_events", params![], |row| {
             row.get::<_, i64>(0)
         })
         .map(|count| count.max(0) as u64)
         .map_err(|error| error.to_string())
     }
 
+    #[doc(hidden)]
+    pub fn debug_index_execute_sql(&self, sql: &str, params: Vec<SqlValue>) -> Result<(), String> {
+        let conn = self.open_index()?;
+        let values = params
+            .iter()
+            .map(sql::sql_value_to_sqlite)
+            .collect::<Vec<_>>();
+        conn.execute(sql, sqlite_facade::params_from_iter(values.iter()))
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    #[doc(hidden)]
+    pub fn debug_index_query_sql(
+        &self,
+        sql: &str,
+        params: Vec<SqlValue>,
+    ) -> Result<Vec<Vec<SqlValue>>, String> {
+        let conn = self.open_index()?;
+        let values = params
+            .iter()
+            .map(sql::sql_value_to_sqlite)
+            .collect::<Vec<_>>();
+        let mut statement = conn.prepare(sql).map_err(|error| error.to_string())?;
+        let column_count = statement.column_count();
+        let mut rows = statement
+            .query(sqlite_facade::params_from_iter(values.iter()))
+            .map_err(|error| error.to_string())?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().map_err(|error| error.to_string())? {
+            let mut out_row = Vec::with_capacity(column_count);
+            for index in 0..column_count {
+                out_row.push(sql::sql_value_from_ref(
+                    row.get_ref(index).map_err(|error| error.to_string())?,
+                ));
+            }
+            out.push(out_row);
+        }
+        Ok(out)
+    }
+
     pub fn database_usage(&self, database_id: &str, caller: &str) -> Result<DatabaseUsage, String> {
         self.require_role(database_id, caller, RequiredRole::Reader)?;
+        self.database_usage_unchecked(database_id)
+    }
+
+    pub fn database_usage_event_summaries(
+        &self,
+        database_id: &str,
+        caller: &str,
+    ) -> Result<Vec<DatabaseUsageEventSummary>, String> {
+        self.require_role(database_id, caller, RequiredRole::Reader)?;
+        self.database_usage_event_summaries_unchecked(database_id)
+    }
+
+    fn database_usage_unchecked(&self, database_id: &str) -> Result<DatabaseUsage, String> {
         let conn = self.open_index()?;
-        conn.query_row(
-            "SELECT database_id, status, logical_size_bytes, max_logical_size_bytes,
-                    (SELECT COUNT(*) FROM usage_events WHERE database_id = databases.database_id)
-             FROM databases
-             WHERE database_id = ?1",
-            params![database_id],
-            |row| {
-                let logical_size_bytes: i64 = row.get(2)?;
-                let max_logical_size_bytes: i64 = row.get(3)?;
-                let usage_event_count: i64 = row.get(4)?;
-                Ok(DatabaseUsage {
-                    database_id: row.get(0)?,
-                    status: status_from_db(&row.get::<_, String>(1)?)?,
-                    logical_size_bytes: logical_size_bytes.max(0) as u64,
-                    max_logical_size_bytes: max_logical_size_bytes.max(0) as u64,
-                    usage_event_count: usage_event_count.max(0) as u64,
-                })
-            },
-        )
-        .optional()
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| format!("database not found: {database_id}"))
+        load_database_usage(&conn, database_id)
+    }
+
+    fn database_usage_event_summaries_unchecked(
+        &self,
+        database_id: &str,
+    ) -> Result<Vec<DatabaseUsageEventSummary>, String> {
+        let conn = self.open_index()?;
+        load_database_usage(&conn, database_id)?;
+        load_database_usage_event_summaries(&conn, database_id)
     }
 
     pub fn set_database_quota(
@@ -208,11 +1059,32 @@ impl IcpdbService {
         request: DatabaseQuotaRequest,
     ) -> Result<DatabaseUsage, String> {
         self.require_role(&request.database_id, caller, RequiredRole::Owner)?;
+        self.set_database_quota_unchecked(request)
+    }
+
+    pub fn set_database_quota_with_token(
+        &self,
+        auth: &AuthenticatedDatabaseToken,
+        request: DatabaseQuotaRequest,
+    ) -> Result<DatabaseUsage, String> {
+        if auth.database_id != request.database_id {
+            return Err("api token database_id does not match request".to_string());
+        }
+        if !token_scope_allows(auth.scope, RequiredRole::Owner) {
+            return Err("api token scope does not allow this operation".to_string());
+        }
+        self.set_database_quota_unchecked(request)
+    }
+
+    fn set_database_quota_unchecked(
+        &self,
+        request: DatabaseQuotaRequest,
+    ) -> Result<DatabaseUsage, String> {
         if request.max_logical_size_bytes == 0 {
             return Err("max_logical_size_bytes must be greater than 0".to_string());
         }
         let current_size = self
-            .database_usage(&request.database_id, caller)?
+            .database_usage_unchecked(&request.database_id)?
             .logical_size_bytes;
         if request.max_logical_size_bytes < current_size {
             return Err(format!(
@@ -231,7 +1103,7 @@ impl IcpdbService {
             ],
         )
         .map_err(|error| error.to_string())?;
-        self.database_usage(&request.database_id, caller)
+        self.database_usage_unchecked(&request.database_id)
     }
 
     pub fn database_billing(
@@ -413,6 +1285,16 @@ impl IcpdbService {
         load_payments(&conn, database_id)
     }
 
+    pub fn list_payments_with_token(
+        &self,
+        auth: &AuthenticatedDatabaseToken,
+        database_id: &str,
+    ) -> Result<Vec<PaymentRecord>, String> {
+        self.require_owner_token_for_database(auth, database_id)?;
+        let conn = self.open_index()?;
+        load_payments(&conn, database_id)
+    }
+
     pub fn create_database_token(
         &self,
         caller: &str,
@@ -421,6 +1303,27 @@ impl IcpdbService {
         now: i64,
     ) -> Result<DatabaseTokenInfo, String> {
         self.validate_create_database_token(caller, &request)?;
+        self.create_database_token_unchecked(request, token_hash, now)
+    }
+
+    pub fn create_database_token_with_token(
+        &self,
+        auth: &AuthenticatedDatabaseToken,
+        request: icpdb_types::CreateDatabaseTokenRequest,
+        token_hash: Vec<u8>,
+        now: i64,
+    ) -> Result<DatabaseTokenInfo, String> {
+        self.require_owner_token_for_database(auth, &request.database_id)?;
+        validate_database_token_name(&request.name)?;
+        self.create_database_token_unchecked(request, token_hash, now)
+    }
+
+    fn create_database_token_unchecked(
+        &self,
+        request: icpdb_types::CreateDatabaseTokenRequest,
+        token_hash: Vec<u8>,
+        now: i64,
+    ) -> Result<DatabaseTokenInfo, String> {
         validate_token_hash(&token_hash)?;
         let token_id = generated_token_id(&token_hash);
         let conn = self.open_index()?;
@@ -464,6 +1367,22 @@ impl IcpdbService {
         caller: &str,
     ) -> Result<Vec<DatabaseTokenInfo>, String> {
         self.require_role(database_id, caller, RequiredRole::Owner)?;
+        self.list_database_tokens_unchecked(database_id)
+    }
+
+    pub fn list_database_tokens_with_token(
+        &self,
+        auth: &AuthenticatedDatabaseToken,
+        database_id: &str,
+    ) -> Result<Vec<DatabaseTokenInfo>, String> {
+        self.require_owner_token_for_database(auth, database_id)?;
+        self.list_database_tokens_unchecked(database_id)
+    }
+
+    fn list_database_tokens_unchecked(
+        &self,
+        database_id: &str,
+    ) -> Result<Vec<DatabaseTokenInfo>, String> {
         let conn = self.open_index()?;
         load_database_tokens(&conn, database_id)
     }
@@ -476,6 +1395,26 @@ impl IcpdbService {
         now: i64,
     ) -> Result<DatabaseTokenInfo, String> {
         self.require_role(database_id, caller, RequiredRole::Owner)?;
+        self.revoke_database_token_unchecked(database_id, token_id, now)
+    }
+
+    pub fn revoke_database_token_with_token(
+        &self,
+        auth: &AuthenticatedDatabaseToken,
+        database_id: &str,
+        token_id: &str,
+        now: i64,
+    ) -> Result<DatabaseTokenInfo, String> {
+        self.require_owner_token_for_database(auth, database_id)?;
+        self.revoke_database_token_unchecked(database_id, token_id, now)
+    }
+
+    fn revoke_database_token_unchecked(
+        &self,
+        database_id: &str,
+        token_id: &str,
+        now: i64,
+    ) -> Result<DatabaseTokenInfo, String> {
         let conn = self.open_index()?;
         conn.execute(
             "UPDATE database_tokens
@@ -486,6 +1425,20 @@ impl IcpdbService {
         .map_err(|error| error.to_string())?;
         load_database_token(&conn, database_id, token_id)?
             .ok_or_else(|| format!("database token not found: {token_id}"))
+    }
+
+    fn require_owner_token_for_database(
+        &self,
+        auth: &AuthenticatedDatabaseToken,
+        database_id: &str,
+    ) -> Result<(), String> {
+        if auth.database_id != database_id {
+            return Err("api token database_id does not match request".to_string());
+        }
+        if !token_scope_allows(auth.scope, RequiredRole::Owner) {
+            return Err("api token scope does not allow this operation".to_string());
+        }
+        Ok(())
     }
 
     pub fn authenticate_database_token(
@@ -589,6 +1542,14 @@ impl IcpdbService {
         )
         .map_err(|error| error.to_string())?;
         record_mount_history(&tx, &database_id, mount_id, "create", now)?;
+        record_shard_placement(
+            &tx,
+            &database_id,
+            Some(mount_id),
+            DatabaseStatus::Hot,
+            DATABASE_SCHEMA_VERSION,
+            now,
+        )?;
         tx.execute(
             "INSERT INTO database_members
              (database_id, principal, role, created_at_ms)
@@ -635,6 +1596,14 @@ impl IcpdbService {
         )
         .map_err(|error| error.to_string())?;
         record_mount_history(&tx, database_id, mount_id, "create", now)?;
+        record_shard_placement(
+            &tx,
+            database_id,
+            Some(mount_id),
+            DatabaseStatus::Hot,
+            DATABASE_SCHEMA_VERSION,
+            now,
+        )?;
         tx.execute(
             "INSERT INTO database_members
              (database_id, principal, role, created_at_ms)
@@ -649,6 +1618,83 @@ impl IcpdbService {
             mount_id,
             schema_version: DATABASE_SCHEMA_VERSION.to_string(),
             logical_size_bytes: 0,
+        })
+    }
+
+    pub fn register_remote_database(
+        &self,
+        request: CreateRemoteDatabaseRequest,
+        owner: &str,
+        now: i64,
+    ) -> Result<DatabaseInfo, String> {
+        validate_database_id(&request.database_id)?;
+        if request.database_canister_id.trim().is_empty() {
+            return Err("database_canister_id must not be empty".to_string());
+        }
+        let mut conn = self.open_index()?;
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        if database_exists(&tx, &request.database_id)? {
+            return Err(format!("database already exists: {}", request.database_id));
+        }
+        ensure_database_shard_has_capacity(&tx, &request.database_canister_id)?;
+        let mount_id = allocate_mount_id(&tx)?;
+        let db_file_name = format!(
+            "remote:{}:{}",
+            request.database_canister_id, request.database_id
+        );
+        tx.execute(
+            "INSERT INTO databases
+             (database_id, db_file_name, mount_id, active_mount_id, status, schema_version,
+              logical_size_bytes, created_at_ms, updated_at_ms)
+             VALUES (?1, ?2, ?3, NULL, 'hot', ?4, 0, ?5, ?5)",
+            params![
+                &request.database_id,
+                db_file_name,
+                i64::from(mount_id),
+                DATABASE_SCHEMA_VERSION,
+                now
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+        record_shard_placement(
+            &tx,
+            &request.database_id,
+            None,
+            DatabaseStatus::Hot,
+            DATABASE_SCHEMA_VERSION,
+            now,
+        )?;
+        tx.execute(
+            "UPDATE database_shard_placements
+             SET shard_id = ?2,
+                 canister_id = ?3,
+                 updated_at_ms = ?4
+             WHERE database_id = ?1",
+            params![
+                &request.database_id,
+                format!("database:{}", request.database_canister_id),
+                &request.database_canister_id,
+                now
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.execute(
+            "INSERT INTO database_members
+             (database_id, principal, role, created_at_ms)
+             VALUES (?1, ?2, 'owner', ?3)",
+            params![&request.database_id, owner, now],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(DatabaseInfo {
+            database_id: request.database_id,
+            status: DatabaseStatus::Hot,
+            mount_id: None,
+            schema_version: DATABASE_SCHEMA_VERSION.to_string(),
+            logical_size_bytes: 0,
+            snapshot_hash: None,
+            archived_at_ms: None,
+            deleted_at_ms: None,
         })
     }
 
@@ -681,25 +1727,25 @@ impl IcpdbService {
         )
         .map_err(|error| error.to_string())?;
         tx.execute(
+            "DELETE FROM database_shard_placements WHERE database_id = ?1",
+            params![database_id],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.execute(
             "DELETE FROM databases WHERE database_id = ?1",
             params![database_id],
         )
         .map_err(|error| error.to_string())?;
         tx.commit().map_err(|error| error.to_string())?;
-        if let Some(db_file_name) = db_file_name
-            && let Err(error) = remove_file(&db_file_name)
-            && error.kind() != std::io::ErrorKind::NotFound
-        {
-            return Err(error.to_string());
+        if let Some(db_file_name) = db_file_name {
+            remove_database_image(&db_file_name)?;
         }
         Ok(())
     }
 
     pub fn run_database_migrations(&self, database_id: &str) -> Result<(), String> {
         let meta = self.database_meta(database_id)?;
-        if let Some(parent) = Path::new(&meta.db_file_name).parent() {
-            create_dir_all(parent).map_err(|error| error.to_string())?;
-        }
+        self.ensure_database_image_registered(&meta)?;
         let result = Connection::open(&meta.db_file_name)
             .and_then(|conn| conn.execute_batch("PRAGMA application_id = 0x49435044;"));
         if result.is_ok() {
@@ -715,6 +1761,24 @@ impl IcpdbService {
         now: i64,
     ) -> Result<DatabaseMeta, String> {
         self.require_role(database_id, caller, RequiredRole::Owner)?;
+        self.delete_database_unchecked(database_id, now)
+    }
+
+    pub fn delete_database_with_token(
+        &self,
+        auth: &AuthenticatedDatabaseToken,
+        database_id: &str,
+        now: i64,
+    ) -> Result<DatabaseMeta, String> {
+        self.require_owner_token_for_database(auth, database_id)?;
+        self.delete_database_unchecked(database_id, now)
+    }
+
+    fn delete_database_unchecked(
+        &self,
+        database_id: &str,
+        now: i64,
+    ) -> Result<DatabaseMeta, String> {
         let meta = self.database_meta_for_delete(database_id)?;
         let mut conn = self.open_index()?;
         let tx = conn.transaction().map_err(|error| error.to_string())?;
@@ -730,11 +1794,15 @@ impl IcpdbService {
             params![database_id, now],
         )
         .map_err(|error| error.to_string())?;
-        if let Err(error) = remove_file(&meta.db_file_name)
-            && error.kind() != std::io::ErrorKind::NotFound
-        {
-            return Err(error.to_string());
-        }
+        record_shard_placement(
+            &tx,
+            database_id,
+            None,
+            DatabaseStatus::Deleted,
+            &meta.schema_version,
+            now,
+        )?;
+        remove_database_image(&meta.db_file_name)?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(meta)
     }
@@ -746,10 +1814,29 @@ impl IcpdbService {
         now: i64,
     ) -> Result<DatabaseArchiveInfo, String> {
         self.require_role(database_id, caller, RequiredRole::Owner)?;
+        self.begin_database_archive_unchecked(database_id, now)
+    }
+
+    pub fn begin_database_archive_with_token(
+        &self,
+        auth: &AuthenticatedDatabaseToken,
+        database_id: &str,
+        now: i64,
+    ) -> Result<DatabaseArchiveInfo, String> {
+        self.require_owner_token_for_database(auth, database_id)?;
+        self.begin_database_archive_unchecked(database_id, now)
+    }
+
+    fn begin_database_archive_unchecked(
+        &self,
+        database_id: &str,
+        now: i64,
+    ) -> Result<DatabaseArchiveInfo, String> {
         let meta = self.database_meta(database_id)?;
         let size_bytes = file_size(&meta.db_file_name)?;
-        let conn = self.open_index()?;
-        conn.execute(
+        let mut conn = self.open_index()?;
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        tx.execute(
             "UPDATE databases
              SET status = 'archiving',
                  updated_at_ms = ?2
@@ -757,6 +1844,15 @@ impl IcpdbService {
             params![database_id, now],
         )
         .map_err(|error| error.to_string())?;
+        record_shard_placement(
+            &tx,
+            database_id,
+            Some(meta.mount_id),
+            DatabaseStatus::Archiving,
+            &meta.schema_version,
+            now,
+        )?;
+        tx.commit().map_err(|error| error.to_string())?;
         Ok(DatabaseArchiveInfo {
             database_id: database_id.to_string(),
             size_bytes,
@@ -771,6 +1867,26 @@ impl IcpdbService {
         max_bytes: u32,
     ) -> Result<Vec<u8>, String> {
         self.require_role(database_id, caller, RequiredRole::Owner)?;
+        self.read_database_archive_chunk_unchecked(database_id, offset, max_bytes)
+    }
+
+    pub fn read_database_archive_chunk_with_token(
+        &self,
+        auth: &AuthenticatedDatabaseToken,
+        database_id: &str,
+        offset: u64,
+        max_bytes: u32,
+    ) -> Result<Vec<u8>, String> {
+        self.require_owner_token_for_database(auth, database_id)?;
+        self.read_database_archive_chunk_unchecked(database_id, offset, max_bytes)
+    }
+
+    fn read_database_archive_chunk_unchecked(
+        &self,
+        database_id: &str,
+        offset: u64,
+        max_bytes: u32,
+    ) -> Result<Vec<u8>, String> {
         let meta = self.database_meta_with_statuses(database_id, &[DatabaseStatus::Archiving])?;
         if max_bytes == 0 {
             return Ok(Vec::new());
@@ -784,16 +1900,10 @@ impl IcpdbService {
         if offset >= size {
             return Ok(Vec::new());
         }
-        let mut file = File::open(&meta.db_file_name).map_err(|error| error.to_string())?;
-        file.seek(SeekFrom::Start(offset))
-            .map_err(|error| error.to_string())?;
         let remaining = size.saturating_sub(offset);
         let chunk_len = remaining.min(u64::from(max_bytes));
-        let mut bytes = Vec::with_capacity(chunk_len as usize);
-        file.take(chunk_len)
-            .read_to_end(&mut bytes)
-            .map_err(|error| error.to_string())?;
-        Ok(bytes)
+        self.database_executor
+            .read_archive_chunk(&meta.db_file_name, offset, chunk_len)
     }
 
     pub fn finalize_database_archive(
@@ -804,14 +1914,35 @@ impl IcpdbService {
         now: i64,
     ) -> Result<DatabaseMeta, String> {
         self.require_role(database_id, caller, RequiredRole::Owner)?;
+        self.finalize_database_archive_unchecked(database_id, snapshot_hash, now)
+    }
+
+    pub fn finalize_database_archive_with_token(
+        &self,
+        auth: &AuthenticatedDatabaseToken,
+        database_id: &str,
+        snapshot_hash: Vec<u8>,
+        now: i64,
+    ) -> Result<DatabaseMeta, String> {
+        self.require_owner_token_for_database(auth, database_id)?;
+        self.finalize_database_archive_unchecked(database_id, snapshot_hash, now)
+    }
+
+    fn finalize_database_archive_unchecked(
+        &self,
+        database_id: &str,
+        snapshot_hash: Vec<u8>,
+        now: i64,
+    ) -> Result<DatabaseMeta, String> {
         let meta = self.database_meta_with_statuses(database_id, &[DatabaseStatus::Archiving])?;
         validate_snapshot_hash(&snapshot_hash)?;
         let actual_hash = file_sha256(&meta.db_file_name)?;
         if actual_hash != snapshot_hash {
             return Err("snapshot_hash does not match archived database bytes".to_string());
         }
-        let conn = self.open_index()?;
-        conn.execute(
+        let mut conn = self.open_index()?;
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        tx.execute(
             "UPDATE databases
              SET status = 'archived',
                  active_mount_id = NULL,
@@ -823,6 +1954,15 @@ impl IcpdbService {
             params![database_id, snapshot_hash, now],
         )
         .map_err(|error| error.to_string())?;
+        record_shard_placement(
+            &tx,
+            database_id,
+            None,
+            DatabaseStatus::Archived,
+            &meta.schema_version,
+            now,
+        )?;
+        tx.commit().map_err(|error| error.to_string())?;
         Ok(meta)
     }
 
@@ -833,9 +1973,28 @@ impl IcpdbService {
         now: i64,
     ) -> Result<DatabaseMeta, String> {
         self.require_role(database_id, caller, RequiredRole::Owner)?;
+        self.cancel_database_archive_unchecked(database_id, now)
+    }
+
+    pub fn cancel_database_archive_with_token(
+        &self,
+        auth: &AuthenticatedDatabaseToken,
+        database_id: &str,
+        now: i64,
+    ) -> Result<DatabaseMeta, String> {
+        self.require_owner_token_for_database(auth, database_id)?;
+        self.cancel_database_archive_unchecked(database_id, now)
+    }
+
+    fn cancel_database_archive_unchecked(
+        &self,
+        database_id: &str,
+        now: i64,
+    ) -> Result<DatabaseMeta, String> {
         let meta = self.database_meta_with_statuses(database_id, &[DatabaseStatus::Archiving])?;
-        let conn = self.open_index()?;
-        conn.execute(
+        let mut conn = self.open_index()?;
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        tx.execute(
             "UPDATE databases
              SET status = 'hot',
                  updated_at_ms = ?2
@@ -843,6 +2002,15 @@ impl IcpdbService {
             params![database_id, now],
         )
         .map_err(|error| error.to_string())?;
+        record_shard_placement(
+            &tx,
+            database_id,
+            Some(meta.mount_id),
+            DatabaseStatus::Hot,
+            &meta.schema_version,
+            now,
+        )?;
+        tx.commit().map_err(|error| error.to_string())?;
         Ok(meta)
     }
 
@@ -867,6 +2035,28 @@ impl IcpdbService {
         now: i64,
     ) -> Result<DatabaseRestoreBegin, String> {
         self.require_role(database_id, caller, RequiredRole::Owner)?;
+        self.begin_database_restore_session_unchecked(database_id, snapshot_hash, size_bytes, now)
+    }
+
+    pub fn begin_database_restore_session_with_token(
+        &self,
+        auth: &AuthenticatedDatabaseToken,
+        database_id: &str,
+        snapshot_hash: Vec<u8>,
+        size_bytes: u64,
+        now: i64,
+    ) -> Result<DatabaseRestoreBegin, String> {
+        self.require_owner_token_for_database(auth, database_id)?;
+        self.begin_database_restore_session_unchecked(database_id, snapshot_hash, size_bytes, now)
+    }
+
+    fn begin_database_restore_session_unchecked(
+        &self,
+        database_id: &str,
+        snapshot_hash: Vec<u8>,
+        size_bytes: u64,
+        now: i64,
+    ) -> Result<DatabaseRestoreBegin, String> {
         validate_snapshot_hash(&snapshot_hash)?;
         if size_bytes > MAX_DATABASE_SIZE_BYTES {
             return Err(format!(
@@ -910,9 +2100,18 @@ impl IcpdbService {
             ],
         )
         .map_err(|error| error.to_string())?;
+        record_shard_placement(
+            &tx,
+            database_id,
+            Some(mount_id),
+            DatabaseStatus::Restoring,
+            DATABASE_SCHEMA_VERSION,
+            now,
+        )?;
         tx.commit().map_err(|error| error.to_string())?;
         let meta = self.database_meta_allowing_restoring(database_id)?;
-        let _ = remove_file(&meta.db_file_name);
+        self.ensure_database_image_registered(&meta)?;
+        remove_database_image(&meta.db_file_name)?;
         Ok(DatabaseRestoreBegin { meta, rollback })
     }
 
@@ -961,6 +2160,14 @@ impl IcpdbService {
             ],
         )
         .map_err(|error| error.to_string())?;
+        record_shard_placement(
+            &tx,
+            &rollback.database_id,
+            rollback.active_mount_id,
+            rollback.status,
+            DATABASE_SCHEMA_VERSION,
+            now,
+        )?;
         tx.commit().map_err(|error| error.to_string())
     }
 
@@ -972,13 +2179,33 @@ impl IcpdbService {
         bytes: &[u8],
     ) -> Result<(), String> {
         self.require_role(database_id, caller, RequiredRole::Owner)?;
+        self.write_database_restore_chunk_unchecked(database_id, offset, bytes)
+    }
+
+    pub fn write_database_restore_chunk_with_token(
+        &self,
+        auth: &AuthenticatedDatabaseToken,
+        database_id: &str,
+        offset: u64,
+        bytes: &[u8],
+    ) -> Result<(), String> {
+        self.require_owner_token_for_database(auth, database_id)?;
+        self.write_database_restore_chunk_unchecked(database_id, offset, bytes)
+    }
+
+    fn write_database_restore_chunk_unchecked(
+        &self,
+        database_id: &str,
+        offset: u64,
+        bytes: &[u8],
+    ) -> Result<(), String> {
         if bytes.len() > MAX_RESTORE_CHUNK_BYTES {
             return Err(format!(
                 "restore chunk size exceeds limit: {} > {MAX_RESTORE_CHUNK_BYTES}",
                 bytes.len()
             ));
         }
-        let meta = self.database_meta_with_statuses(database_id, &[DatabaseStatus::Restoring])?;
+        self.database_meta_with_statuses(database_id, &[DatabaseStatus::Restoring])?;
         let expected_size = self.restore_size_bytes(database_id)?;
         let end = offset
             .checked_add(bytes.len() as u64)
@@ -988,29 +2215,9 @@ impl IcpdbService {
                 "restore chunk exceeds expected size: end {end} > {expected_size}"
             ));
         }
-        if let Some(parent) = Path::new(&meta.db_file_name).parent() {
-            create_dir_all(parent).map_err(|error| error.to_string())?;
-        }
-        let mut file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(false)
-            .open(&meta.db_file_name)
-            .map_err(|error| error.to_string())?;
-        file.seek(SeekFrom::Start(offset))
-            .map_err(|error| error.to_string())?;
-        file.write_all(bytes).map_err(|error| error.to_string())?;
         let conn = self.open_index()?;
-        conn.execute(
-            "INSERT OR REPLACE INTO database_restore_chunks (database_id, offset_bytes, end_bytes)
-             VALUES (?1, ?2, ?3)",
-            params![
-                database_id,
-                i64::try_from(offset).map_err(|error| error.to_string())?,
-                i64::try_from(end).map_err(|error| error.to_string())?
-            ],
-        )
-        .map_err(|error| error.to_string())?;
+        self.database_executor
+            .write_restore_chunk(&conn, database_id, offset, end, bytes)?;
         Ok(())
     }
 
@@ -1030,6 +2237,22 @@ impl IcpdbService {
         caller: &str,
     ) -> Result<DatabaseMeta, String> {
         self.require_role(database_id, caller, RequiredRole::Owner)?;
+        self.prepare_database_restore_finalize_unchecked(database_id)
+    }
+
+    pub fn prepare_database_restore_finalize_with_token(
+        &self,
+        auth: &AuthenticatedDatabaseToken,
+        database_id: &str,
+    ) -> Result<DatabaseMeta, String> {
+        self.require_owner_token_for_database(auth, database_id)?;
+        self.prepare_database_restore_finalize_unchecked(database_id)
+    }
+
+    fn prepare_database_restore_finalize_unchecked(
+        &self,
+        database_id: &str,
+    ) -> Result<DatabaseMeta, String> {
         let meta = self.database_meta_with_statuses(database_id, &[DatabaseStatus::Restoring])?;
         let expected_size = self.restore_size_bytes(database_id)?;
         if !restore_chunks_cover_expected_size(&self.open_index()?, database_id, expected_size)? {
@@ -1037,25 +2260,14 @@ impl IcpdbService {
                 "restore chunks are incomplete for expected size {expected_size} bytes"
             ));
         }
-        OpenOptions::new()
-            .write(true)
-            .open(&meta.db_file_name)
-            .and_then(|file| file.set_len(expected_size))
-            .map_err(|error| error.to_string())?;
-        let size = file_size(&meta.db_file_name)?;
-        if size != expected_size {
-            return Err(format!(
-                "restore size mismatch: expected {expected_size} bytes, got {size} bytes"
-            ));
-        }
         let expected_hash = self.restore_snapshot_hash(database_id)?;
-        let actual_hash = file_sha256(&meta.db_file_name)?;
-        if actual_hash != expected_hash {
-            return Err("snapshot_hash does not match restored database bytes".to_string());
-        }
-        Connection::open(&meta.db_file_name)
-            .and_then(|conn| conn.execute_batch("PRAGMA application_id = 0x49435044;"))
-            .map_err(|error| error.to_string())?;
+        self.database_executor.finalize_restore(
+            &self.open_index()?,
+            &meta.db_file_name,
+            database_id,
+            expected_size,
+            expected_hash,
+        )?;
         Ok(meta)
     }
 
@@ -1066,6 +2278,24 @@ impl IcpdbService {
         now: i64,
     ) -> Result<DatabaseMeta, String> {
         self.require_role(database_id, caller, RequiredRole::Owner)?;
+        self.complete_database_restore_unchecked(database_id, now)
+    }
+
+    pub fn complete_database_restore_with_token(
+        &self,
+        auth: &AuthenticatedDatabaseToken,
+        database_id: &str,
+        now: i64,
+    ) -> Result<DatabaseMeta, String> {
+        self.require_owner_token_for_database(auth, database_id)?;
+        self.complete_database_restore_unchecked(database_id, now)
+    }
+
+    fn complete_database_restore_unchecked(
+        &self,
+        database_id: &str,
+        now: i64,
+    ) -> Result<DatabaseMeta, String> {
         let meta = self.database_meta_with_statuses(database_id, &[DatabaseStatus::Restoring])?;
         let size = file_size(&meta.db_file_name)?;
         let mut conn = self.open_index()?;
@@ -1089,6 +2319,14 @@ impl IcpdbService {
             ],
         )
         .map_err(|error| error.to_string())?;
+        record_shard_placement(
+            &tx,
+            database_id,
+            Some(meta.mount_id),
+            DatabaseStatus::Hot,
+            &meta.schema_version,
+            now,
+        )?;
         tx.commit().map_err(|error| error.to_string())?;
         self.database_meta(database_id)
     }
@@ -1102,7 +2340,31 @@ impl IcpdbService {
         now: i64,
     ) -> Result<(), String> {
         self.require_role(database_id, caller, RequiredRole::Owner)?;
-        if caller == principal && role != DatabaseRole::Owner {
+        self.grant_database_access_checked(database_id, principal, role, now, Some(caller))
+    }
+
+    pub fn grant_database_access_with_token(
+        &self,
+        auth: &AuthenticatedDatabaseToken,
+        database_id: &str,
+        principal: &str,
+        role: DatabaseRole,
+        now: i64,
+    ) -> Result<(), String> {
+        self.require_owner_token_for_database(auth, database_id)?;
+        self.grant_database_access_checked(database_id, principal, role, now, None)
+    }
+
+    fn grant_database_access_checked(
+        &self,
+        database_id: &str,
+        principal: &str,
+        role: DatabaseRole,
+        now: i64,
+        caller: Option<&str>,
+    ) -> Result<(), String> {
+        self.hot_database_route_unchecked(database_id)?;
+        if caller == Some(principal) && role != DatabaseRole::Owner {
             return Err("owner cannot downgrade own access".to_string());
         }
         if principal == ANONYMOUS_PRINCIPAL_TEXT && role != DatabaseRole::Reader {
@@ -1127,8 +2389,27 @@ impl IcpdbService {
         principal: &str,
     ) -> Result<(), String> {
         self.require_role(database_id, caller, RequiredRole::Owner)?;
-        self.database_meta(database_id)?;
-        if caller == principal {
+        self.revoke_database_access_checked(database_id, principal, Some(caller))
+    }
+
+    pub fn revoke_database_access_with_token(
+        &self,
+        auth: &AuthenticatedDatabaseToken,
+        database_id: &str,
+        principal: &str,
+    ) -> Result<(), String> {
+        self.require_owner_token_for_database(auth, database_id)?;
+        self.revoke_database_access_checked(database_id, principal, None)
+    }
+
+    fn revoke_database_access_checked(
+        &self,
+        database_id: &str,
+        principal: &str,
+        caller: Option<&str>,
+    ) -> Result<(), String> {
+        self.hot_database_route_unchecked(database_id)?;
+        if caller == Some(principal) {
             return Err("owner cannot revoke own access".to_string());
         }
         let conn = self.open_index()?;
@@ -1146,8 +2427,24 @@ impl IcpdbService {
         caller: &str,
     ) -> Result<Vec<DatabaseMember>, String> {
         self.require_role(database_id, caller, RequiredRole::Owner)?;
-        self.database_meta(database_id)?;
+        self.list_database_members_unchecked(database_id)
+    }
+
+    pub fn list_database_members_with_token(
+        &self,
+        auth: &AuthenticatedDatabaseToken,
+        database_id: &str,
+    ) -> Result<Vec<DatabaseMember>, String> {
+        self.require_owner_token_for_database(auth, database_id)?;
+        self.list_database_members_unchecked(database_id)
+    }
+
+    fn list_database_members_unchecked(
+        &self,
+        database_id: &str,
+    ) -> Result<Vec<DatabaseMember>, String> {
         let conn = self.open_index()?;
+        load_database_status(&conn, database_id)?;
         conn.prepare(
             "SELECT database_id, principal, role, created_at_ms
              FROM database_members
@@ -1179,12 +2476,8 @@ impl IcpdbService {
             caller,
             RequiredRole::Reader,
             |database_path, max_database_size_bytes| {
-                sql::execute_sql_file(
-                    database_path,
-                    request,
-                    sql::SqlMode::ReadOnly,
-                    max_database_size_bytes,
-                )
+                self.database_executor
+                    .sql_query(database_path, request, max_database_size_bytes)
             },
         )
     }
@@ -1201,12 +2494,8 @@ impl IcpdbService {
             caller,
             RequiredRole::Writer,
             |database_path, max_database_size_bytes| {
-                sql::execute_sql_file(
-                    database_path,
-                    request,
-                    sql::SqlMode::ReadWrite,
-                    max_database_size_bytes,
-                )
+                self.database_executor
+                    .sql_execute(database_path, request, max_database_size_bytes)
             },
         );
         if result.is_ok() {
@@ -1230,12 +2519,8 @@ impl IcpdbService {
             caller,
             RequiredRole::Writer,
             |database_path, max_database_size_bytes| {
-                sql::execute_sql_batch_file(
-                    database_path,
-                    request.statements,
-                    request.max_rows,
-                    max_database_size_bytes,
-                )
+                self.database_executor
+                    .sql_batch(database_path, request, max_database_size_bytes)
             },
         );
         if result.is_ok() {
@@ -1243,6 +2528,301 @@ impl IcpdbService {
             self.refresh_logical_size(&database_id)?;
         }
         result
+    }
+
+    pub fn sql_execute_data_plane(
+        &self,
+        caller: &str,
+        request: SqlExecuteRequest,
+    ) -> Result<SqlExecuteResponse, String> {
+        let database_id = request.database_id.clone();
+        let result = self.with_database_path(
+            &database_id,
+            caller,
+            RequiredRole::Writer,
+            |database_path, max_database_size_bytes| {
+                self.database_executor
+                    .sql_execute(database_path, request, max_database_size_bytes)
+            },
+        );
+        if result.is_ok() {
+            self.refresh_logical_size(&database_id)?;
+        }
+        result
+    }
+
+    pub fn sql_batch_data_plane(
+        &self,
+        caller: &str,
+        request: SqlBatchRequest,
+    ) -> Result<Vec<SqlExecuteResponse>, String> {
+        let database_id = request.database_id.clone();
+        let result = self.with_database_path(
+            &database_id,
+            caller,
+            RequiredRole::Writer,
+            |database_path, max_database_size_bytes| {
+                self.database_executor
+                    .sql_batch(database_path, request, max_database_size_bytes)
+            },
+        );
+        if result.is_ok() {
+            self.refresh_logical_size(&database_id)?;
+        }
+        result
+    }
+
+    pub fn list_tables(
+        &self,
+        database_id: &str,
+        caller: &str,
+    ) -> Result<Vec<DatabaseTable>, String> {
+        self.with_database_path(
+            database_id,
+            caller,
+            RequiredRole::Reader,
+            |database_path, _| self.database_executor.list_tables(database_path),
+        )
+    }
+
+    pub fn describe_table(
+        &self,
+        database_id: &str,
+        table_name: &str,
+        caller: &str,
+    ) -> Result<TableDescription, String> {
+        self.with_database_path(
+            database_id,
+            caller,
+            RequiredRole::Reader,
+            |database_path, _| {
+                self.database_executor
+                    .describe_table(database_path, database_id, table_name)
+            },
+        )
+    }
+
+    pub fn preview_table(
+        &self,
+        caller: &str,
+        request: TablePreviewRequest,
+    ) -> Result<TablePreviewResponse, String> {
+        let database_id = request.database_id.clone();
+        self.with_database_path(
+            &database_id,
+            caller,
+            RequiredRole::Reader,
+            |database_path, _| self.database_executor.preview_table(database_path, request),
+        )
+    }
+
+    pub fn list_tables_with_token(
+        &self,
+        auth: &AuthenticatedDatabaseToken,
+        database_id: &str,
+    ) -> Result<Vec<DatabaseTable>, String> {
+        if auth.database_id != database_id {
+            return Err("api token database_id does not match request".to_string());
+        }
+        self.with_database_path_for_token(
+            &auth.database_id,
+            RequiredRole::Reader,
+            auth.scope,
+            |database_path, _| self.database_executor.list_tables(database_path),
+        )
+    }
+
+    pub fn describe_table_with_token(
+        &self,
+        auth: &AuthenticatedDatabaseToken,
+        database_id: &str,
+        table_name: &str,
+    ) -> Result<TableDescription, String> {
+        if auth.database_id != database_id {
+            return Err("api token database_id does not match request".to_string());
+        }
+        self.with_database_path_for_token(
+            &auth.database_id,
+            RequiredRole::Reader,
+            auth.scope,
+            |database_path, _| {
+                self.database_executor
+                    .describe_table(database_path, database_id, table_name)
+            },
+        )
+    }
+
+    pub fn preview_table_with_token(
+        &self,
+        auth: &AuthenticatedDatabaseToken,
+        request: TablePreviewRequest,
+    ) -> Result<TablePreviewResponse, String> {
+        if auth.database_id != request.database_id {
+            return Err("api token database_id does not match request".to_string());
+        }
+        self.with_database_path_for_token(
+            &auth.database_id,
+            RequiredRole::Reader,
+            auth.scope,
+            |database_path, _| self.database_executor.preview_table(database_path, request),
+        )
+    }
+
+    pub fn database_usage_with_token(
+        &self,
+        auth: &AuthenticatedDatabaseToken,
+        database_id: &str,
+    ) -> Result<DatabaseUsage, String> {
+        if auth.database_id != database_id {
+            return Err("api token database_id does not match request".to_string());
+        }
+        if !token_scope_allows(auth.scope, RequiredRole::Reader) {
+            return Err("api token scope does not allow this operation".to_string());
+        }
+        self.database_usage_unchecked(database_id)
+    }
+
+    pub fn database_shard_placement_with_token(
+        &self,
+        auth: &AuthenticatedDatabaseToken,
+        database_id: &str,
+    ) -> Result<DatabaseShardPlacement, String> {
+        if auth.database_id != database_id {
+            return Err("api token database_id does not match request".to_string());
+        }
+        if !token_scope_allows(auth.scope, RequiredRole::Reader) {
+            return Err("api token scope does not allow this operation".to_string());
+        }
+        self.database_shard_placement_unchecked(database_id)
+    }
+
+    pub fn hot_database_route(
+        &self,
+        database_id: &str,
+        caller: &str,
+        required_role: RequiredRole,
+    ) -> Result<DatabaseShardPlacement, String> {
+        self.require_role(database_id, caller, required_role)?;
+        self.hot_database_route_unchecked(database_id)
+    }
+
+    pub fn hot_database_route_with_token(
+        &self,
+        auth: &AuthenticatedDatabaseToken,
+        database_id: &str,
+        required_role: RequiredRole,
+    ) -> Result<DatabaseShardPlacement, String> {
+        if auth.database_id != database_id {
+            return Err("api token database_id does not match request".to_string());
+        }
+        if !token_scope_allows(auth.scope, required_role) {
+            return Err("api token scope does not allow this operation".to_string());
+        }
+        self.hot_database_route_unchecked(database_id)
+    }
+
+    pub fn database_route_with_token(
+        &self,
+        auth: &AuthenticatedDatabaseToken,
+        database_id: &str,
+        required_role: RequiredRole,
+        allowed_statuses: &[DatabaseStatus],
+    ) -> Result<DatabaseShardPlacement, String> {
+        if auth.database_id != database_id {
+            return Err("api token database_id does not match request".to_string());
+        }
+        if !token_scope_allows(auth.scope, required_role) {
+            return Err("api token scope does not allow this operation".to_string());
+        }
+        self.database_route_unchecked(database_id, allowed_statuses)
+    }
+
+    pub fn remote_database_route_with_token(
+        &self,
+        auth: &AuthenticatedDatabaseToken,
+        database_id: &str,
+        required_role: RequiredRole,
+        allowed_statuses: &[DatabaseStatus],
+    ) -> Result<DatabaseShardPlacement, String> {
+        let placement =
+            self.database_route_with_token(auth, database_id, required_role, allowed_statuses)?;
+        if placement.canister_id.is_none() {
+            return Err(format!("database is not remote: {database_id}"));
+        }
+        Ok(placement)
+    }
+
+    fn database_shard_placement_unchecked(
+        &self,
+        database_id: &str,
+    ) -> Result<DatabaseShardPlacement, String> {
+        let conn = self.open_index()?;
+        load_database_shard_placement(&conn, database_id)?
+            .ok_or_else(|| format!("database shard placement not found: {database_id}"))
+    }
+
+    fn database_route_unchecked(
+        &self,
+        database_id: &str,
+        allowed_statuses: &[DatabaseStatus],
+    ) -> Result<DatabaseShardPlacement, String> {
+        let conn = self.open_index()?;
+        let status = load_database_status(&conn, database_id)?;
+        if !allowed_statuses.contains(&status) {
+            return Err(database_meta_error(&conn, database_id));
+        }
+        let placement = load_database_shard_placement(&conn, database_id)?
+            .ok_or_else(|| format!("database shard placement not found: {database_id}"))?;
+        if !allowed_statuses.contains(&placement.status) {
+            return Err(format!(
+                "database route is {}: {database_id}",
+                status_to_db(placement.status)
+            ));
+        }
+        Ok(placement)
+    }
+
+    fn hot_database_route_unchecked(
+        &self,
+        database_id: &str,
+    ) -> Result<DatabaseShardPlacement, String> {
+        let conn = self.open_index()?;
+        let status = load_database_status(&conn, database_id)?;
+        if status != DatabaseStatus::Hot {
+            return Err(database_meta_error(&conn, database_id));
+        }
+        let placement = load_database_shard_placement(&conn, database_id)?
+            .ok_or_else(|| format!("database shard placement not found: {database_id}"))?;
+        if placement.status != DatabaseStatus::Hot {
+            return Err(format!(
+                "database route is {}: {database_id}",
+                status_to_db(placement.status)
+            ));
+        }
+        Ok(placement)
+    }
+
+    pub fn database_usage_event_summaries_with_token(
+        &self,
+        auth: &AuthenticatedDatabaseToken,
+        database_id: &str,
+    ) -> Result<Vec<DatabaseUsageEventSummary>, String> {
+        if auth.database_id != database_id {
+            return Err("api token database_id does not match request".to_string());
+        }
+        if !token_scope_allows(auth.scope, RequiredRole::Reader) {
+            return Err("api token scope does not allow this operation".to_string());
+        }
+        self.database_usage_event_summaries_unchecked(database_id)
+    }
+
+    pub fn database_billing_with_token(
+        &self,
+        auth: &AuthenticatedDatabaseToken,
+        database_id: &str,
+    ) -> Result<DatabaseBilling, String> {
+        self.require_owner_token_for_database(auth, database_id)?;
+        self.load_database_billing(database_id)
     }
 
     pub fn sql_query_with_token(
@@ -1258,12 +2838,8 @@ impl IcpdbService {
             RequiredRole::Reader,
             auth.scope,
             |database_path, max_database_size_bytes| {
-                sql::execute_sql_file(
-                    database_path,
-                    request,
-                    sql::SqlMode::ReadOnly,
-                    max_database_size_bytes,
-                )
+                self.database_executor
+                    .sql_query(database_path, request, max_database_size_bytes)
             },
         )
     }
@@ -1282,16 +2858,39 @@ impl IcpdbService {
             RequiredRole::Writer,
             auth.scope,
             |database_path, max_database_size_bytes| {
-                sql::execute_sql_file(
-                    database_path,
-                    request,
-                    sql::SqlMode::ReadWrite,
-                    max_database_size_bytes,
-                )
+                self.database_executor
+                    .sql_execute(database_path, request, max_database_size_bytes)
             },
         );
         if result.is_ok() {
             self.charge_database_units(&auth.database_id, SQL_EXECUTE_BILLING_UNITS)?;
+            self.refresh_logical_size(&auth.database_id)?;
+        }
+        result
+    }
+
+    pub fn sql_batch_with_token(
+        &self,
+        auth: &AuthenticatedDatabaseToken,
+        request: SqlBatchRequest,
+    ) -> Result<Vec<SqlExecuteResponse>, String> {
+        if auth.database_id != request.database_id {
+            return Err("api token database_id does not match request".to_string());
+        }
+        let billing_units =
+            SQL_EXECUTE_BILLING_UNITS.saturating_mul(request.statements.len().max(1) as u64);
+        self.ensure_database_has_units(&auth.database_id, billing_units)?;
+        let result = self.with_database_path_for_token(
+            &auth.database_id,
+            RequiredRole::Writer,
+            auth.scope,
+            |database_path, max_database_size_bytes| {
+                self.database_executor
+                    .sql_batch(database_path, request, max_database_size_bytes)
+            },
+        );
+        if result.is_ok() {
+            self.charge_database_units(&auth.database_id, billing_units)?;
             self.refresh_logical_size(&auth.database_id)?;
         }
         result
@@ -1302,14 +2901,11 @@ impl IcpdbService {
         database_id: &str,
         caller: &str,
         required_role: RequiredRole,
-        f: impl FnOnce(&Path, u64) -> Result<T, String>,
+        f: impl FnOnce(&str, u64) -> Result<T, String>,
     ) -> Result<T, String> {
         self.require_role(database_id, caller, required_role)?;
         let meta = self.database_meta(database_id)?;
-        f(
-            Path::new(&meta.db_file_name),
-            self.database_quota(database_id)?,
-        )
+        f(&meta.db_file_name, self.database_quota(database_id)?)
     }
 
     fn with_database_path_for_token<T>(
@@ -1317,16 +2913,13 @@ impl IcpdbService {
         database_id: &str,
         required_role: RequiredRole,
         scope: DatabaseTokenScope,
-        f: impl FnOnce(&Path, u64) -> Result<T, String>,
+        f: impl FnOnce(&str, u64) -> Result<T, String>,
     ) -> Result<T, String> {
         if !token_scope_allows(scope, required_role) {
             return Err("api token scope does not allow this operation".to_string());
         }
         let meta = self.database_meta(database_id)?;
-        f(
-            Path::new(&meta.db_file_name),
-            self.database_quota(database_id)?,
-        )
+        f(&meta.db_file_name, self.database_quota(database_id)?)
     }
 
     fn require_role(
@@ -1527,6 +3120,10 @@ impl IcpdbService {
     fn refresh_logical_size(&self, database_id: &str) -> Result<(), String> {
         let meta = self.database_meta_allowing_restoring(database_id)?;
         let size = file_size(&meta.db_file_name)?;
+        self.set_logical_size(database_id, size)
+    }
+
+    fn set_logical_size(&self, database_id: &str, size: u64) -> Result<(), String> {
         let conn = self.open_index()?;
         conn.execute(
             "UPDATE databases
@@ -1539,7 +3136,28 @@ impl IcpdbService {
     }
 
     fn open_index(&self) -> Result<Connection, String> {
+        self.ensure_index_image_registered()?;
         Connection::open(&self.index_path).map_err(|error| error.to_string())
+    }
+
+    fn ensure_index_image_registered(&self) -> Result<(), String> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            sqlite_facade::register_local_path(&self.index_path, &self.index_path, 10)
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
+    fn ensure_database_image_registered(&self, _meta: &DatabaseMeta) -> Result<(), String> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let meta = _meta;
+            let memory_id = u8::try_from(meta.mount_id).map_err(|error| error.to_string())?;
+            sqlite_facade::register_local_path(&self.index_path, &meta.db_file_name, memory_id)
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
     }
 }
 
@@ -1791,6 +3409,185 @@ fn run_index_migrations(conn: &mut Connection) -> Result<(), String> {
         .map_err(|error| error.to_string())?;
         tx.commit().map_err(|error| error.to_string())?;
     }
+    if !migration_applied(conn, INDEX_SCHEMA_VERSION_RESTORE_CHUNK_BYTES)? {
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        tx.execute_batch("ALTER TABLE database_restore_chunks ADD COLUMN bytes BLOB;")
+            .map_err(|error| error.to_string())?;
+        tx.execute(
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, strftime('%s','now'))",
+            params![INDEX_SCHEMA_VERSION_RESTORE_CHUNK_BYTES],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())?;
+    }
+    if !migration_applied(conn, INDEX_SCHEMA_VERSION_USAGE_EVENT_ROWS)? {
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        tx.execute_batch(
+            "ALTER TABLE usage_events ADD COLUMN rows_returned INTEGER NOT NULL DEFAULT 0;
+             ALTER TABLE usage_events ADD COLUMN rows_affected INTEGER NOT NULL DEFAULT 0;",
+        )
+        .map_err(|error| error.to_string())?;
+        tx.execute(
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, strftime('%s','now'))",
+            params![INDEX_SCHEMA_VERSION_USAGE_EVENT_ROWS],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())?;
+    }
+    if !migration_applied(conn, INDEX_SCHEMA_VERSION_USAGE_EVENT_OPERATION)? {
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        tx.execute_batch("ALTER TABLE usage_events ADD COLUMN operation TEXT;")
+            .map_err(|error| error.to_string())?;
+        tx.execute(
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, strftime('%s','now'))",
+            params![INDEX_SCHEMA_VERSION_USAGE_EVENT_OPERATION],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())?;
+    }
+    if !migration_applied(conn, INDEX_SCHEMA_VERSION_SHARD_PLACEMENTS)? {
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        tx.execute_batch(
+            "CREATE TABLE database_shard_placements (
+               database_id TEXT PRIMARY KEY,
+               shard_id TEXT NOT NULL,
+               canister_id TEXT,
+               mount_id INTEGER,
+               status TEXT NOT NULL,
+               schema_version TEXT NOT NULL,
+               created_at_ms INTEGER NOT NULL,
+               updated_at_ms INTEGER NOT NULL,
+               FOREIGN KEY (database_id) REFERENCES databases(database_id)
+             );
+             CREATE INDEX database_shard_placements_shard_status_idx
+               ON database_shard_placements(shard_id, status);
+             INSERT INTO database_shard_placements
+               (database_id, shard_id, canister_id, mount_id, status, schema_version,
+                created_at_ms, updated_at_ms)
+               SELECT database_id, 'local', NULL, active_mount_id, status, schema_version,
+                      created_at_ms, updated_at_ms
+               FROM databases;",
+        )
+        .map_err(|error| error.to_string())?;
+        tx.execute(
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, strftime('%s','now'))",
+            params![INDEX_SCHEMA_VERSION_SHARD_PLACEMENTS],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())?;
+    }
+    if !migration_applied(conn, INDEX_SCHEMA_VERSION_ROUTED_OPERATIONS)? {
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        tx.execute_batch(
+            "CREATE TABLE routed_operations (
+               operation_id TEXT PRIMARY KEY,
+               database_id TEXT NOT NULL,
+               database_canister_id TEXT NOT NULL,
+               method TEXT NOT NULL,
+               request_hash BLOB NOT NULL,
+               status TEXT NOT NULL,
+               error TEXT,
+               created_at_ms INTEGER NOT NULL,
+               updated_at_ms INTEGER NOT NULL,
+               FOREIGN KEY (database_id) REFERENCES databases(database_id)
+             );
+             CREATE INDEX routed_operations_database_status_idx
+               ON routed_operations(database_id, status, updated_at_ms);
+             CREATE INDEX routed_operations_canister_status_idx
+               ON routed_operations(database_canister_id, status, updated_at_ms);",
+        )
+        .map_err(|error| error.to_string())?;
+        tx.execute(
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, strftime('%s','now'))",
+            params![INDEX_SCHEMA_VERSION_ROUTED_OPERATIONS],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())?;
+    }
+    if !migration_applied(conn, INDEX_SCHEMA_VERSION_DATABASE_SHARDS)? {
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        tx.execute_batch(
+            "CREATE TABLE database_shards (
+               shard_id TEXT PRIMARY KEY,
+               canister_id TEXT NOT NULL UNIQUE,
+               status TEXT NOT NULL,
+               max_databases INTEGER NOT NULL,
+               created_at_ms INTEGER NOT NULL,
+               updated_at_ms INTEGER NOT NULL
+             );
+             CREATE INDEX database_shards_status_idx
+               ON database_shards(status, updated_at_ms);",
+        )
+        .map_err(|error| error.to_string())?;
+        tx.execute(
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, strftime('%s','now'))",
+            params![INDEX_SCHEMA_VERSION_DATABASE_SHARDS],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())?;
+    }
+    if !migration_applied(conn, INDEX_SCHEMA_VERSION_SHARD_OPERATIONS)? {
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        tx.execute_batch(
+            "CREATE TABLE shard_operations (
+               operation_id TEXT PRIMARY KEY,
+               operation_kind TEXT NOT NULL,
+               target TEXT,
+               request_hash BLOB NOT NULL,
+               status TEXT NOT NULL,
+               error TEXT,
+               created_at_ms INTEGER NOT NULL,
+               updated_at_ms INTEGER NOT NULL
+             );
+             CREATE INDEX shard_operations_status_idx
+               ON shard_operations(status, updated_at_ms);
+             CREATE INDEX shard_operations_target_idx
+               ON shard_operations(target, status, updated_at_ms);",
+        )
+        .map_err(|error| error.to_string())?;
+        tx.execute(
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, strftime('%s','now'))",
+            params![INDEX_SCHEMA_VERSION_SHARD_OPERATIONS],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())?;
+    }
+    if !migration_applied(conn, INDEX_SCHEMA_VERSION_DATA_PLANE_OPERATIONS)? {
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        tx.execute_batch(
+            "CREATE TABLE data_plane_operations (
+               operation_id TEXT PRIMARY KEY,
+               database_id TEXT NOT NULL,
+               method TEXT NOT NULL,
+               request_hash BLOB NOT NULL,
+               created_at_ms INTEGER NOT NULL
+             );
+             CREATE INDEX data_plane_operations_database_idx
+               ON data_plane_operations(database_id, created_at_ms);",
+        )
+        .map_err(|error| error.to_string())?;
+        tx.execute(
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, strftime('%s','now'))",
+            params![INDEX_SCHEMA_VERSION_DATA_PLANE_OPERATIONS],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())?;
+    }
+    if !migration_applied(conn, INDEX_SCHEMA_VERSION_ROUTED_OPERATION_BILLING)? {
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        tx.execute(
+            "ALTER TABLE routed_operations
+             ADD COLUMN billing_units INTEGER NOT NULL DEFAULT 0",
+            params![],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.execute(
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, strftime('%s','now'))",
+            params![INDEX_SCHEMA_VERSION_ROUTED_OPERATION_BILLING],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())?;
+    }
     Ok(())
 }
 
@@ -1874,6 +3671,198 @@ fn validate_database_token_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_routed_operation_input(
+    operation_id: &str,
+    database_id: &str,
+    database_canister_id: &str,
+    method: &str,
+    request_hash: &[u8],
+) -> Result<(), String> {
+    validate_routed_operation_id(operation_id)?;
+    validate_database_id(database_id)?;
+    validate_database_canister_id(database_canister_id)?;
+    validate_routed_operation_method(method)?;
+    validate_routed_request_hash(request_hash)
+}
+
+fn validate_routed_operation_id(operation_id: &str) -> Result<(), String> {
+    validate_ascii_identifier(operation_id, ROUTED_OPERATION_ID_MAX_BYTES, "operation_id")
+}
+
+fn validate_database_canister_id(database_canister_id: &str) -> Result<(), String> {
+    if database_canister_id.is_empty() || database_canister_id.len() > 128 {
+        return Err("database_canister_id must be 1..128 characters".to_string());
+    }
+    if !database_canister_id
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-'))
+    {
+        return Err(
+            "database_canister_id may only contain ASCII letters, digits and '-'".to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_routed_operation_method(method: &str) -> Result<(), String> {
+    validate_ascii_identifier(method, ROUTED_OPERATION_METHOD_MAX_BYTES, "method")
+}
+
+fn validate_ascii_identifier(value: &str, max_len: usize, label: &str) -> Result<(), String> {
+    if value.is_empty() || value.len() > max_len {
+        return Err(format!("{label} must be 1..{max_len} characters"));
+    }
+    if !value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(format!(
+            "{label} may only contain ASCII letters, digits, '-' and '_'"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_routed_request_hash(request_hash: &[u8]) -> Result<(), String> {
+    if request_hash.len() == SHA256_DIGEST_BYTES {
+        Ok(())
+    } else {
+        Err(format!(
+            "request_hash must be a {SHA256_DIGEST_BYTES}-byte SHA-256 digest"
+        ))
+    }
+}
+
+fn validate_routed_operation_replay(
+    existing: &RoutedOperationInfo,
+    database_id: &str,
+    database_canister_id: &str,
+    method: &str,
+    request_hash: &[u8],
+) -> Result<(), String> {
+    if existing.database_id == database_id
+        && existing.database_canister_id == database_canister_id
+        && existing.method == method
+        && existing.request_hash == request_hash
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "routed operation request mismatch: {}",
+            existing.operation_id
+        ))
+    }
+}
+
+fn validate_data_plane_operation_input(
+    operation_id: &str,
+    database_id: &str,
+    method: &str,
+    request_hash: &[u8],
+) -> Result<(), String> {
+    validate_routed_operation_id(operation_id)?;
+    validate_database_id(database_id)?;
+    validate_routed_operation_method(method)?;
+    validate_routed_request_hash(request_hash)
+}
+
+fn validate_data_plane_operation_replay(
+    existing: &DataPlaneOperationInfo,
+    database_id: &str,
+    method: &str,
+    request_hash: &[u8],
+) -> Result<(), String> {
+    if existing.database_id == database_id
+        && existing.method == method
+        && existing.request_hash == request_hash
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "data-plane operation request mismatch: {}",
+            existing.operation_id
+        ))
+    }
+}
+
+fn validate_shard_operation_input(
+    operation_id: &str,
+    operation_kind: &str,
+    target: Option<&str>,
+    request_hash: &[u8],
+) -> Result<(), String> {
+    validate_shard_operation_id(operation_id)?;
+    validate_ascii_identifier(
+        operation_kind,
+        SHARD_OPERATION_KIND_MAX_BYTES,
+        "operation_kind",
+    )?;
+    if let Some(target) = target {
+        validate_shard_operation_target(target)?;
+    }
+    validate_routed_request_hash(request_hash)
+}
+
+fn validate_shard_operation_id(operation_id: &str) -> Result<(), String> {
+    validate_ascii_identifier(operation_id, SHARD_OPERATION_ID_MAX_BYTES, "operation_id")
+}
+
+fn validate_shard_operation_target(target: &str) -> Result<(), String> {
+    if target.is_empty() || target.len() > 256 {
+        return Err("target must be 1..256 characters".to_string());
+    }
+    if !target
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b':' | b'.'))
+    {
+        return Err(
+            "target may only contain ASCII letters, digits, '-', '_', ':' and '.'".to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_shard_operation_replay(
+    existing: &ShardOperationInfo,
+    operation_kind: &str,
+    target: Option<&str>,
+    request_hash: &[u8],
+) -> Result<(), String> {
+    if existing.operation_kind == operation_kind
+        && existing.target.as_deref() == target
+        && existing.request_hash == request_hash
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "shard operation request mismatch: {}",
+            existing.operation_id
+        ))
+    }
+}
+
+fn validate_shard_operation_reconcile(
+    status: RoutedOperationStatus,
+    error: Option<&str>,
+) -> Result<(), String> {
+    match status {
+        RoutedOperationStatus::Applied => Ok(()),
+        RoutedOperationStatus::Failed => {
+            if error
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .is_none()
+            {
+                return Err("failed shard operation reconcile requires an error".to_string());
+            }
+            Ok(())
+        }
+        RoutedOperationStatus::Pending | RoutedOperationStatus::Unknown => {
+            Err("shard operation reconcile status must be applied or failed".to_string())
+        }
+    }
+}
+
 fn validate_token_hash(token_hash: &[u8]) -> Result<(), String> {
     if token_hash.len() == SHA256_DIGEST_BYTES {
         Ok(())
@@ -1901,6 +3890,27 @@ fn generated_database_id(caller: &str, now: i64, mount_id: u16, attempt: u32) ->
         "{GENERATED_DATABASE_ID_PREFIX}{}",
         &base32_lower(&hasher.finalize())[..GENERATED_DATABASE_ID_HASH_CHARS]
     )
+}
+
+fn generated_remote_database_id(
+    caller: &str,
+    now: i64,
+    database_canister_id: &str,
+    attempt: u32,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(caller.as_bytes());
+    hasher.update(now.to_be_bytes());
+    hasher.update(database_canister_id.as_bytes());
+    hasher.update(attempt.to_be_bytes());
+    format!(
+        "{GENERATED_DATABASE_ID_PREFIX}{}",
+        &base32_lower(&hasher.finalize())[..GENERATED_DATABASE_ID_HASH_CHARS]
+    )
+}
+
+fn database_shard_id(database_canister_id: &str) -> String {
+    format!("database:{database_canister_id}")
 }
 
 fn generated_token_id(token_hash: &[u8]) -> String {
@@ -1966,12 +3976,13 @@ fn base32_lower(bytes: &[u8]) -> String {
     output
 }
 
-fn database_file_name(databases_dir: &Path, database_id: &str) -> Result<String, String> {
+fn database_file_name(databases_dir: &str, database_id: &str) -> Result<String, String> {
     validate_database_id(database_id)?;
-    Ok(databases_dir
-        .join(format!("{database_id}.sqlite3"))
-        .to_string_lossy()
-        .into_owned())
+    Ok(format!(
+        "{}/{}.sqlite3",
+        databases_dir.trim_end_matches('/'),
+        database_id
+    ))
 }
 
 fn database_exists(conn: &Connection, database_id: &str) -> Result<bool, String> {
@@ -1993,7 +4004,7 @@ fn allocate_mount_id(conn: &Connection) -> Result<u16, String> {
              ORDER BY used_mount_id ASC",
         )
         .map_err(|error| error.to_string())?
-        .query_map([], |row| row.get::<_, i64>(0))
+        .query_map(params![], |row| row.get::<_, i64>(0))
         .map_err(|error| error.to_string())?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| error.to_string())?;
@@ -2034,6 +4045,59 @@ fn record_mount_history(
     Ok(())
 }
 
+fn record_shard_placement(
+    conn: &Connection,
+    database_id: &str,
+    mount_id: Option<u16>,
+    status: DatabaseStatus,
+    schema_version: &str,
+    now: i64,
+) -> Result<(), String> {
+    conn.execute(
+        "INSERT INTO database_shard_placements
+         (database_id, shard_id, canister_id, mount_id, status, schema_version, created_at_ms, updated_at_ms)
+         VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?6)
+         ON CONFLICT(database_id) DO UPDATE SET
+           shard_id = excluded.shard_id,
+           canister_id = excluded.canister_id,
+           mount_id = excluded.mount_id,
+           status = excluded.status,
+           schema_version = excluded.schema_version,
+           updated_at_ms = excluded.updated_at_ms",
+        params![
+            database_id,
+            LOCAL_SHARD_ID,
+            mount_id,
+            status_to_db(status),
+            schema_version,
+            now
+        ],
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn update_shard_placement_status(
+    conn: &Connection,
+    database_id: &str,
+    status: DatabaseStatus,
+    now: i64,
+) -> Result<(), String> {
+    let updated = conn
+        .execute(
+            "UPDATE database_shard_placements
+         SET status = ?2,
+             updated_at_ms = ?3
+         WHERE database_id = ?1",
+            params![database_id, status_to_db(status), now],
+        )
+        .map_err(|error| error.to_string())?;
+    if updated == 0 {
+        return Err(format!("database shard placement not found: {database_id}"));
+    }
+    Ok(())
+}
+
 fn validate_snapshot_hash(snapshot_hash: &[u8]) -> Result<(), String> {
     if snapshot_hash.len() == SHA256_DIGEST_BYTES {
         Ok(())
@@ -2044,16 +4108,175 @@ fn validate_snapshot_hash(snapshot_hash: &[u8]) -> Result<(), String> {
     }
 }
 
-fn file_sha256(path: &str) -> Result<Vec<u8>, String> {
-    let mut file = File::open(path).map_err(|error| error.to_string())?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let read = file.read(&mut buffer).map_err(|error| error.to_string())?;
-        if read == 0 {
+fn remove_database_image(_path: &str) -> Result<(), String> {
+    Ok(())
+}
+
+fn read_database_image_chunk(path: &str, offset: u64, chunk_len: u64) -> Result<Vec<u8>, String> {
+    crate::sqlite_facade::export_database_image_chunk(path, offset, chunk_len)
+        .map_err(|error| error.to_string())
+}
+
+fn write_database_restore_bytes(
+    conn: &Connection,
+    database_id: &str,
+    offset: u64,
+    end: u64,
+    bytes: &[u8],
+) -> Result<(), String> {
+    conn.execute(
+        "INSERT OR REPLACE INTO database_restore_chunks (database_id, offset_bytes, end_bytes, bytes)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![
+            database_id,
+            i64::try_from(offset).map_err(|error| error.to_string())?,
+            i64::try_from(end).map_err(|error| error.to_string())?,
+            bytes
+        ],
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn finalize_database_image_restore(
+    path: &str,
+    database_id: &str,
+    expected_size: u64,
+    expected_hash: Vec<u8>,
+    conn: &Connection,
+) -> Result<(), String> {
+    let chunks = restore_chunks_with_bytes(conn, database_id)?;
+    let (actual_hash, checksum, size) = restore_chunk_digests(&chunks, expected_size)?;
+    if size != expected_size {
+        return Err(format!(
+            "restore size mismatch: expected {expected_size} bytes, got {size} bytes"
+        ));
+    }
+    if actual_hash != expected_hash {
+        return Err("snapshot_hash does not match restored database bytes".to_string());
+    }
+    crate::sqlite_facade::begin_database_image_import(path, expected_size, checksum)
+        .map_err(|error| error.to_string())?;
+    if let Err(error) = import_restore_chunks(path, &chunks, expected_size) {
+        crate::sqlite_facade::cancel_database_image_import(path);
+        return Err(error);
+    }
+    crate::sqlite_facade::finish_database_image_import(path).map_err(|error| error.to_string())?;
+    Connection::open(path)
+        .and_then(|conn| conn.execute_batch("PRAGMA application_id = 0x49435044;"))
+        .map_err(|error| error.to_string())
+}
+
+struct RestoreChunk {
+    offset: u64,
+    end: u64,
+    bytes: Vec<u8>,
+}
+
+fn restore_chunks_with_bytes(
+    conn: &Connection,
+    database_id: &str,
+) -> Result<Vec<RestoreChunk>, String> {
+    conn.prepare(
+        "SELECT offset_bytes, end_bytes, bytes
+         FROM database_restore_chunks
+         WHERE database_id = ?1
+         ORDER BY offset_bytes ASC, end_bytes ASC",
+    )
+    .map_err(|error| error.to_string())?
+    .query_map(params![database_id], |row| {
+        let offset = row.get::<_, i64>(0)?;
+        let end = row.get::<_, i64>(1)?;
+        Ok(RestoreChunk {
+            offset: u64::try_from(offset).map_err(|_| sqlite_facade::Error::InvalidQuery)?,
+            end: u64::try_from(end).map_err(|_| sqlite_facade::Error::InvalidQuery)?,
+            bytes: row.get(2)?,
+        })
+    })
+    .map_err(|error| error.to_string())?
+    .collect::<Result<Vec<_>, _>>()
+    .map_err(|error| error.to_string())
+}
+
+fn restore_chunk_digests(
+    chunks: &[RestoreChunk],
+    expected_size: u64,
+) -> Result<(Vec<u8>, u64, u64), String> {
+    let mut covered_end = 0_u64;
+    let mut sha = Sha256::new();
+    let mut checksum = crate::sqlite_facade::fnv1a64_init();
+    for chunk in chunks {
+        if chunk.end > expected_size {
+            return Err(format!(
+                "restore chunk exceeds expected size: end {} > {expected_size}",
+                chunk.end
+            ));
+        }
+        if chunk.offset > covered_end {
+            return Err(format!(
+                "restore chunks are incomplete for expected size {expected_size} bytes"
+            ));
+        }
+        if chunk.end <= covered_end {
+            continue;
+        }
+        let skip =
+            usize::try_from(covered_end - chunk.offset).map_err(|error| error.to_string())?;
+        let bytes = chunk
+            .bytes
+            .get(skip..)
+            .ok_or_else(|| "restore chunk bytes do not match recorded range".to_string())?;
+        sha.update(bytes);
+        checksum = crate::sqlite_facade::fnv1a64_update(checksum, bytes);
+        covered_end = chunk.end;
+        if covered_end == expected_size {
             break;
         }
-        hasher.update(&buffer[..read]);
+    }
+    Ok((sha.finalize().to_vec(), checksum, covered_end))
+}
+
+fn import_restore_chunks(
+    path: &str,
+    chunks: &[RestoreChunk],
+    expected_size: u64,
+) -> Result<(), String> {
+    let mut covered_end = 0_u64;
+    for chunk in chunks {
+        if chunk.end <= covered_end {
+            continue;
+        }
+        let skip =
+            usize::try_from(covered_end - chunk.offset).map_err(|error| error.to_string())?;
+        let bytes = chunk
+            .bytes
+            .get(skip..)
+            .ok_or_else(|| "restore chunk bytes do not match recorded range".to_string())?;
+        crate::sqlite_facade::import_database_image_chunk(path, covered_end, bytes)
+            .map_err(|error| error.to_string())?;
+        covered_end = chunk.end;
+        if covered_end == expected_size {
+            return Ok(());
+        }
+    }
+    Err(format!(
+        "restore chunks are incomplete for expected size {expected_size} bytes"
+    ))
+}
+
+fn file_sha256(path: &str) -> Result<Vec<u8>, String> {
+    let size = file_size(path)?;
+    let mut hasher = Sha256::new();
+    let mut offset = 0_u64;
+    while offset < size {
+        let chunk_len = (size - offset).min(64 * 1024);
+        let bytes = crate::sqlite_facade::export_database_image_chunk(path, offset, chunk_len)
+            .map_err(|error| error.to_string())?;
+        if bytes.is_empty() {
+            break;
+        }
+        offset += u64::try_from(bytes.len()).map_err(|error| error.to_string())?;
+        hasher.update(bytes);
     }
     Ok(hasher.finalize().to_vec())
 }
@@ -2131,7 +4354,7 @@ fn load_databases(conn: &Connection) -> Result<Vec<DatabaseMeta>, String> {
          ORDER BY mount_id ASC",
     )
     .map_err(|error| error.to_string())?
-    .query_map([], map_database_meta)
+    .query_map(params![], map_database_meta)
     .map_err(|error| error.to_string())?
     .collect::<Result<Vec<_>, _>>()
     .map_err(|error| error.to_string())
@@ -2145,7 +4368,7 @@ fn load_database_infos(conn: &Connection) -> Result<Vec<DatabaseInfo>, String> {
          ORDER BY database_id ASC",
     )
     .map_err(|error| error.to_string())?
-    .query_map([], |row| {
+    .query_map(params![], |row| {
         let mount_id: Option<i64> = row.get(2)?;
         let logical_size_bytes: i64 = row.get(4)?;
         Ok(DatabaseInfo {
@@ -2193,21 +4416,376 @@ fn load_database_summaries_for_caller(
     .map_err(|error| error.to_string())
 }
 
+fn load_database_shard_placements_for_caller(
+    conn: &Connection,
+    caller: &str,
+) -> Result<Vec<DatabaseShardPlacement>, String> {
+    conn.prepare(
+        "SELECT p.database_id, p.shard_id, p.canister_id, p.mount_id, p.status,
+                p.schema_version, p.created_at_ms, p.updated_at_ms
+         FROM database_shard_placements p
+         INNER JOIN database_members m ON m.database_id = p.database_id
+         WHERE m.principal = ?1
+         ORDER BY p.database_id ASC",
+    )
+    .map_err(|error| error.to_string())?
+    .query_map(params![caller], map_database_shard_placement)
+    .map_err(|error| error.to_string())?
+    .collect::<Result<Vec<_>, _>>()
+    .map_err(|error| error.to_string())
+}
+
+fn load_all_database_shard_placements(
+    conn: &Connection,
+) -> Result<Vec<DatabaseShardPlacement>, String> {
+    conn.prepare(
+        "SELECT database_id, shard_id, canister_id, mount_id, status,
+                schema_version, created_at_ms, updated_at_ms
+         FROM database_shard_placements
+         ORDER BY database_id ASC",
+    )
+    .map_err(|error| error.to_string())?
+    .query_map(params![], map_database_shard_placement)
+    .map_err(|error| error.to_string())?
+    .collect::<Result<Vec<_>, _>>()
+    .map_err(|error| error.to_string())
+}
+
+fn load_database_shard_placement(
+    conn: &Connection,
+    database_id: &str,
+) -> Result<Option<DatabaseShardPlacement>, String> {
+    conn.query_row(
+        "SELECT database_id, shard_id, canister_id, mount_id, status,
+                schema_version, created_at_ms, updated_at_ms
+         FROM database_shard_placements
+         WHERE database_id = ?1",
+        params![database_id],
+        map_database_shard_placement,
+    )
+    .optional()
+    .map_err(|error| error.to_string())
+}
+
+fn load_database_shards(conn: &Connection) -> Result<Vec<DatabaseShardInfo>, String> {
+    conn.prepare(
+        "SELECT s.shard_id, s.canister_id, s.status, s.max_databases,
+                COALESCE(assigned.assigned_databases, 0),
+                s.created_at_ms, s.updated_at_ms
+         FROM database_shards s
+         LEFT JOIN (
+           SELECT canister_id, COUNT(*) AS assigned_databases
+           FROM database_shard_placements
+           WHERE canister_id IS NOT NULL AND status <> 'deleted'
+           GROUP BY canister_id
+         ) assigned ON assigned.canister_id = s.canister_id
+         ORDER BY s.created_at_ms ASC, s.shard_id ASC",
+    )
+    .map_err(|error| error.to_string())?
+    .query_map(params![], map_database_shard)
+    .map_err(|error| error.to_string())?
+    .collect::<Result<Vec<_>, _>>()
+    .map_err(|error| error.to_string())
+}
+
+fn load_database_shard(
+    conn: &Connection,
+    shard_id: &str,
+) -> Result<Option<DatabaseShardInfo>, String> {
+    conn.query_row(
+        "SELECT s.shard_id, s.canister_id, s.status, s.max_databases,
+                COALESCE(assigned.assigned_databases, 0),
+                s.created_at_ms, s.updated_at_ms
+         FROM database_shards s
+         LEFT JOIN (
+           SELECT canister_id, COUNT(*) AS assigned_databases
+           FROM database_shard_placements
+           WHERE canister_id IS NOT NULL AND status <> 'deleted'
+           GROUP BY canister_id
+         ) assigned ON assigned.canister_id = s.canister_id
+         WHERE s.shard_id = ?1",
+        params![shard_id],
+        map_database_shard,
+    )
+    .optional()
+    .map_err(|error| error.to_string())
+}
+
+fn select_database_shard_for_create(
+    conn: &Connection,
+) -> Result<Option<DatabaseShardInfo>, String> {
+    conn.query_row(
+        "SELECT s.shard_id, s.canister_id, s.status, s.max_databases,
+                COALESCE(assigned.assigned_databases, 0),
+                s.created_at_ms, s.updated_at_ms
+         FROM database_shards s
+         LEFT JOIN (
+           SELECT canister_id, COUNT(*) AS assigned_databases
+           FROM database_shard_placements
+           WHERE canister_id IS NOT NULL AND status <> 'deleted'
+           GROUP BY canister_id
+         ) assigned ON assigned.canister_id = s.canister_id
+         WHERE s.status = 'active'
+           AND COALESCE(assigned.assigned_databases, 0) < s.max_databases
+         ORDER BY COALESCE(assigned.assigned_databases, 0) ASC,
+                  s.created_at_ms ASC,
+                  s.shard_id ASC
+         LIMIT 1",
+        params![],
+        map_database_shard,
+    )
+    .optional()
+    .map_err(|error| error.to_string())
+}
+
+fn ensure_database_shard_has_capacity(
+    conn: &Connection,
+    database_canister_id: &str,
+) -> Result<(), String> {
+    let Some(shard) = load_database_shard(conn, &database_shard_id(database_canister_id))? else {
+        return Ok(());
+    };
+    if shard.status != "active" {
+        return Err(format!("database shard is not active: {}", shard.shard_id));
+    }
+    if shard.assigned_databases >= u64::from(shard.max_databases) {
+        return Err(format!(
+            "database shard capacity exhausted: {} >= {}",
+            shard.assigned_databases, shard.max_databases
+        ));
+    }
+    Ok(())
+}
+
+fn map_database_shard(row: &sqlite_facade::Row<'_>) -> sqlite_facade::Result<DatabaseShardInfo> {
+    let max_databases: i64 = row.get(3)?;
+    let assigned_databases: i64 = row.get(4)?;
+    Ok(DatabaseShardInfo {
+        shard_id: row.get(0)?,
+        canister_id: row.get(1)?,
+        status: row.get(2)?,
+        max_databases: mount_id_from_db(max_databases)?,
+        assigned_databases: assigned_databases.max(0) as u64,
+        created_at_ms: row.get(5)?,
+        updated_at_ms: row.get(6)?,
+    })
+}
+
+fn map_database_shard_placement(
+    row: &sqlite_facade::Row<'_>,
+) -> sqlite_facade::Result<DatabaseShardPlacement> {
+    let mount_id: Option<i64> = row.get(3)?;
+    Ok(DatabaseShardPlacement {
+        database_id: row.get(0)?,
+        shard_id: row.get(1)?,
+        canister_id: row.get(2)?,
+        mount_id: mount_id.map(mount_id_from_db).transpose()?,
+        status: status_from_db(&row.get::<_, String>(4)?)?,
+        schema_version: row.get(5)?,
+        created_at_ms: row.get(6)?,
+        updated_at_ms: row.get(7)?,
+    })
+}
+
+fn load_routed_operation(
+    conn: &Connection,
+    operation_id: &str,
+) -> Result<Option<RoutedOperationInfo>, String> {
+    conn.query_row(
+        "SELECT operation_id, database_id, database_canister_id, method,
+                request_hash, status, error, created_at_ms, updated_at_ms
+         FROM routed_operations
+         WHERE operation_id = ?1",
+        params![operation_id],
+        map_routed_operation,
+    )
+    .optional()
+    .map_err(|error| error.to_string())
+}
+
+fn load_routed_operation_billing_units(
+    conn: &Connection,
+    operation_id: &str,
+) -> Result<u64, String> {
+    conn.query_row(
+        "SELECT billing_units FROM routed_operations WHERE operation_id = ?1",
+        params![operation_id],
+        |row| {
+            let billing_units: i64 = row.get(0)?;
+            Ok(billing_units.max(0) as u64)
+        },
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn map_routed_operation(
+    row: &sqlite_facade::Row<'_>,
+) -> sqlite_facade::Result<RoutedOperationInfo> {
+    Ok(RoutedOperationInfo {
+        operation_id: row.get(0)?,
+        database_id: row.get(1)?,
+        database_canister_id: row.get(2)?,
+        method: row.get(3)?,
+        request_hash: row.get(4)?,
+        status: routed_operation_status_from_db(&row.get::<_, String>(5)?)?,
+        error: row.get(6)?,
+        created_at_ms: row.get(7)?,
+        updated_at_ms: row.get(8)?,
+    })
+}
+
+fn load_data_plane_operation(
+    conn: &Connection,
+    operation_id: &str,
+) -> Result<Option<DataPlaneOperationInfo>, String> {
+    conn.query_row(
+        "SELECT operation_id, database_id, method, request_hash, created_at_ms
+         FROM data_plane_operations
+         WHERE operation_id = ?1",
+        params![operation_id],
+        map_data_plane_operation,
+    )
+    .optional()
+    .map_err(|error| error.to_string())
+}
+
+fn map_data_plane_operation(
+    row: &sqlite_facade::Row<'_>,
+) -> sqlite_facade::Result<DataPlaneOperationInfo> {
+    Ok(DataPlaneOperationInfo {
+        operation_id: row.get(0)?,
+        database_id: row.get(1)?,
+        method: row.get(2)?,
+        request_hash: row.get(3)?,
+        created_at_ms: row.get(4)?,
+    })
+}
+
+fn load_shard_operation(
+    conn: &Connection,
+    operation_id: &str,
+) -> Result<Option<ShardOperationInfo>, String> {
+    conn.query_row(
+        "SELECT operation_id, operation_kind, target, request_hash, status,
+                error, created_at_ms, updated_at_ms
+         FROM shard_operations
+         WHERE operation_id = ?1",
+        params![operation_id],
+        map_shard_operation,
+    )
+    .optional()
+    .map_err(|error| error.to_string())
+}
+
+fn load_shard_operations(conn: &Connection) -> Result<Vec<ShardOperationInfo>, String> {
+    let mut statement = conn
+        .prepare(
+            "SELECT operation_id, operation_kind, target, request_hash, status,
+                    error, created_at_ms, updated_at_ms
+             FROM shard_operations
+             ORDER BY updated_at_ms DESC, operation_id ASC
+             LIMIT 200",
+        )
+        .map_err(|error| error.to_string())?;
+    statement
+        .query_map(params![], map_shard_operation)
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())
+}
+
+fn map_shard_operation(row: &sqlite_facade::Row<'_>) -> sqlite_facade::Result<ShardOperationInfo> {
+    Ok(ShardOperationInfo {
+        operation_id: row.get(0)?,
+        operation_kind: row.get(1)?,
+        target: row.get(2)?,
+        request_hash: row.get(3)?,
+        status: routed_operation_status_from_db(&row.get::<_, String>(4)?)?,
+        error: row.get(5)?,
+        created_at_ms: row.get(6)?,
+        updated_at_ms: row.get(7)?,
+    })
+}
+
+fn load_database_usage(conn: &Connection, database_id: &str) -> Result<DatabaseUsage, String> {
+    conn.query_row(
+        "SELECT database_id, status, logical_size_bytes, max_logical_size_bytes,
+                (SELECT COUNT(*) FROM usage_events WHERE database_id = databases.database_id)
+         FROM databases
+         WHERE database_id = ?1",
+        params![database_id],
+        |row| {
+            let logical_size_bytes: i64 = row.get(2)?;
+            let max_logical_size_bytes: i64 = row.get(3)?;
+            let usage_event_count: i64 = row.get(4)?;
+            Ok(DatabaseUsage {
+                database_id: row.get(0)?,
+                status: status_from_db(&row.get::<_, String>(1)?)?,
+                logical_size_bytes: logical_size_bytes.max(0) as u64,
+                max_logical_size_bytes: max_logical_size_bytes.max(0) as u64,
+                usage_event_count: usage_event_count.max(0) as u64,
+            })
+        },
+    )
+    .optional()
+    .map_err(|error| error.to_string())?
+    .ok_or_else(|| format!("database not found: {database_id}"))
+}
+
+fn load_database_usage_event_summaries(
+    conn: &Connection,
+    database_id: &str,
+) -> Result<Vec<DatabaseUsageEventSummary>, String> {
+    let mut statement = conn
+        .prepare(
+            "SELECT method, operation, success, COUNT(*), COALESCE(SUM(cycles_delta), 0),
+                    COALESCE(SUM(rows_returned), 0), COALESCE(SUM(rows_affected), 0),
+                    MAX(created_at_ms)
+             FROM usage_events
+             WHERE database_id = ?1
+             GROUP BY method, operation, success
+             ORDER BY MAX(created_at_ms) DESC, method ASC, success DESC
+             LIMIT 25",
+        )
+        .map_err(|error| error.to_string())?;
+    statement
+        .query_map(params![database_id], |row| {
+            let success: i64 = row.get(2)?;
+            let event_count: i64 = row.get(3)?;
+            let total_cycles_delta: i64 = row.get(4)?;
+            let total_rows_returned: i64 = row.get(5)?;
+            let total_rows_affected: i64 = row.get(6)?;
+            Ok(DatabaseUsageEventSummary {
+                method: row.get(0)?,
+                operation: row.get(1)?,
+                success: success != 0,
+                event_count: event_count.max(0) as u64,
+                total_cycles_delta: total_cycles_delta.max(0) as u64,
+                total_rows_returned: total_rows_returned.max(0) as u64,
+                total_rows_affected: total_rows_affected.max(0) as u64,
+                last_created_at_ms: row.get(7)?,
+            })
+        })
+        .map_err(|error| error.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())
+}
+
 fn map_database_meta_with_statuses(
-    row: &rusqlite::Row<'_>,
+    row: &sqlite_facade::Row<'_>,
     statuses: &[DatabaseStatus],
-) -> rusqlite::Result<DatabaseMeta> {
+) -> sqlite_facade::Result<DatabaseMeta> {
     let status: String = row.get(5).unwrap_or_else(|_| "hot".to_string());
     let status = status_from_db(&status)?;
     if !statuses.contains(&status) {
-        return Err(rusqlite::Error::QueryReturnedNoRows);
+        return Err(sqlite_facade::Error::QueryReturnedNoRows);
     }
     map_database_meta(row)
 }
 
-fn map_database_meta(row: &rusqlite::Row<'_>) -> rusqlite::Result<DatabaseMeta> {
+fn map_database_meta(row: &sqlite_facade::Row<'_>) -> sqlite_facade::Result<DatabaseMeta> {
     let mount_id: Option<i64> = row.get(2)?;
-    let mount_id = mount_id.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+    let mount_id = mount_id.ok_or(sqlite_facade::Error::QueryReturnedNoRows)?;
     let logical_size_bytes: i64 = row.get(4)?;
     Ok(DatabaseMeta {
         database_id: row.get(0)?,
@@ -2218,8 +4796,8 @@ fn map_database_meta(row: &rusqlite::Row<'_>) -> rusqlite::Result<DatabaseMeta> 
     })
 }
 
-fn mount_id_from_db(mount_id: i64) -> rusqlite::Result<u16> {
-    u16::try_from(mount_id).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(2, mount_id))
+fn mount_id_from_db(mount_id: i64) -> sqlite_facade::Result<u16> {
+    u16::try_from(mount_id).map_err(|_| sqlite_facade::Error::IntegralValueOutOfRange(2, mount_id))
 }
 
 fn load_member_role(
@@ -2312,7 +4890,7 @@ fn load_billing_config_u64(conn: &Connection, key: &str) -> Result<Option<u64>, 
     .map_err(|error| error.to_string())
 }
 
-fn map_payment_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<PaymentRecord> {
+fn map_payment_record(row: &sqlite_facade::Row<'_>) -> sqlite_facade::Result<PaymentRecord> {
     let amount_e8s: i64 = row.get(3)?;
     let credited_units: i64 = row.get(4)?;
     let block_index: i64 = row.get(5)?;
@@ -2327,7 +4905,7 @@ fn map_payment_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<PaymentRecord
     })
 }
 
-fn map_database_token(row: &rusqlite::Row<'_>) -> rusqlite::Result<DatabaseTokenInfo> {
+fn map_database_token(row: &sqlite_facade::Row<'_>) -> sqlite_facade::Result<DatabaseTokenInfo> {
     Ok(DatabaseTokenInfo {
         token_id: row.get(0)?,
         database_id: row.get(1)?,
@@ -2339,12 +4917,12 @@ fn map_database_token(row: &rusqlite::Row<'_>) -> rusqlite::Result<DatabaseToken
     })
 }
 
-fn role_from_db(role: &str) -> rusqlite::Result<DatabaseRole> {
+fn role_from_db(role: &str) -> sqlite_facade::Result<DatabaseRole> {
     match role {
         "owner" => Ok(DatabaseRole::Owner),
         "writer" => Ok(DatabaseRole::Writer),
         "reader" => Ok(DatabaseRole::Reader),
-        _ => Err(rusqlite::Error::InvalidQuery),
+        _ => Err(sqlite_facade::Error::InvalidQuery),
     }
 }
 
@@ -2356,19 +4934,20 @@ fn role_to_db(role: DatabaseRole) -> &'static str {
     }
 }
 
-fn billing_status_from_db(status: &str) -> rusqlite::Result<DatabaseBillingStatus> {
+fn billing_status_from_db(status: &str) -> sqlite_facade::Result<DatabaseBillingStatus> {
     match status {
         "active" => Ok(DatabaseBillingStatus::Active),
         "suspended" => Ok(DatabaseBillingStatus::Suspended),
-        _ => Err(rusqlite::Error::InvalidQuery),
+        _ => Err(sqlite_facade::Error::InvalidQuery),
     }
 }
 
-fn token_scope_from_db(scope: &str) -> rusqlite::Result<DatabaseTokenScope> {
+fn token_scope_from_db(scope: &str) -> sqlite_facade::Result<DatabaseTokenScope> {
     match scope {
         "read" => Ok(DatabaseTokenScope::Read),
         "write" => Ok(DatabaseTokenScope::Write),
-        _ => Err(rusqlite::Error::InvalidQuery),
+        "owner" => Ok(DatabaseTokenScope::Owner),
+        _ => Err(sqlite_facade::Error::InvalidQuery),
     }
 }
 
@@ -2376,6 +4955,7 @@ fn token_scope_to_db(scope: DatabaseTokenScope) -> &'static str {
     match scope {
         DatabaseTokenScope::Read => "read",
         DatabaseTokenScope::Write => "write",
+        DatabaseTokenScope::Owner => "owner",
     }
 }
 
@@ -2385,17 +4965,18 @@ fn token_scope_allows(scope: DatabaseTokenScope, required_role: RequiredRole) ->
         DatabaseTokenScope::Write => {
             required_role == RequiredRole::Reader || required_role == RequiredRole::Writer
         }
+        DatabaseTokenScope::Owner => true,
     }
 }
 
-fn status_from_db(status: &str) -> rusqlite::Result<DatabaseStatus> {
+fn status_from_db(status: &str) -> sqlite_facade::Result<DatabaseStatus> {
     match status {
         "hot" => Ok(DatabaseStatus::Hot),
         "archiving" => Ok(DatabaseStatus::Archiving),
         "archived" => Ok(DatabaseStatus::Archived),
         "deleted" => Ok(DatabaseStatus::Deleted),
         "restoring" => Ok(DatabaseStatus::Restoring),
-        _ => Err(rusqlite::Error::InvalidQuery),
+        _ => Err(sqlite_facade::Error::InvalidQuery),
     }
 }
 
@@ -2406,6 +4987,25 @@ fn status_to_db(status: DatabaseStatus) -> &'static str {
         DatabaseStatus::Archived => "archived",
         DatabaseStatus::Deleted => "deleted",
         DatabaseStatus::Restoring => "restoring",
+    }
+}
+
+fn routed_operation_status_from_db(status: &str) -> sqlite_facade::Result<RoutedOperationStatus> {
+    match status {
+        "pending" => Ok(RoutedOperationStatus::Pending),
+        "applied" => Ok(RoutedOperationStatus::Applied),
+        "failed" => Ok(RoutedOperationStatus::Failed),
+        "unknown" => Ok(RoutedOperationStatus::Unknown),
+        _ => Err(sqlite_facade::Error::InvalidQuery),
+    }
+}
+
+fn routed_operation_status_to_db(status: RoutedOperationStatus) -> &'static str {
+    match status {
+        RoutedOperationStatus::Pending => "pending",
+        RoutedOperationStatus::Applied => "applied",
+        RoutedOperationStatus::Failed => "failed",
+        RoutedOperationStatus::Unknown => "unknown",
     }
 }
 
@@ -2421,7 +5021,5 @@ fn role_allows(role: DatabaseRole, required_role: RequiredRole) -> bool {
 }
 
 fn file_size(path: &str) -> Result<u64, String> {
-    metadata(path)
-        .map(|metadata| metadata.len())
-        .map_err(|error| error.to_string())
+    crate::sqlite_facade::database_image_size(path).map_err(|error| error.to_string())
 }

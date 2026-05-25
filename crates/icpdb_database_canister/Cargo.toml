@@ -1,0 +1,22 @@
+[package]
+name = "icpdb-database-canister"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+candid = "0.10.26"
+ic-cdk = "0.20.0"
+icpdb-runtime = { path = "../icpdb_runtime" }
+icpdb-types = { path = "../icpdb_types" }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+sha2 = "0.10.9"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+ic-sqlite-vfs = { version = "=0.2.2", default-features = false, features = ["sqlite-precompiled", "bench-profile"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+ic-sqlite-vfs = { version = "=0.2.2", default-features = false, features = ["sqlite-bundled", "bench-profile"] }

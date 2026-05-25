@@ -1,4 +1,8 @@
 type CanisterHealth = record { cycles_balance : nat };
+type CreateDatabaseShardRequest = record {
+  initial_cycles : nat;
+  max_databases : nat16;
+};
 type CreateDatabaseTokenRequest = record {
   name : text;
   scope : DatabaseTokenScope;
@@ -7,6 +11,10 @@ type CreateDatabaseTokenRequest = record {
 type CreateDatabaseTokenResponse = record {
   token : text;
   info : DatabaseTokenInfo;
+};
+type CreateRemoteDatabaseRequest = record {
+  database_canister_id : text;
+  database_id : text;
 };
 type DatabaseArchiveChunk = record { bytes : blob };
 type DatabaseArchiveInfo = record { size_bytes : nat64; database_id : text };
@@ -19,12 +27,59 @@ type DatabaseBilling = record {
   balance_units : nat64;
 };
 type DatabaseBillingStatus = variant { Active; Suspended };
+type DatabaseColumn = record {
+  cid : nat32;
+  name : text;
+  hidden : nat32;
+  primary_key_position : nat32;
+  declared_type : text;
+  default_value : opt text;
+  not_null : bool;
+};
+type DatabaseForeignKey = record {
+  id : nat32;
+  seq : nat32;
+  match_clause : text;
+  to_column : opt text;
+  table_name : text;
+  on_delete : text;
+  on_update : text;
+  from_column : text;
+};
+type DatabaseIndex = record {
+  schema_sql : opt text;
+  name : text;
+  origin : text;
+  unique : bool;
+  table_name : text;
+  partial : bool;
+  columns : vec DatabaseIndexColumn;
+};
+type DatabaseIndexColumn = record {
+  cid : int64;
+  key : bool;
+  descending : bool;
+  collation : text;
+  name : opt text;
+  seqno : nat32;
+};
+type DatabaseInfo = record {
+  status : DatabaseStatus;
+  logical_size_bytes : nat64;
+  schema_version : text;
+  database_id : text;
+  archived_at_ms : opt int64;
+  mount_id : opt nat16;
+  snapshot_hash : opt blob;
+  deleted_at_ms : opt int64;
+};
 type DatabaseMember = record {
   "principal" : text;
   role : DatabaseRole;
   created_at_ms : int64;
   database_id : text;
 };
+type DatabaseObjectType = variant { View; Table };
 type DatabaseQuotaRequest = record {
   max_logical_size_bytes : nat64;
   database_id : text;
@@ -35,6 +90,46 @@ type DatabaseRestoreChunkRequest = record {
   bytes : blob;
 };
 type DatabaseRole = variant { Reader; Writer; Owner };
+type DatabaseShardInfo = record {
+  status : text;
+  shard_id : text;
+  canister_id : text;
+  updated_at_ms : int64;
+  created_at_ms : int64;
+  assigned_databases : nat64;
+  max_databases : nat16;
+};
+type DatabaseShardMaintenanceAction = record {
+  action : text;
+  database_canister_id : opt text;
+  shard_id : opt text;
+  cycles : nat;
+  reason : text;
+};
+type DatabaseShardMaintenanceReport = record {
+  actions : vec DatabaseShardMaintenanceAction;
+  available_slots : nat64;
+  inspected_shards : vec DatabaseShardStatus;
+};
+type DatabaseShardPlacement = record {
+  status : DatabaseStatus;
+  shard_id : text;
+  canister_id : opt text;
+  updated_at_ms : int64;
+  created_at_ms : int64;
+  schema_version : text;
+  database_id : text;
+  mount_id : opt nat16;
+};
+type DatabaseShardStatus = record {
+  cycles_balance : nat;
+  memory_size_bytes : nat;
+  shard : DatabaseShardInfo;
+  canister_status : text;
+  idle_cycles_burned_per_day : nat;
+  module_hash : opt blob;
+};
+type DatabaseShardStatusRequest = record { database_canister_id : text };
 type DatabaseStatus = variant { Hot; Restoring; Archiving; Archived; Deleted };
 type DatabaseSummary = record {
   status : DatabaseStatus;
@@ -43,6 +138,11 @@ type DatabaseSummary = record {
   database_id : text;
   archived_at_ms : opt int64;
   deleted_at_ms : opt int64;
+};
+type DatabaseTable = record {
+  schema_sql : opt text;
+  name : text;
+  object_type : DatabaseObjectType;
 };
 type DatabaseTokenInfo = record {
   last_used_at_ms : opt int64;
@@ -53,13 +153,28 @@ type DatabaseTokenInfo = record {
   database_id : text;
   revoked_at_ms : opt int64;
 };
-type DatabaseTokenScope = variant { Read; Write };
+type DatabaseTokenScope = variant { Read; Write; Owner };
+type DatabaseTrigger = record {
+  schema_sql : opt text;
+  name : text;
+  table_name : text;
+};
 type DatabaseUsage = record {
   status : DatabaseStatus;
   max_logical_size_bytes : nat64;
   logical_size_bytes : nat64;
   usage_event_count : nat64;
   database_id : text;
+};
+type DatabaseUsageEventSummary = record {
+  method : text;
+  last_created_at_ms : int64;
+  total_rows_returned : nat64;
+  event_count : nat64;
+  total_cycles_delta : nat64;
+  operation : opt text;
+  success : bool;
+  total_rows_affected : nat64;
 };
 type DepositQuote = record {
   spender_principal : text;
@@ -100,6 +215,14 @@ type HttpUpdateResponse = record {
   headers : vec record { text; text };
   status_code : nat16;
 };
+type MaintainDatabaseShardsRequest = record {
+  top_up_cycles : nat;
+  new_shard_initial_cycles : nat;
+  new_shard_max_databases : nat16;
+  min_cycles_balance : nat;
+  min_available_slots : nat64;
+  max_new_shards : nat16;
+};
 type PaymentRecord = record {
   block_index : nat64;
   created_at_ms : int64;
@@ -109,22 +232,71 @@ type PaymentRecord = record {
   payer_principal : text;
   payment_id : text;
 };
+type RegisterDatabaseShardRequest = record {
+  database_canister_id : text;
+  max_databases : nat16;
+};
 type Result = variant { Ok : DatabaseArchiveInfo; Err : text };
 type Result_1 = variant { Ok; Err : text };
-type Result_10 = variant { Ok : vec DatabaseSummary; Err : text };
-type Result_11 = variant { Ok : vec PaymentRecord; Err : text };
-type Result_12 = variant { Ok : DatabaseArchiveChunk; Err : text };
-type Result_13 = variant { Ok : DatabaseTokenInfo; Err : text };
-type Result_14 = variant { Ok : vec SqlExecuteResponse; Err : text };
-type Result_15 = variant { Ok : SqlExecuteResponse; Err : text };
+type Result_10 = variant { Ok : DepositQuote; Err : text };
+type Result_11 = variant { Ok : RoutedOperationInfo; Err : text };
+type Result_12 = variant { Ok : DatabaseUsage; Err : text };
+type Result_13 = variant { Ok : vec DatabaseUsageEventSummary; Err : text };
+type Result_14 = variant { Ok : vec DatabaseShardPlacement; Err : text };
+type Result_15 = variant { Ok : vec DatabaseMember; Err : text };
+type Result_16 = variant { Ok : vec DatabaseShardInfo; Err : text };
+type Result_17 = variant { Ok : vec DatabaseTokenInfo; Err : text };
+type Result_18 = variant { Ok : vec DatabaseSummary; Err : text };
+type Result_19 = variant { Ok : vec PaymentRecord; Err : text };
 type Result_2 = variant { Ok : text; Err : text };
-type Result_3 = variant { Ok : CreateDatabaseTokenResponse; Err : text };
-type Result_4 = variant { Ok : DepositResult; Err : text };
-type Result_5 = variant { Ok : DatabaseBilling; Err : text };
-type Result_6 = variant { Ok : DepositQuote; Err : text };
-type Result_7 = variant { Ok : DatabaseUsage; Err : text };
-type Result_8 = variant { Ok : vec DatabaseMember; Err : text };
-type Result_9 = variant { Ok : vec DatabaseTokenInfo; Err : text };
+type Result_20 = variant { Ok : vec ShardOperationInfo; Err : text };
+type Result_21 = variant { Ok : vec DatabaseTable; Err : text };
+type Result_22 = variant { Ok : DatabaseShardMaintenanceReport; Err : text };
+type Result_23 = variant { Ok : DatabaseShardPlacement; Err : text };
+type Result_24 = variant { Ok : TablePreviewResponse; Err : text };
+type Result_25 = variant { Ok : DatabaseArchiveChunk; Err : text };
+type Result_26 = variant { Ok : ShardOperationInfo; Err : text };
+type Result_27 = variant { Ok : DatabaseTokenInfo; Err : text };
+type Result_28 = variant { Ok : vec SqlExecuteResponse; Err : text };
+type Result_29 = variant { Ok : SqlExecuteResponse; Err : text };
+type Result_3 = variant { Ok : DatabaseShardInfo; Err : text };
+type Result_4 = variant { Ok : CreateDatabaseTokenResponse; Err : text };
+type Result_5 = variant { Ok : DatabaseInfo; Err : text };
+type Result_6 = variant { Ok : DepositResult; Err : text };
+type Result_7 = variant { Ok : TableDescription; Err : text };
+type Result_8 = variant { Ok : DatabaseBilling; Err : text };
+type Result_9 = variant { Ok : DatabaseShardStatus; Err : text };
+type RoutedOperationInfo = record {
+  request_hash : blob;
+  status : RoutedOperationStatus;
+  method : text;
+  database_canister_id : text;
+  updated_at_ms : int64;
+  operation_id : text;
+  error : opt text;
+  created_at_ms : int64;
+  database_id : text;
+};
+type RoutedOperationRequest = record {
+  operation_id : text;
+  database_id : text;
+};
+type RoutedOperationStatus = variant { Applied; Failed; Unknown; Pending };
+type ShardOperationInfo = record {
+  request_hash : blob;
+  status : RoutedOperationStatus;
+  operation_kind : text;
+  updated_at_ms : int64;
+  operation_id : text;
+  error : opt text;
+  created_at_ms : int64;
+  target : opt text;
+};
+type ShardOperationReconcileRequest = record {
+  status : RoutedOperationStatus;
+  operation_id : text;
+  error : opt text;
+};
 type SqlBatchRequest = record {
   max_rows : opt nat32;
   database_id : text;
@@ -151,34 +323,82 @@ type SqlValue = variant {
   Text : text;
   Integer : int64;
 };
+type TableDescription = record {
+  foreign_keys : vec DatabaseForeignKey;
+  schema_sql : opt text;
+  database_id : text;
+  object_type : DatabaseObjectType;
+  table_name : text;
+  indexes : vec DatabaseIndex;
+  columns : vec DatabaseColumn;
+  triggers : vec DatabaseTrigger;
+};
+type TablePreviewRequest = record {
+  offset : opt nat32;
+  limit : opt nat32;
+  database_id : text;
+  table_name : text;
+};
+type TablePreviewResponse = record {
+  truncated : bool;
+  rows : vec vec SqlValue;
+  offset : nat32;
+  limit : nat32;
+  database_id : text;
+  total_count : nat64;
+  table_name : text;
+  columns : vec text;
+};
+type TopUpDatabaseShardRequest = record {
+  database_canister_id : text;
+  cycles : nat;
+};
 service : () -> {
   begin_database_archive : (text) -> (Result);
   begin_database_restore : (text, blob, nat64) -> (Result_1);
   cancel_database_archive : (text) -> (Result_1);
   canister_health : () -> (CanisterHealth) query;
   create_database : () -> (Result_2);
-  create_database_token : (CreateDatabaseTokenRequest) -> (Result_3);
+  create_database_shard : (CreateDatabaseShardRequest) -> (Result_3);
+  create_database_token : (CreateDatabaseTokenRequest) -> (Result_4);
+  create_remote_database : (CreateRemoteDatabaseRequest) -> (Result_5);
   delete_database : (text) -> (Result_1);
-  deposit_with_approval : (text, nat64) -> (Result_4);
+  deposit_with_approval : (text, nat64) -> (Result_6);
+  describe_table : (text, text) -> (Result_7) query;
   finalize_database_archive : (text, blob) -> (Result_1);
   finalize_database_restore : (text) -> (Result_1);
-  get_billing : (text) -> (Result_5) query;
-  get_deposit_quote : (text, nat64) -> (Result_6);
-  get_usage : (text) -> (Result_7) query;
+  get_billing : (text) -> (Result_8) query;
+  get_database_shard_status : (DatabaseShardStatusRequest) -> (Result_9);
+  get_deposit_quote : (text, nat64) -> (Result_10);
+  get_routed_operation : (RoutedOperationRequest) -> (Result_11) query;
+  get_usage : (text) -> (Result_12) query;
+  get_usage_event_summaries : (text) -> (Result_13) query;
   grant_database_access : (text, text, DatabaseRole) -> (Result_1);
   http_request : (HttpRequest) -> (HttpResponse) query;
   http_request_update : (HttpUpdateRequest) -> (HttpUpdateResponse);
-  list_database_members : (text) -> (Result_8) query;
-  list_database_tokens : (text) -> (Result_9) query;
-  list_databases : () -> (Result_10) query;
-  list_payments : (text) -> (Result_11) query;
-  read_database_archive_chunk : (text, nat64, nat32) -> (Result_12) query;
+  list_all_database_placements : () -> (Result_14) query;
+  list_database_members : (text) -> (Result_15) query;
+  list_database_placements : () -> (Result_14) query;
+  list_database_shards : () -> (Result_16) query;
+  list_database_tokens : (text) -> (Result_17) query;
+  list_databases : () -> (Result_18) query;
+  list_payments : (text) -> (Result_19) query;
+  list_shard_operations : () -> (Result_20) query;
+  list_tables : (text) -> (Result_21) query;
+  maintain_database_shards : (MaintainDatabaseShardsRequest) -> (Result_22);
+  migrate_database_to_shard : (CreateRemoteDatabaseRequest) -> (Result_23);
+  preview_table : (TablePreviewRequest) -> (Result_24) query;
+  read_database_archive_chunk : (text, nat64, nat32) -> (Result_25) query;
+  reconcile_routed_operation : (RoutedOperationRequest) -> (Result_11);
+  reconcile_shard_operation : (ShardOperationReconcileRequest) -> (Result_26);
+  register_database_shard : (RegisterDatabaseShardRequest) -> (Result_3);
   revoke_database_access : (text, text) -> (Result_1);
-  revoke_database_token : (text, text) -> (Result_13);
-  set_database_quota : (DatabaseQuotaRequest) -> (Result_7);
-  sql_batch : (SqlBatchRequest) -> (Result_14);
-  sql_execute : (SqlExecuteRequest) -> (Result_15);
-  sql_query : (SqlExecuteRequest) -> (Result_15) query;
-  top_up_database_balance : (DatabaseBalanceTopUpRequest) -> (Result_5);
+  revoke_database_token : (text, text) -> (Result_27);
+  set_database_quota : (DatabaseQuotaRequest) -> (Result_12);
+  sql_batch : (SqlBatchRequest) -> (Result_28);
+  sql_execute : (SqlExecuteRequest) -> (Result_29);
+  sql_query : (SqlExecuteRequest) -> (Result_29) query;
+  top_up_database_balance : (DatabaseBalanceTopUpRequest) -> (Result_8);
+  top_up_database_shard : (TopUpDatabaseShardRequest) -> (Result_3);
   write_database_restore_chunk : (DatabaseRestoreChunkRequest) -> (Result_1);
 }

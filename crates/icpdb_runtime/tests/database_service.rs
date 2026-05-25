@@ -4,15 +4,18 @@
 use std::path::PathBuf;
 
 use icpdb_runtime::{
-    ICP_TRANSFER_FEE_E8S_DEFAULT, ICPDB_UNITS_PER_ICP, IcpdbService, MAX_ARCHIVE_CHUNK_BYTES,
-    MAX_DATABASE_SIZE_BYTES, MAX_RESTORE_CHUNK_BYTES, MIN_DEPOSIT_E8S, SQL_EXECUTE_BILLING_UNITS,
-    USAGE_EVENTS_RETENTION_LIMIT, UsageEvent, hash_api_token,
+    AuthenticatedDatabaseToken, ICP_TRANSFER_FEE_E8S_DEFAULT, ICPDB_UNITS_PER_ICP, IcpdbService,
+    MAX_ARCHIVE_CHUNK_BYTES, MAX_DATABASE_SIZE_BYTES, MAX_RESTORE_CHUNK_BYTES, MIN_DEPOSIT_E8S,
+    RequiredRole, RoutedWriteBegin, SQL_EXECUTE_BILLING_UNITS, USAGE_EVENTS_RETENTION_LIMIT,
+    UsageEvent, hash_api_token,
 };
 use icpdb_types::{
-    CreateDatabaseTokenRequest, DatabaseBalanceTopUpRequest, DatabaseBillingStatus, DatabaseRole,
-    DatabaseStatus, DatabaseTokenScope, SqlBatchRequest, SqlExecuteRequest, SqlStatement, SqlValue,
+    CreateDatabaseTokenRequest, CreateRemoteDatabaseRequest, DatabaseBalanceTopUpRequest,
+    DatabaseBillingStatus, DatabaseObjectType, DatabaseRole, DatabaseStatus, DatabaseTokenScope,
+    MigrateDatabaseToShardRequest, RegisterDatabaseShardRequest, RoutedOperationRequest,
+    RoutedOperationStatus, SqlBatchRequest, SqlExecuteRequest, SqlStatement, SqlValue,
+    TablePreviewRequest,
 };
-use rusqlite::{Connection, params};
 use sha2::{Digest, Sha256};
 use tempfile::tempdir;
 
@@ -23,22 +26,68 @@ fn service() -> IcpdbService {
 fn service_with_root() -> (IcpdbService, PathBuf) {
     let dir = tempdir().expect("tempdir should create");
     let root = dir.keep();
-    let service = IcpdbService::new(root.join("index.sqlite3"), root.join("databases"));
+    let service = IcpdbService::new(
+        path_string(root.join("index.sqlite3")),
+        path_string(root.join("databases")),
+    );
     service
         .run_index_migrations()
         .expect("index migrations should run");
     (service, root)
 }
 
+fn path_string(path: PathBuf) -> String {
+    path.to_string_lossy().into_owned()
+}
+
+fn index_service(root: &std::path::Path) -> IcpdbService {
+    IcpdbService::new(
+        path_string(root.join("index.sqlite3")),
+        path_string(root.join("databases")),
+    )
+}
+
+fn index_query(root: &std::path::Path, sql: &str, params: Vec<SqlValue>) -> Vec<Vec<SqlValue>> {
+    index_service(root)
+        .debug_index_query_sql(sql, params)
+        .expect("index query should run")
+}
+
+fn index_execute(root: &std::path::Path, sql: &str, params: Vec<SqlValue>) {
+    index_service(root)
+        .debug_index_execute_sql(sql, params)
+        .expect("index execute should run");
+}
+
+fn sql_text(value: &SqlValue) -> String {
+    match value {
+        SqlValue::Text(value) => value.clone(),
+        value => panic!("expected text value, got {value:?}"),
+    }
+}
+
+fn sql_i64(value: &SqlValue) -> i64 {
+    match value {
+        SqlValue::Integer(value) => *value,
+        value => panic!("expected integer value, got {value:?}"),
+    }
+}
+
+fn sql_opt_i64(value: &SqlValue) -> Option<i64> {
+    match value {
+        SqlValue::Null => None,
+        SqlValue::Integer(value) => Some(*value),
+        value => panic!("expected nullable integer value, got {value:?}"),
+    }
+}
+
 fn assert_restore_size(root: &std::path::Path, database_id: &str, expected: Option<u64>) {
-    let conn = Connection::open(root.join("index.sqlite3")).expect("index should open");
-    let actual: Option<i64> = conn
-        .query_row(
-            "SELECT restore_size_bytes FROM databases WHERE database_id = ?1",
-            params![database_id],
-            |row| row.get(0),
-        )
-        .expect("restore size row should exist");
+    let rows = index_query(
+        root,
+        "SELECT restore_size_bytes FROM databases WHERE database_id = ?1",
+        vec![SqlValue::Text(database_id.to_string())],
+    );
+    let actual = sql_opt_i64(&rows[0][0]);
     assert_eq!(actual.map(|size| size as u64), expected);
 }
 
@@ -50,54 +99,46 @@ fn database_index_row(
     root: &std::path::Path,
     database_id: &str,
 ) -> (String, Option<u16>, u64, Option<u64>) {
-    let conn = Connection::open(root.join("index.sqlite3")).expect("index should open");
-    conn.query_row(
+    let rows = index_query(
+        root,
         "SELECT status, active_mount_id, logical_size_bytes, restore_size_bytes
          FROM databases WHERE database_id = ?1",
-        params![database_id],
-        |row| {
-            let active_mount_id: Option<i64> = row.get(1)?;
-            let logical_size_bytes: i64 = row.get(2)?;
-            let restore_size_bytes: Option<i64> = row.get(3)?;
-            Ok((
-                row.get::<_, String>(0)?,
-                active_mount_id.map(|value| value as u16),
-                logical_size_bytes.max(0) as u64,
-                restore_size_bytes.map(|value| value.max(0) as u64),
-            ))
-        },
+        vec![SqlValue::Text(database_id.to_string())],
+    );
+    let row = &rows[0];
+    (
+        sql_text(&row[0]),
+        sql_opt_i64(&row[1]).map(|value| value as u16),
+        sql_i64(&row[2]).max(0) as u64,
+        sql_opt_i64(&row[3]).map(|value| value.max(0) as u64),
     )
-    .expect("database index row should exist")
 }
 
 fn database_updated_at_ms(root: &std::path::Path, database_id: &str) -> i64 {
-    let conn = Connection::open(root.join("index.sqlite3")).expect("index should open");
-    conn.query_row(
+    let rows = index_query(
+        root,
         "SELECT updated_at_ms FROM databases WHERE database_id = ?1",
-        params![database_id],
-        |row| row.get(0),
-    )
-    .expect("database updated_at_ms should load")
+        vec![SqlValue::Text(database_id.to_string())],
+    );
+    sql_i64(&rows[0][0])
 }
 
 fn database_member_count(root: &std::path::Path, database_id: &str) -> i64 {
-    let conn = Connection::open(root.join("index.sqlite3")).expect("index should open");
-    conn.query_row(
+    let rows = index_query(
+        root,
         "SELECT COUNT(*) FROM database_members WHERE database_id = ?1",
-        params![database_id],
-        |row| row.get(0),
-    )
-    .expect("member count should load")
+        vec![SqlValue::Text(database_id.to_string())],
+    );
+    sql_i64(&rows[0][0])
 }
 
 fn billing_balance_storage_type(root: &std::path::Path, database_id: &str) -> String {
-    let conn = Connection::open(root.join("index.sqlite3")).expect("index should open");
-    conn.query_row(
+    let rows = index_query(
+        root,
         "SELECT typeof(billing_balance_units) FROM databases WHERE database_id = ?1",
-        params![database_id],
-        |row| row.get(0),
-    )
-    .expect("billing balance type should load")
+        vec![SqlValue::Text(database_id.to_string())],
+    );
+    sql_text(&rows[0][0])
 }
 
 fn assert_generated_database_id(database_id: &str) {
@@ -109,39 +150,62 @@ fn assert_generated_database_id(database_id: &str) {
 }
 
 fn schema_migration_count(root: &std::path::Path, version: &str) -> i64 {
-    let conn = Connection::open(root.join("index.sqlite3")).expect("index should open");
-    conn.query_row(
+    let rows = index_query(
+        root,
         "SELECT COUNT(*) FROM schema_migrations WHERE version = ?1",
-        params![version],
-        |row| row.get(0),
-    )
-    .expect("migration count should load")
+        vec![SqlValue::Text(version.to_string())],
+    );
+    sql_i64(&rows[0][0])
 }
 
 fn mount_history_row(root: &std::path::Path, mount_id: u16) -> (String, String) {
-    let conn = Connection::open(root.join("index.sqlite3")).expect("index should open");
-    conn.query_row(
+    let rows = index_query(
+        root,
         "SELECT database_id, reason FROM database_mount_history WHERE mount_id = ?1",
-        params![i64::from(mount_id)],
-        |row| Ok((row.get(0)?, row.get(1)?)),
+        vec![SqlValue::Integer(i64::from(mount_id))],
+    );
+    (sql_text(&rows[0][0]), sql_text(&rows[0][1]))
+}
+
+fn shard_placement_row(
+    root: &std::path::Path,
+    database_id: &str,
+) -> (String, Option<u16>, String, Option<String>, String) {
+    let rows = index_query(
+        root,
+        "SELECT shard_id, mount_id, status, canister_id, schema_version
+         FROM database_shard_placements
+         WHERE database_id = ?1",
+        vec![SqlValue::Text(database_id.to_string())],
+    );
+    (
+        sql_text(&rows[0][0]),
+        sql_opt_i64(&rows[0][1]).map(|value| value as u16),
+        sql_text(&rows[0][2]),
+        match &rows[0][3] {
+            SqlValue::Null => None,
+            value => Some(sql_text(value)),
+        },
+        sql_text(&rows[0][4]),
     )
-    .expect("mount history row should exist")
 }
 
 fn database_restore_chunk_count(root: &std::path::Path, database_id: &str) -> i64 {
-    let conn = Connection::open(root.join("index.sqlite3")).expect("index should open");
-    conn.query_row(
+    let rows = index_query(
+        root,
         "SELECT COUNT(*) FROM database_restore_chunks WHERE database_id = ?1",
-        params![database_id],
-        |row| row.get(0),
-    )
-    .expect("restore chunk count should load")
+        vec![SqlValue::Text(database_id.to_string())],
+    );
+    sql_i64(&rows[0][0])
 }
 
 type UsageEventTuple = (
     String,
     Option<String>,
+    Option<String>,
     String,
+    i64,
+    i64,
     i64,
     i64,
     Option<String>,
@@ -149,27 +213,38 @@ type UsageEventTuple = (
 );
 
 fn usage_event_rows(root: &std::path::Path) -> Vec<UsageEventTuple> {
-    let conn = Connection::open(root.join("index.sqlite3")).expect("index should open");
-    conn.prepare(
-        "SELECT method, database_id, caller, success, cycles_delta, error, created_at_ms
+    index_query(
+        root,
+        "SELECT method, operation, database_id, caller, success, cycles_delta, rows_returned, rows_affected, error, created_at_ms
          FROM usage_events
          ORDER BY event_id ASC",
+        vec![],
     )
-    .expect("usage query should prepare")
-    .query_map([], |row| {
-        Ok((
-            row.get(0)?,
-            row.get(1)?,
-            row.get(2)?,
-            row.get(3)?,
-            row.get(4)?,
-            row.get(5)?,
-            row.get(6)?,
-        ))
+    .into_iter()
+    .map(|row| {
+        (
+            sql_text(&row[0]),
+            match &row[1] {
+                SqlValue::Null => None,
+                value => Some(sql_text(value)),
+            },
+            match &row[2] {
+                SqlValue::Null => None,
+                value => Some(sql_text(value)),
+            },
+            sql_text(&row[3]),
+            sql_i64(&row[4]),
+            sql_i64(&row[5]),
+            sql_i64(&row[6]),
+            sql_i64(&row[7]),
+            match &row[8] {
+                SqlValue::Null => None,
+                value => Some(sql_text(value)),
+            },
+            sql_i64(&row[9]),
+        )
     })
-    .expect("usage query should run")
-    .collect::<Result<Vec<_>, _>>()
-    .expect("usage rows should collect")
+    .collect()
 }
 
 fn read_archive_in_chunks(
@@ -219,15 +294,19 @@ fn sql_request(database_id: &str, sql: &str) -> SqlExecuteRequest {
 fn index_migrations_create_usage_events_and_mount_history_once() {
     let (service, root) = service_with_root();
 
-    let conn = Connection::open(root.join("index.sqlite3")).expect("index should open");
-    for table_name in ["usage_events", "database_mount_history"] {
-        let table_exists: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
-                params![table_name],
-                |row| row.get(0),
-            )
-            .expect("table lookup should work");
+    for table_name in [
+        "usage_events",
+        "database_mount_history",
+        "database_shard_placements",
+        "routed_operations",
+        "shard_operations",
+    ] {
+        let rows = index_query(
+            &root,
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            vec![SqlValue::Text(table_name.to_string())],
+        );
+        let table_exists = sql_i64(&rows[0][0]);
         assert_eq!(table_exists, 1);
     }
     assert_eq!(
@@ -236,6 +315,18 @@ fn index_migrations_create_usage_events_and_mount_history_once() {
     );
     assert_eq!(
         schema_migration_count(&root, "database_index:005_mount_history"),
+        1
+    );
+    assert_eq!(
+        schema_migration_count(&root, "database_index:014_shard_placements"),
+        1
+    );
+    assert_eq!(
+        schema_migration_count(&root, "database_index:015_routed_operations"),
+        1
+    );
+    assert_eq!(
+        schema_migration_count(&root, "database_index:017_shard_operations"),
         1
     );
 
@@ -248,6 +339,18 @@ fn index_migrations_create_usage_events_and_mount_history_once() {
     );
     assert_eq!(
         schema_migration_count(&root, "database_index:005_mount_history"),
+        1
+    );
+    assert_eq!(
+        schema_migration_count(&root, "database_index:014_shard_placements"),
+        1
+    );
+    assert_eq!(
+        schema_migration_count(&root, "database_index:015_routed_operations"),
+        1
+    );
+    assert_eq!(
+        schema_migration_count(&root, "database_index:017_shard_operations"),
         1
     );
 }
@@ -268,6 +371,16 @@ fn generated_database_create_returns_hash_id_and_owner_member() {
     assert_eq!(row.1, Some(11));
     assert!(row.2 > 0);
     assert_eq!(row.3, None);
+    assert_eq!(
+        shard_placement_row(&root, &meta.database_id),
+        (
+            "local".to_string(),
+            Some(11),
+            "hot".to_string(),
+            None,
+            "sqlite:raw".to_string()
+        )
+    );
 }
 
 #[test]
@@ -343,6 +456,185 @@ fn sql_execute_writes_and_sql_query_reads_rows() {
 }
 
 #[test]
+fn table_inspection_lists_describes_and_previews_rows() {
+    let service = service();
+    let meta = service
+        .create_generated_database("owner", 1)
+        .expect("database should create");
+    service
+        .sql_execute(
+            "owner",
+            SqlExecuteRequest {
+                database_id: meta.database_id.clone(),
+                sql: "CREATE TABLE teams (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE)"
+                    .to_string(),
+                params: vec![],
+                max_rows: None,
+            },
+        )
+        .expect("parent table should create");
+    service
+        .sql_execute(
+            "owner",
+            SqlExecuteRequest {
+                database_id: meta.database_id.clone(),
+                sql: "CREATE TABLE members (
+                    id INTEGER PRIMARY KEY,
+                    team_id INTEGER NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+                    name TEXT NOT NULL DEFAULT 'anon',
+                    name_length INTEGER GENERATED ALWAYS AS (length(name)) STORED
+                )"
+                .to_string(),
+                params: vec![],
+                max_rows: None,
+            },
+        )
+        .expect("child table should create");
+    service
+        .sql_execute(
+            "owner",
+            SqlExecuteRequest {
+                database_id: meta.database_id.clone(),
+                sql: "CREATE INDEX members_team_name_idx ON members (team_id, name)".to_string(),
+                params: vec![],
+                max_rows: None,
+            },
+        )
+        .expect("index should create");
+    service
+        .sql_execute(
+            "owner",
+            SqlExecuteRequest {
+                database_id: meta.database_id.clone(),
+                sql: "CREATE TRIGGER members_name_guard
+                    BEFORE INSERT ON members
+                    WHEN NEW.name = ''
+                    BEGIN
+                        SELECT RAISE(ABORT, 'member name required');
+                    END"
+                .to_string(),
+                params: vec![],
+                max_rows: None,
+            },
+        )
+        .expect("trigger should create");
+    service
+        .sql_execute(
+            "owner",
+            SqlExecuteRequest {
+                database_id: meta.database_id.clone(),
+                sql: "INSERT INTO teams (name) VALUES ('core')".to_string(),
+                params: vec![],
+                max_rows: None,
+            },
+        )
+        .expect("team should insert");
+    service
+        .sql_execute(
+            "owner",
+            SqlExecuteRequest {
+                database_id: meta.database_id.clone(),
+                sql: "INSERT INTO members (team_id, name) VALUES (1, 'alice'), (1, 'bob')"
+                    .to_string(),
+                params: vec![],
+                max_rows: None,
+            },
+        )
+        .expect("members should insert");
+
+    let tables = service
+        .list_tables(&meta.database_id, "owner")
+        .expect("tables should list");
+    assert_eq!(
+        tables
+            .iter()
+            .map(|table| table.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["members", "teams"]
+    );
+    assert!(
+        tables
+            .iter()
+            .all(|table| table.object_type == DatabaseObjectType::Table)
+    );
+
+    let description = service
+        .describe_table(&meta.database_id, "members", "owner")
+        .expect("table should describe");
+    assert_eq!(description.database_id, meta.database_id);
+    assert_eq!(description.table_name, "members");
+    assert_eq!(
+        description
+            .columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["id", "team_id", "name", "name_length"]
+    );
+    assert_eq!(
+        description
+            .columns
+            .iter()
+            .map(|column| column.hidden)
+            .collect::<Vec<_>>(),
+        vec![0, 0, 0, 3]
+    );
+    assert_eq!(description.foreign_keys.len(), 1);
+    assert_eq!(description.foreign_keys[0].table_name, "teams");
+    let user_index = description
+        .indexes
+        .iter()
+        .find(|index| index.name == "members_team_name_idx")
+        .expect("created index should describe");
+    assert_eq!(
+        user_index
+            .columns
+            .iter()
+            .filter(|column| column.key)
+            .map(|column| column.name.as_deref().unwrap_or_default())
+            .collect::<Vec<_>>(),
+        vec!["team_id", "name"]
+    );
+    assert_eq!(description.triggers.len(), 1);
+    assert_eq!(description.triggers[0].name, "members_name_guard");
+    assert_eq!(description.triggers[0].table_name, "members");
+    assert!(
+        description.triggers[0]
+            .schema_sql
+            .as_deref()
+            .unwrap_or_default()
+            .contains("CREATE TRIGGER members_name_guard")
+    );
+
+    let preview = service
+        .preview_table(
+            "owner",
+            TablePreviewRequest {
+                database_id: description.database_id,
+                table_name: "members".to_string(),
+                limit: Some(1),
+                offset: Some(1),
+            },
+        )
+        .expect("table preview should load");
+    assert_eq!(
+        preview.columns,
+        vec!["id", "team_id", "name", "name_length"]
+    );
+    assert_eq!(
+        preview.rows,
+        vec![vec![
+            SqlValue::Integer(2),
+            SqlValue::Integer(1),
+            SqlValue::Text("bob".to_string()),
+            SqlValue::Integer(3)
+        ]]
+    );
+    assert_eq!(preview.total_count, 2);
+    assert!(!preview.truncated);
+}
+
+#[test]
 fn sql_query_rejects_writes() {
     let service = service();
     let meta = service
@@ -391,12 +683,11 @@ fn sql_query_is_free_and_allows_empty_balance() {
     assert_eq!(charged.balance_units, initial.balance_units);
     assert_eq!(charged.spent_units, initial.spent_units);
 
-    let conn = Connection::open(root.join("index.sqlite3")).expect("index should open");
-    conn.execute(
+    index_execute(
+        &root,
         "UPDATE databases SET billing_balance_units = 0 WHERE database_id = ?1",
-        params![meta.database_id],
-    )
-    .expect("test balance should update");
+        vec![SqlValue::Text(meta.database_id.clone())],
+    );
     let response = service
         .sql_query(
             "owner",
@@ -500,21 +791,41 @@ fn database_usage_counts_database_scoped_usage_events() {
     service
         .record_usage_event(UsageEvent {
             method: "sql_execute",
+            operation: Some("INSERT"),
             database_id: Some(&meta.database_id),
             caller: "owner",
             success: true,
             cycles_delta: 10,
+            rows_returned: 3,
+            rows_affected: 2,
             error: None,
             now: 2,
         })
         .expect("usage should record");
     service
         .record_usage_event(UsageEvent {
+            method: "sql_execute",
+            operation: Some("INSERT"),
+            database_id: Some(&meta.database_id),
+            caller: "owner",
+            success: false,
+            cycles_delta: 20,
+            rows_returned: 0,
+            rows_affected: 0,
+            error: Some("rejected"),
+            now: 4,
+        })
+        .expect("failed usage should record");
+    service
+        .record_usage_event(UsageEvent {
             method: "list_databases",
+            operation: None,
             database_id: None,
             caller: "owner",
             success: true,
             cycles_delta: 1,
+            rows_returned: 0,
+            rows_affected: 0,
             error: None,
             now: 3,
         })
@@ -526,8 +837,243 @@ fn database_usage_counts_database_scoped_usage_events() {
 
     assert_eq!(usage.database_id, meta.database_id);
     assert_eq!(usage.status, DatabaseStatus::Hot);
-    assert_eq!(usage.usage_event_count, 1);
+    assert_eq!(usage.usage_event_count, 2);
     assert!(usage.max_logical_size_bytes >= usage.logical_size_bytes);
+
+    let summaries = service
+        .database_usage_event_summaries(&meta.database_id, "owner")
+        .expect("usage event summaries should load");
+    assert_eq!(summaries.len(), 2);
+    assert_eq!(summaries[0].method, "sql_execute");
+    assert_eq!(summaries[0].operation.as_deref(), Some("INSERT"));
+    assert!(!summaries[0].success);
+    assert_eq!(summaries[0].event_count, 1);
+    assert_eq!(summaries[0].total_cycles_delta, 20);
+    assert_eq!(summaries[0].last_created_at_ms, 4);
+    assert_eq!(summaries[1].method, "sql_execute");
+    assert_eq!(summaries[1].operation.as_deref(), Some("INSERT"));
+    assert!(summaries[1].success);
+    assert_eq!(summaries[1].event_count, 1);
+    assert_eq!(summaries[1].total_cycles_delta, 10);
+    assert_eq!(summaries[1].total_rows_returned, 3);
+    assert_eq!(summaries[1].total_rows_affected, 2);
+}
+
+#[test]
+fn data_plane_writes_refresh_size_without_charging_billing() {
+    let service = service();
+    service
+        .create_database("alpha", "owner", 1)
+        .expect("alpha should create");
+    let before = service
+        .database_billing("alpha", "owner")
+        .expect("billing should load");
+
+    service
+        .sql_execute_data_plane(
+            "owner",
+            sql_request(
+                "alpha",
+                "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)",
+            ),
+        )
+        .expect("data-plane table create should succeed");
+    service
+        .sql_execute_data_plane(
+            "owner",
+            SqlExecuteRequest {
+                database_id: "alpha".to_string(),
+                sql: "INSERT INTO notes (body) VALUES (?1)".to_string(),
+                params: vec![SqlValue::Text("from data plane".to_string())],
+                max_rows: None,
+            },
+        )
+        .expect("data-plane insert should succeed");
+
+    let after = service
+        .database_billing("alpha", "owner")
+        .expect("billing should reload");
+    let usage = service
+        .database_usage("alpha", "owner")
+        .expect("usage should load");
+    assert_eq!(after.balance_units, before.balance_units);
+    assert_eq!(after.spent_units, before.spent_units);
+    assert!(usage.logical_size_bytes > 0);
+}
+
+#[test]
+fn routed_write_completion_charges_and_syncs_logical_size() {
+    let service = service();
+    service
+        .create_database("alpha", "owner", 1)
+        .expect("alpha should create");
+    let auth = AuthenticatedDatabaseToken {
+        token_id: "tok_alpha_write".to_string(),
+        database_id: "alpha".to_string(),
+        scope: DatabaseTokenScope::Write,
+    };
+    let hash = sha256_bytes(b"remote write request");
+
+    let pending = service
+        .begin_routed_write_with_token(
+            &auth,
+            RoutedWriteBegin {
+                operation_id: "op_remote_insert",
+                database_canister_id: "aaaaa-aa",
+                method: "sql_execute_internal",
+                request_hash: hash.clone(),
+                billing_units: SQL_EXECUTE_BILLING_UNITS,
+                now: 2,
+            },
+        )
+        .expect("routed write should begin");
+    assert_eq!(pending.status, RoutedOperationStatus::Pending);
+
+    let completed = service
+        .complete_routed_write_with_token(
+            &auth,
+            "op_remote_insert",
+            SQL_EXECUTE_BILLING_UNITS,
+            12_345,
+            3,
+        )
+        .expect("routed write should complete");
+    assert_eq!(completed.status, RoutedOperationStatus::Applied);
+    let billing = service
+        .database_billing("alpha", "owner")
+        .expect("billing should load");
+    let usage = service
+        .database_usage("alpha", "owner")
+        .expect("usage should load");
+    assert_eq!(
+        billing.balance_units,
+        icpdb_runtime::DEFAULT_DATABASE_BALANCE_UNITS - SQL_EXECUTE_BILLING_UNITS
+    );
+    assert_eq!(billing.spent_units, SQL_EXECUTE_BILLING_UNITS);
+    assert_eq!(usage.logical_size_bytes, 12_345);
+
+    let replay = service
+        .begin_routed_write_with_token(
+            &auth,
+            RoutedWriteBegin {
+                operation_id: "op_remote_insert",
+                database_canister_id: "aaaaa-aa",
+                method: "sql_execute_internal",
+                request_hash: hash,
+                billing_units: SQL_EXECUTE_BILLING_UNITS,
+                now: 4,
+            },
+        )
+        .expect("routed write replay should load existing operation");
+    assert_eq!(replay.status, RoutedOperationStatus::Applied);
+}
+
+#[test]
+fn routed_write_reconcile_charges_unknown_data_plane_write() {
+    let service = service();
+    service
+        .create_database("alpha", "owner", 1)
+        .expect("alpha should create");
+    let auth = AuthenticatedDatabaseToken {
+        token_id: "tok_alpha_write".to_string(),
+        database_id: "alpha".to_string(),
+        scope: DatabaseTokenScope::Write,
+    };
+    let before = service
+        .database_billing("alpha", "owner")
+        .expect("billing should load");
+
+    service
+        .begin_routed_write_with_token(
+            &auth,
+            RoutedWriteBegin {
+                operation_id: "op_unknown_insert",
+                database_canister_id: "aaaaa-aa",
+                method: "sql_execute_internal",
+                request_hash: sha256_bytes(b"remote write request"),
+                billing_units: SQL_EXECUTE_BILLING_UNITS,
+                now: 2,
+            },
+        )
+        .expect("routed write should begin");
+    service
+        .update_routed_operation_status(
+            "op_unknown_insert",
+            RoutedOperationStatus::Unknown,
+            Some("post-write usage unavailable"),
+            3,
+        )
+        .expect("operation should become unknown");
+
+    let reconciled = service
+        .reconcile_routed_write_from_data_plane("op_unknown_insert", 44_444, 4)
+        .expect("unknown routed write should reconcile");
+    assert_eq!(reconciled.status, RoutedOperationStatus::Applied);
+    assert_eq!(reconciled.error, None);
+    let after = service
+        .database_billing("alpha", "owner")
+        .expect("billing should reload");
+    let usage = service
+        .database_usage("alpha", "owner")
+        .expect("usage should load");
+    assert_eq!(
+        after.balance_units,
+        before.balance_units - SQL_EXECUTE_BILLING_UNITS
+    );
+    assert_eq!(
+        after.spent_units,
+        before.spent_units + SQL_EXECUTE_BILLING_UNITS
+    );
+    assert_eq!(usage.logical_size_bytes, 44_444);
+
+    let rejected = service
+        .reconcile_routed_write_from_data_plane("op_unknown_insert", 44_444, 5)
+        .expect_err("applied operation should not reconcile twice");
+    assert!(rejected.contains("routed operation is not unknown"));
+}
+
+#[test]
+fn data_plane_operation_log_is_idempotent() {
+    let service = service();
+    service
+        .create_database("alpha", "owner", 1)
+        .expect("alpha should create");
+    let request_hash = sha256_bytes(b"data plane write");
+
+    let recorded = service
+        .record_data_plane_operation(
+            "op_data_plane_insert",
+            "alpha",
+            "sql_execute_internal",
+            request_hash.clone(),
+            2,
+        )
+        .expect("data-plane operation should record");
+    assert_eq!(recorded.operation_id, "op_data_plane_insert");
+    assert_eq!(recorded.database_id, "alpha");
+    assert_eq!(recorded.method, "sql_execute_internal");
+
+    let replay = service
+        .record_data_plane_operation(
+            "op_data_plane_insert",
+            "alpha",
+            "sql_execute_internal",
+            request_hash,
+            3,
+        )
+        .expect("same data-plane operation should replay");
+    assert_eq!(replay.created_at_ms, 2);
+
+    let mismatch = service
+        .record_data_plane_operation(
+            "op_data_plane_insert",
+            "alpha",
+            "sql_batch_internal",
+            sha256_bytes(b"other write"),
+            4,
+        )
+        .expect_err("mismatched data-plane replay should reject");
+    assert!(mismatch.contains("data-plane operation request mismatch"));
 }
 
 #[test]
@@ -650,11 +1196,52 @@ fn database_tokens_authorize_http_sql_by_scope_and_track_last_use() {
         .expect_err("read token should not write");
     assert_eq!(error, "api token scope does not allow this operation");
 
+    service
+        .create_database_token(
+            "owner",
+            CreateDatabaseTokenRequest {
+                database_id: "alpha".to_string(),
+                name: "web-owner".to_string(),
+                scope: DatabaseTokenScope::Owner,
+            },
+            hash_api_token("secret-owner"),
+            13,
+        )
+        .expect("owner token should create");
+    let owner_auth = service
+        .authenticate_database_token("secret-owner", icpdb_runtime::RequiredRole::Owner, 14)
+        .expect("owner token should authenticate");
+    let quota = service
+        .set_database_quota_with_token(
+            &owner_auth,
+            icpdb_types::DatabaseQuotaRequest {
+                database_id: "alpha".to_string(),
+                max_logical_size_bytes: 128 * 1024 * 1024,
+            },
+        )
+        .expect("owner token should set quota");
+    assert_eq!(quota.max_logical_size_bytes, 128 * 1024 * 1024);
+
     let tokens = service
-        .list_database_tokens("alpha", "owner")
-        .expect("tokens should list");
-    assert_eq!(tokens.len(), 1);
-    assert_eq!(tokens[0].last_used_at_ms, Some(11));
+        .list_database_tokens_with_token(&owner_auth, "alpha")
+        .expect("owner token should list tokens");
+    assert_eq!(tokens.len(), 2);
+    let read_token = tokens
+        .iter()
+        .find(|token| token.name == "web-read")
+        .expect("read token should list");
+    assert_eq!(read_token.last_used_at_ms, Some(11));
+    let read_token_id = read_token.token_id.clone();
+
+    let revoked = service
+        .revoke_database_token_with_token(&owner_auth, "alpha", &read_token_id, 15)
+        .expect("owner token should revoke token");
+    assert_eq!(revoked.token_id, read_token_id);
+    assert_eq!(revoked.revoked_at_ms, Some(15));
+    let error = service
+        .authenticate_database_token("secret-read", icpdb_runtime::RequiredRole::Reader, 16)
+        .expect_err("revoked token should not authenticate");
+    assert_eq!(error, "api token revoked");
 }
 
 #[test]
@@ -688,12 +1275,11 @@ fn billing_units_are_charged_and_exhaustion_suspends_database() {
     );
     assert_eq!(charged.spent_units, SQL_EXECUTE_BILLING_UNITS);
 
-    let conn = Connection::open(root.join("index.sqlite3")).expect("index should open");
-    conn.execute(
+    index_execute(
+        &root,
         "UPDATE databases SET billing_balance_units = 0 WHERE database_id = 'alpha'",
-        [],
-    )
-    .expect("test balance should update");
+        vec![],
+    );
     let error = service
         .sql_execute(
             "owner",
@@ -769,12 +1355,11 @@ fn approved_deposit_records_payment_and_reactivates_billing() {
     service
         .create_database("alpha", "owner", 1)
         .expect("database should create");
-    let conn = Connection::open(root.join("index.sqlite3")).expect("index should open");
-    conn.execute(
+    index_execute(
+        &root,
         "UPDATE databases SET billing_status = 'suspended' WHERE database_id = 'alpha'",
-        [],
-    )
-    .expect("test billing status should update");
+        vec![],
+    );
 
     let quote = service
         .deposit_quote(
@@ -897,10 +1482,13 @@ fn records_minimal_usage_events() {
     service
         .record_usage_event(UsageEvent {
             method: "sql_execute",
+            operation: Some("INSERT"),
             database_id: Some("alpha"),
             caller: "owner",
             success: true,
             cycles_delta: 12,
+            rows_returned: 4,
+            rows_affected: 5,
             error: None,
             now: 10,
         })
@@ -908,10 +1496,13 @@ fn records_minimal_usage_events() {
     service
         .record_usage_event(UsageEvent {
             method: "create_database",
+            operation: None,
             database_id: None,
             caller: "owner",
             success: false,
             cycles_delta: 34,
+            rows_returned: 0,
+            rows_affected: 0,
             error: Some("database already exists"),
             now: 11,
         })
@@ -923,10 +1514,13 @@ fn records_minimal_usage_events() {
         rows[0],
         (
             "sql_execute".to_string(),
+            Some("INSERT".to_string()),
             Some("alpha".to_string()),
             "owner".to_string(),
             1,
             12,
+            4,
+            5,
             None,
             10
         )
@@ -936,9 +1530,12 @@ fn records_minimal_usage_events() {
         (
             "create_database".to_string(),
             None,
+            None,
             "owner".to_string(),
             0,
             34,
+            0,
+            0,
             Some("database already exists".to_string()),
             11
         )
@@ -948,27 +1545,32 @@ fn records_minimal_usage_events() {
 #[test]
 fn usage_events_keep_recent_retention_window() {
     let (service, root) = service_with_root();
-    let mut conn = Connection::open(root.join("index.sqlite3")).expect("index should open");
-    let tx = conn.transaction().expect("transaction should start");
-
-    for index in 0..USAGE_EVENTS_RETENTION_LIMIT + 98 {
-        tx.execute(
-            "INSERT INTO usage_events
-             (method, database_id, caller, success, cycles_delta, error, created_at_ms)
-             VALUES ('sql_execute', 'alpha', 'owner', 1, 1, NULL, ?1)",
-            params![i64::try_from(index).expect("index should fit")],
-        )
-        .expect("usage event should insert");
-    }
-    tx.commit().expect("transaction should commit");
+    index_execute(
+        &root,
+        "WITH RECURSIVE usage_seed(created_at_ms) AS (
+           SELECT 0
+           UNION ALL
+           SELECT created_at_ms + 1 FROM usage_seed WHERE created_at_ms < ?1
+         )
+         INSERT INTO usage_events
+           (method, database_id, caller, success, cycles_delta, rows_returned, rows_affected, error, created_at_ms)
+         SELECT 'sql_execute', 'alpha', 'owner', 1, 1, 0, 0, NULL, created_at_ms
+         FROM usage_seed",
+        vec![SqlValue::Integer(
+            i64::try_from(USAGE_EVENTS_RETENTION_LIMIT + 97).expect("index should fit"),
+        )],
+    );
 
     service
         .record_usage_event(UsageEvent {
             method: "sql_execute",
+            operation: Some("INSERT"),
             database_id: Some("alpha"),
             caller: "owner",
             success: true,
             cycles_delta: 1,
+            rows_returned: 0,
+            rows_affected: 0,
             error: None,
             now: i64::try_from(USAGE_EVENTS_RETENTION_LIMIT + 98).expect("index should fit"),
         })
@@ -983,10 +1585,13 @@ fn usage_events_keep_recent_retention_window() {
     service
         .record_usage_event(UsageEvent {
             method: "sql_execute",
+            operation: Some("INSERT"),
             database_id: Some("alpha"),
             caller: "owner",
             success: true,
             cycles_delta: 1,
+            rows_returned: 0,
+            rows_affected: 0,
             error: None,
             now: i64::try_from(USAGE_EVENTS_RETENTION_LIMIT + 99).expect("index should fit"),
         })
@@ -1104,34 +1709,35 @@ fn rejects_invalid_database_ids() {
 #[test]
 fn rejects_database_creation_after_mount_capacity() {
     let (service, root) = service_with_root();
-    let conn = Connection::open(root.join("index.sqlite3")).expect("index should open");
-
-    for mount_id in 11..32767 {
-        conn.execute(
+    for mount_id in 11..254 {
+        index_execute(
+            &root,
             "INSERT INTO databases
              (database_id, db_file_name, mount_id, active_mount_id, status, schema_version,
               logical_size_bytes, created_at_ms, updated_at_ms)
              VALUES (?1, ?2, ?3, ?3, 'hot', 'sqlite:raw', 0, 1, 1)",
-            params![
-                format!("reserved_{mount_id}"),
-                format!("reserved_{mount_id}.sqlite3"),
-                i64::from(mount_id)
+            vec![
+                SqlValue::Text(format!("reserved_{mount_id}")),
+                SqlValue::Text(format!("reserved_{mount_id}.sqlite3")),
+                SqlValue::Integer(i64::from(mount_id)),
             ],
-        )
-        .expect("reserved mount_id should insert");
-        conn.execute(
+        );
+        index_execute(
+            &root,
             "INSERT INTO database_mount_history
              (database_id, mount_id, reason, created_at_ms)
              VALUES (?1, ?2, 'create', 1)",
-            params![format!("reserved_{mount_id}"), i64::from(mount_id)],
-        )
-        .expect("reserved mount history should insert");
+            vec![
+                SqlValue::Text(format!("reserved_{mount_id}")),
+                SqlValue::Integer(i64::from(mount_id)),
+            ],
+        );
     }
 
     let meta = service
-        .create_database("db_32767", "owner", 32767)
+        .create_database("db_254", "owner", 254)
         .expect("last mount_id should create");
-    assert_eq!(meta.mount_id, 32767);
+    assert_eq!(meta.mount_id, 254);
 
     let error = service
         .create_database("db_32768", "owner", 32768)
@@ -1186,6 +1792,62 @@ fn isolates_sql_tables_between_databases() {
 }
 
 #[test]
+fn reopens_database_content_from_same_mount_id_after_service_recreation() {
+    let (service, root) = service_with_root();
+    let meta = service
+        .create_database("alpha", "owner", 1)
+        .expect("alpha should create");
+    service
+        .sql_execute(
+            "owner",
+            sql_request(
+                "alpha",
+                "CREATE TABLE persisted_notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL)",
+            ),
+        )
+        .expect("table create should succeed");
+    service
+        .sql_execute(
+            "owner",
+            SqlExecuteRequest {
+                database_id: "alpha".to_string(),
+                sql: "INSERT INTO persisted_notes (body) VALUES (?1)".to_string(),
+                params: vec![SqlValue::Text("survives reopen".to_string())],
+                max_rows: None,
+            },
+        )
+        .expect("insert should succeed");
+    drop(service);
+
+    let reopened = index_service(&root);
+    reopened
+        .run_index_migrations()
+        .expect("index migrations should rerun");
+    reopened
+        .run_database_migrations("alpha")
+        .expect("database image should remount by mount_id");
+    let reopened_meta = reopened
+        .list_databases()
+        .expect("databases should list")
+        .into_iter()
+        .find(|candidate| candidate.database_id == "alpha")
+        .expect("alpha should remain indexed");
+    assert_eq!(reopened_meta.mount_id, meta.mount_id);
+    assert_eq!(reopened_meta.db_file_name, meta.db_file_name);
+
+    let response = reopened
+        .sql_query(
+            "owner",
+            sql_request("alpha", "SELECT body FROM persisted_notes ORDER BY id"),
+        )
+        .expect("persisted row should read after reopen");
+    assert_eq!(
+        response.rows,
+        vec![vec![SqlValue::Text("survives reopen".to_string())]]
+    );
+}
+
+#[test]
 fn tracks_logical_size_and_does_not_reuse_deleted_slots() {
     let (service, root) = service_with_root();
     let alpha = service
@@ -1233,43 +1895,19 @@ fn tracks_logical_size_and_does_not_reuse_deleted_slots() {
 }
 
 #[test]
-fn delete_database_allows_missing_file_but_rejects_other_remove_errors() {
+fn delete_database_marks_hot_database_deleted() {
     let (service, root) = service_with_root();
     service
-        .create_database("missing_file", "owner", 1)
+        .create_database("deleted_file", "owner", 1)
         .expect("database should create");
-    let missing_file = service
-        .list_databases()
-        .expect("databases should load")
-        .into_iter()
-        .find(|meta| meta.database_id == "missing_file")
-        .expect("database meta should exist")
-        .db_file_name;
-    std::fs::remove_file(&missing_file).expect("database file should delete");
     service
-        .delete_database("missing_file", "owner", 2)
-        .expect("missing file should not block delete");
-    assert_eq!(database_index_row(&root, "missing_file").0, "deleted");
-
-    service
-        .create_database("remove_error", "owner", 3)
-        .expect("database should create");
-    let conn = Connection::open(root.join("index.sqlite3")).expect("index should open");
-    conn.execute(
-        "UPDATE databases SET db_file_name = ?2 WHERE database_id = ?1",
-        params!["remove_error", root.to_string_lossy().as_ref()],
-    )
-    .expect("db file path should update");
-
-    let error = service
-        .delete_database("remove_error", "owner", 4)
-        .expect_err("non-NotFound remove error should fail");
-    assert!(!error.is_empty());
-    assert_eq!(database_index_row(&root, "remove_error").0, "hot");
+        .delete_database("deleted_file", "owner", 2)
+        .expect("delete should succeed");
+    assert_eq!(database_index_row(&root, "deleted_file").0, "deleted");
 }
 
 #[test]
-fn delete_database_accepts_archived_database_and_preserves_state_on_remove_error() {
+fn delete_database_accepts_archived_database() {
     let (service, root) = service_with_root();
     service
         .create_database("archived", "owner", 1)
@@ -1293,32 +1931,6 @@ fn delete_database_accepts_archived_database_and_preserves_state_on_remove_error
         .expect("archived database should delete");
 
     assert_eq!(database_index_row(&root, "archived").0, "deleted");
-
-    service
-        .create_database("remove_error_archived", "owner", 5)
-        .expect("database should create");
-    let archive = service
-        .begin_database_archive("remove_error_archived", "owner", 6)
-        .expect("archive should begin");
-    let bytes = read_archive_in_chunks(&service, "remove_error_archived", archive.size_bytes, 64);
-    service
-        .finalize_database_archive("remove_error_archived", "owner", sha256_bytes(&bytes), 7)
-        .expect("archive should finalize");
-    let conn = Connection::open(root.join("index.sqlite3")).expect("index should open");
-    conn.execute(
-        "UPDATE databases SET db_file_name = ?2 WHERE database_id = ?1",
-        params!["remove_error_archived", root.to_string_lossy().as_ref()],
-    )
-    .expect("db file path should update");
-
-    let error = service
-        .delete_database("remove_error_archived", "owner", 8)
-        .expect_err("non-NotFound remove error should fail");
-    assert!(!error.is_empty());
-    assert_eq!(
-        database_index_row(&root, "remove_error_archived").0,
-        "archived"
-    );
 }
 
 #[test]
@@ -1526,6 +2138,763 @@ fn restored_mount_id_is_not_reused_after_rearchive() {
     assert_eq!(
         mount_history_row(&root, restored.mount_id),
         ("alpha".to_string(), "restore".to_string())
+    );
+}
+
+#[test]
+fn shard_placement_tracks_archive_restore_and_delete() {
+    let (service, root) = service_with_root();
+    let meta = service
+        .create_database("alpha", "owner", 1)
+        .expect("alpha should create");
+    service
+        .sql_execute("owner", sql_request("alpha", "CREATE TABLE t (id INTEGER)"))
+        .expect("table create should succeed");
+    assert_eq!(
+        shard_placement_row(&root, "alpha"),
+        (
+            "local".to_string(),
+            Some(meta.mount_id),
+            "hot".to_string(),
+            None,
+            "sqlite:raw".to_string()
+        )
+    );
+
+    let archive = service
+        .begin_database_archive("alpha", "owner", 2)
+        .expect("archive should begin");
+    assert_eq!(
+        shard_placement_row(&root, "alpha"),
+        (
+            "local".to_string(),
+            Some(meta.mount_id),
+            "archiving".to_string(),
+            None,
+            "sqlite:raw".to_string()
+        )
+    );
+    let bytes = archive_bytes_for_chunk_size(&service, "alpha", archive.size_bytes, 17);
+    let snapshot_hash = sha256_bytes(&bytes);
+    service
+        .finalize_database_archive("alpha", "owner", snapshot_hash.clone(), 3)
+        .expect("archive should finalize");
+    assert_eq!(
+        shard_placement_row(&root, "alpha"),
+        (
+            "local".to_string(),
+            None,
+            "archived".to_string(),
+            None,
+            "sqlite:raw".to_string()
+        )
+    );
+
+    let restored = service
+        .begin_database_restore("alpha", "owner", snapshot_hash, archive.size_bytes, 4)
+        .expect("restore should begin");
+    assert_eq!(
+        shard_placement_row(&root, "alpha"),
+        (
+            "local".to_string(),
+            Some(restored.mount_id),
+            "restoring".to_string(),
+            None,
+            "sqlite:raw".to_string()
+        )
+    );
+    service
+        .write_database_restore_chunk("alpha", "owner", 0, &bytes)
+        .expect("restore chunk should write");
+    service
+        .finalize_database_restore("alpha", "owner", 5)
+        .expect("restore should finalize");
+    assert_eq!(
+        shard_placement_row(&root, "alpha"),
+        (
+            "local".to_string(),
+            Some(restored.mount_id),
+            "hot".to_string(),
+            None,
+            "sqlite:raw".to_string()
+        )
+    );
+
+    service
+        .delete_database("alpha", "owner", 6)
+        .expect("delete should succeed");
+    assert_eq!(
+        shard_placement_row(&root, "alpha"),
+        (
+            "local".to_string(),
+            None,
+            "deleted".to_string(),
+            None,
+            "sqlite:raw".to_string()
+        )
+    );
+}
+
+#[test]
+fn shard_placements_are_visible_to_database_members() {
+    let (service, _root) = service_with_root();
+    service
+        .create_database("alpha", "owner", 1)
+        .expect("alpha should create");
+    service
+        .create_database("beta", "other", 2)
+        .expect("beta should create");
+    service
+        .grant_database_access("alpha", "owner", "writer", DatabaseRole::Writer, 3)
+        .expect("writer grant should succeed");
+
+    let owner_placements = service
+        .list_database_shard_placements_for_caller("owner")
+        .expect("owner placements should load");
+    let writer_placements = service
+        .list_database_shard_placements_for_caller("writer")
+        .expect("writer placements should load");
+    let all_placements = service
+        .list_all_database_shard_placements()
+        .expect("all placements should load");
+
+    assert_eq!(owner_placements.len(), 1);
+    assert_eq!(owner_placements[0].database_id, "alpha");
+    assert_eq!(owner_placements[0].shard_id, "local");
+    assert_eq!(owner_placements[0].mount_id, Some(11));
+    assert_eq!(owner_placements[0].canister_id, None);
+    assert_eq!(writer_placements.len(), 1);
+    assert_eq!(writer_placements[0].database_id, "alpha");
+    assert_eq!(all_placements.len(), 2);
+    assert_eq!(all_placements[0].database_id, "alpha");
+    assert_eq!(all_placements[1].database_id, "beta");
+}
+
+#[test]
+fn hot_database_route_resolves_local_remote_and_enforces_access() {
+    let (service, root) = service_with_root();
+    service
+        .create_database("alpha", "owner", 1)
+        .expect("alpha should create");
+    service
+        .grant_database_access("alpha", "owner", "reader", DatabaseRole::Reader, 2)
+        .expect("reader grant should succeed");
+
+    let local = service
+        .hot_database_route("alpha", "reader", RequiredRole::Reader)
+        .expect("reader should resolve local route");
+    assert_eq!(local.database_id, "alpha");
+    assert_eq!(local.shard_id, "local");
+    assert_eq!(local.canister_id, None);
+    assert_eq!(local.mount_id, Some(11));
+
+    let denied = service
+        .hot_database_route("alpha", "stranger", RequiredRole::Reader)
+        .expect_err("non-member should not resolve route");
+    assert_eq!(denied, "principal has no access to database: alpha");
+
+    index_execute(
+        &root,
+        "UPDATE database_shard_placements
+         SET shard_id = 'database-0',
+             canister_id = 'aaaaa-aa',
+             mount_id = NULL,
+             updated_at_ms = 3
+         WHERE database_id = ?1",
+        vec![SqlValue::Text("alpha".to_string())],
+    );
+
+    let remote = service
+        .hot_database_route("alpha", "owner", RequiredRole::Owner)
+        .expect("owner should resolve remote route");
+    assert_eq!(remote.shard_id, "database-0");
+    assert_eq!(remote.canister_id, Some("aaaaa-aa".to_string()));
+    assert_eq!(remote.mount_id, None);
+
+    let auth = AuthenticatedDatabaseToken {
+        token_id: "tok_alpha_read".to_string(),
+        database_id: "alpha".to_string(),
+        scope: DatabaseTokenScope::Read,
+    };
+    let token_route = service
+        .hot_database_route_with_token(&auth, "alpha", RequiredRole::Reader)
+        .expect("read token should resolve read route");
+    assert_eq!(token_route.canister_id, Some("aaaaa-aa".to_string()));
+
+    let write_error = service
+        .hot_database_route_with_token(&auth, "alpha", RequiredRole::Writer)
+        .expect_err("read token should not resolve write route");
+    assert_eq!(write_error, "api token scope does not allow this operation");
+
+    index_execute(
+        &root,
+        "UPDATE databases SET status = 'archived' WHERE database_id = ?1",
+        vec![SqlValue::Text("alpha".to_string())],
+    );
+    index_execute(
+        &root,
+        "UPDATE database_shard_placements SET status = 'archived' WHERE database_id = ?1",
+        vec![SqlValue::Text("alpha".to_string())],
+    );
+
+    let archived = service
+        .hot_database_route("alpha", "owner", RequiredRole::Reader)
+        .expect_err("archived database should not resolve hot route");
+    assert_eq!(archived, "database is archived: alpha");
+}
+
+#[test]
+fn register_remote_database_records_owner_and_remote_placement() {
+    let service = service();
+    let info = service
+        .register_remote_database(
+            CreateRemoteDatabaseRequest {
+                database_id: "remote_alpha".to_string(),
+                database_canister_id: "aaaaa-aa".to_string(),
+            },
+            "owner",
+            1,
+        )
+        .expect("remote database should register");
+
+    assert_eq!(info.database_id, "remote_alpha");
+    assert_eq!(info.mount_id, None);
+    let route = service
+        .hot_database_route("remote_alpha", "owner", RequiredRole::Owner)
+        .expect("remote route should resolve");
+    assert_eq!(route.canister_id, Some("aaaaa-aa".to_string()));
+    assert_eq!(route.mount_id, None);
+    assert_eq!(route.shard_id, "database:aaaaa-aa");
+}
+
+#[test]
+fn registered_database_shards_drive_remote_create_plan_capacity() {
+    let service = service();
+    let shard = service
+        .register_database_shard(
+            RegisterDatabaseShardRequest {
+                database_canister_id: "aaaaa-aa".to_string(),
+                max_databases: 1,
+            },
+            1,
+        )
+        .expect("database shard should register");
+    assert_eq!(shard.shard_id, "database:aaaaa-aa");
+    assert_eq!(shard.assigned_databases, 0);
+
+    let plan = service
+        .remote_database_create_plan("owner", 2)
+        .expect("remote plan should load")
+        .expect("registered shard should be selected");
+    assert_eq!(plan.database_canister_id, "aaaaa-aa");
+
+    service
+        .register_remote_database(
+            CreateRemoteDatabaseRequest {
+                database_id: plan.database_id,
+                database_canister_id: plan.database_canister_id,
+            },
+            "owner",
+            3,
+        )
+        .expect("planned remote database should register");
+    let shards = service
+        .list_database_shards()
+        .expect("database shards should load");
+    assert_eq!(shards.len(), 1);
+    assert_eq!(shards[0].assigned_databases, 1);
+    assert!(
+        service
+            .remote_database_create_plan("owner", 4)
+            .expect("remote plan should load")
+            .is_none(),
+        "full shard should not be selected"
+    );
+}
+
+#[test]
+fn local_database_migration_switches_catalog_to_remote_shard() {
+    let (service, root) = service_with_root();
+    service
+        .create_database("alpha", "owner", 1)
+        .expect("local database should create");
+    service
+        .sql_execute(
+            "owner",
+            sql_request("alpha", "CREATE TABLE notes (body TEXT)"),
+        )
+        .expect("local schema should write");
+    service
+        .register_database_shard(
+            RegisterDatabaseShardRequest {
+                database_canister_id: "aaaaa-aa".to_string(),
+                max_databases: 2,
+            },
+            2,
+        )
+        .expect("target shard should register");
+
+    let request = MigrateDatabaseToShardRequest {
+        database_id: "alpha".to_string(),
+        database_canister_id: "aaaaa-aa".to_string(),
+    };
+    let archive = service
+        .begin_local_database_migration(&request, 3)
+        .expect("local migration should begin");
+    assert!(archive.size_bytes > 0);
+    assert_eq!(database_index_row(&root, "alpha").0, "archiving");
+
+    let (placement, old_meta) = service
+        .complete_local_database_migration(&request, archive.size_bytes, 4)
+        .expect("local migration should complete");
+
+    assert_eq!(old_meta.database_id, "alpha");
+    assert_eq!(placement.database_id, "alpha");
+    assert_eq!(placement.shard_id, "database:aaaaa-aa");
+    assert_eq!(placement.canister_id, Some("aaaaa-aa".to_string()));
+    assert_eq!(placement.mount_id, None);
+    assert_eq!(placement.status, DatabaseStatus::Hot);
+    let route = service
+        .hot_database_route("alpha", "owner", RequiredRole::Owner)
+        .expect("owner route should remain available");
+    assert_eq!(route.canister_id, Some("aaaaa-aa".to_string()));
+    assert_eq!(database_index_row(&root, "alpha").0, "hot");
+}
+
+#[test]
+fn remote_archive_restore_status_markers_preserve_remote_placement() {
+    let service = service();
+    service
+        .register_remote_database(
+            CreateRemoteDatabaseRequest {
+                database_id: "remote_alpha".to_string(),
+                database_canister_id: "aaaaa-aa".to_string(),
+            },
+            "owner",
+            1,
+        )
+        .expect("remote database should register");
+    let auth = AuthenticatedDatabaseToken {
+        token_id: "tok_remote_owner".to_string(),
+        database_id: "remote_alpha".to_string(),
+        scope: DatabaseTokenScope::Owner,
+    };
+    let snapshot_hash = vec![7_u8; 32];
+
+    service
+        .mark_remote_database_archiving_with_token(&auth, "remote_alpha", 2)
+        .expect("remote database should mark archiving");
+    let archiving = service
+        .database_route_with_token(
+            &auth,
+            "remote_alpha",
+            RequiredRole::Owner,
+            &[DatabaseStatus::Archiving],
+        )
+        .expect("archiving remote route should resolve");
+    assert_eq!(archiving.canister_id, Some("aaaaa-aa".to_string()));
+    assert_eq!(archiving.mount_id, None);
+
+    service
+        .mark_remote_database_hot_with_token(&auth, "remote_alpha", 99, 3)
+        .expect("remote cancel should return database to hot");
+    let hot_usage = service
+        .database_usage_with_token(&auth, "remote_alpha")
+        .expect("hot usage should load");
+    assert_eq!(hot_usage.status, DatabaseStatus::Hot);
+    assert_eq!(hot_usage.logical_size_bytes, 99);
+
+    service
+        .mark_remote_database_archiving_with_token(&auth, "remote_alpha", 4)
+        .expect("remote database should mark archiving again");
+    service
+        .mark_remote_database_archived_with_token(&auth, "remote_alpha", snapshot_hash.clone(), 5)
+        .expect("remote database should mark archived");
+    let archived = service
+        .database_route_with_token(
+            &auth,
+            "remote_alpha",
+            RequiredRole::Owner,
+            &[DatabaseStatus::Archived],
+        )
+        .expect("archived remote route should resolve");
+    assert_eq!(archived.canister_id, Some("aaaaa-aa".to_string()));
+
+    service
+        .mark_remote_database_restoring_with_token(&auth, "remote_alpha", snapshot_hash, 4096, 6)
+        .expect("remote database should mark restoring");
+    service
+        .mark_remote_database_hot_with_token(&auth, "remote_alpha", 2048, 7)
+        .expect("remote restore should return database to hot");
+    let hot = service
+        .hot_database_route_with_token(&auth, "remote_alpha", RequiredRole::Owner)
+        .expect("hot remote route should resolve after restore");
+    assert_eq!(hot.canister_id, Some("aaaaa-aa".to_string()));
+    let usage = service
+        .database_usage_with_token(&auth, "remote_alpha")
+        .expect("usage should load");
+    assert_eq!(usage.status, DatabaseStatus::Hot);
+    assert_eq!(usage.logical_size_bytes, 2048);
+}
+
+#[test]
+fn remote_delete_marker_preserves_remote_placement_and_frees_capacity() {
+    let service = service();
+    service
+        .register_database_shard(
+            RegisterDatabaseShardRequest {
+                database_canister_id: "aaaaa-aa".to_string(),
+                max_databases: 1,
+            },
+            1,
+        )
+        .expect("database shard should register");
+    service
+        .register_remote_database(
+            CreateRemoteDatabaseRequest {
+                database_id: "remote_delete".to_string(),
+                database_canister_id: "aaaaa-aa".to_string(),
+            },
+            "owner",
+            2,
+        )
+        .expect("remote database should register");
+    let auth = AuthenticatedDatabaseToken {
+        token_id: "tok_remote_owner".to_string(),
+        database_id: "remote_delete".to_string(),
+        scope: DatabaseTokenScope::Owner,
+    };
+
+    service
+        .mark_remote_database_deleted_with_token(&auth, "remote_delete", 3)
+        .expect("remote database should mark deleted");
+
+    let usage = service
+        .database_usage_with_token(&auth, "remote_delete")
+        .expect("deleted usage should load");
+    assert_eq!(usage.status, DatabaseStatus::Deleted);
+    assert_eq!(usage.logical_size_bytes, 0);
+    let placement = service
+        .database_shard_placement_with_token(&auth, "remote_delete")
+        .expect("deleted placement should load");
+    assert_eq!(placement.status, DatabaseStatus::Deleted);
+    assert_eq!(placement.canister_id, Some("aaaaa-aa".to_string()));
+    let shards = service
+        .list_database_shards()
+        .expect("database shards should load");
+    assert_eq!(shards[0].assigned_databases, 0);
+}
+
+#[test]
+fn database_billing_with_token_requires_owner_scope() {
+    let service = service();
+    service
+        .create_database("billing_scope", "owner", 1)
+        .expect("database should create");
+    let read_auth = AuthenticatedDatabaseToken {
+        token_id: "tok_read".to_string(),
+        database_id: "billing_scope".to_string(),
+        scope: DatabaseTokenScope::Read,
+    };
+    let write_auth = AuthenticatedDatabaseToken {
+        token_id: "tok_write".to_string(),
+        database_id: "billing_scope".to_string(),
+        scope: DatabaseTokenScope::Write,
+    };
+    let owner_auth = AuthenticatedDatabaseToken {
+        token_id: "tok_owner".to_string(),
+        database_id: "billing_scope".to_string(),
+        scope: DatabaseTokenScope::Owner,
+    };
+
+    assert!(
+        service
+            .database_billing_with_token(&read_auth, "billing_scope")
+            .expect_err("read token should reject billing")
+            .contains("api token scope does not allow this operation")
+    );
+    assert!(
+        service
+            .database_billing_with_token(&write_auth, "billing_scope")
+            .expect_err("write token should reject billing")
+            .contains("api token scope does not allow this operation")
+    );
+    let billing = service
+        .database_billing_with_token(&owner_auth, "billing_scope")
+        .expect("owner token should read billing");
+    assert_eq!(billing.database_id, "billing_scope");
+}
+
+#[test]
+fn remote_database_membership_mutation_uses_controller_metadata() {
+    let service = service();
+    service
+        .register_remote_database(
+            CreateRemoteDatabaseRequest {
+                database_id: "remote_members".to_string(),
+                database_canister_id: "aaaaa-aa".to_string(),
+            },
+            "owner",
+            1,
+        )
+        .expect("remote database should register");
+
+    service
+        .grant_database_access("remote_members", "owner", "reader", DatabaseRole::Reader, 2)
+        .expect("owner should grant remote database access");
+    let members = service
+        .list_database_members("remote_members", "owner")
+        .expect("owner should list remote database members");
+    assert!(
+        members
+            .iter()
+            .any(|member| member.principal == "reader" && member.role == DatabaseRole::Reader)
+    );
+
+    service
+        .revoke_database_access("remote_members", "owner", "reader")
+        .expect("owner should revoke remote database access");
+    let members = service
+        .list_database_members("remote_members", "owner")
+        .expect("owner should list remote database members after revoke");
+    assert!(!members.iter().any(|member| member.principal == "reader"));
+}
+
+#[test]
+fn routed_operation_log_is_idempotent_and_tracks_status() {
+    let service = service();
+    service
+        .create_database("alpha", "owner", 1)
+        .expect("alpha should create");
+    let request_hash = sha256_bytes(b"sql_execute_internal alpha create table");
+
+    let pending = service
+        .begin_routed_operation(
+            "op_alpha_create",
+            "alpha",
+            "aaaaa-aa",
+            "sql_execute_internal",
+            request_hash.clone(),
+            2,
+        )
+        .expect("routed operation should begin");
+    assert_eq!(pending.status, RoutedOperationStatus::Pending);
+    assert_eq!(pending.database_id, "alpha");
+    assert_eq!(pending.database_canister_id, "aaaaa-aa");
+    assert_eq!(pending.request_hash, request_hash);
+
+    let replay = service
+        .begin_routed_operation(
+            "op_alpha_create",
+            "alpha",
+            "aaaaa-aa",
+            "sql_execute_internal",
+            pending.request_hash.clone(),
+            3,
+        )
+        .expect("same routed operation should replay");
+    assert_eq!(replay.created_at_ms, 2);
+    assert_eq!(replay.updated_at_ms, 2);
+
+    let mismatch = service
+        .begin_routed_operation(
+            "op_alpha_create",
+            "alpha",
+            "aaaaa-aa",
+            "sql_execute_internal",
+            sha256_bytes(b"different request"),
+            4,
+        )
+        .expect_err("different request should be rejected");
+    assert!(mismatch.contains("routed operation request mismatch"));
+
+    let applied = service
+        .update_routed_operation_status("op_alpha_create", RoutedOperationStatus::Applied, None, 5)
+        .expect("routed operation should mark applied");
+    assert_eq!(applied.status, RoutedOperationStatus::Applied);
+    assert_eq!(applied.updated_at_ms, 5);
+    assert_eq!(
+        service
+            .routed_operation("op_alpha_create")
+            .expect("routed operation should load")
+            .expect("routed operation should exist")
+            .status,
+        RoutedOperationStatus::Applied
+    );
+    assert_eq!(
+        service
+            .routed_operation_for_caller(
+                RoutedOperationRequest {
+                    database_id: "alpha".to_string(),
+                    operation_id: "op_alpha_create".to_string()
+                },
+                "owner"
+            )
+            .expect("owner should inspect routed operation")
+            .status,
+        RoutedOperationStatus::Applied
+    );
+    let read_auth = AuthenticatedDatabaseToken {
+        token_id: "tok_read".to_string(),
+        database_id: "alpha".to_string(),
+        scope: DatabaseTokenScope::Read,
+    };
+    assert_eq!(
+        service
+            .routed_operation_with_token(
+                &read_auth,
+                RoutedOperationRequest {
+                    database_id: "alpha".to_string(),
+                    operation_id: "op_alpha_create".to_string()
+                }
+            )
+            .expect("read token should inspect routed operation")
+            .method,
+        "sql_execute_internal"
+    );
+    let wrong_database = service
+        .routed_operation_for_caller(
+            RoutedOperationRequest {
+                database_id: "beta".to_string(),
+                operation_id: "op_alpha_create".to_string(),
+            },
+            "owner",
+        )
+        .expect_err("operation should not leak across database ids");
+    assert!(wrong_database.contains("principal has no access to database: beta"));
+}
+
+#[test]
+fn shard_operation_log_tracks_unknown_outcomes() {
+    let service = service();
+    let request_hash = sha256_bytes(b"create shard policy");
+
+    let pending = service
+        .begin_shard_operation(
+            "op_shard_create",
+            "create_shard",
+            Some("database:aaaaa-aa"),
+            request_hash.clone(),
+            2,
+        )
+        .expect("shard operation should begin");
+    assert_eq!(pending.status, RoutedOperationStatus::Pending);
+    assert_eq!(pending.operation_kind, "create_shard");
+    assert_eq!(pending.target.as_deref(), Some("database:aaaaa-aa"));
+
+    let replay = service
+        .begin_shard_operation(
+            "op_shard_create",
+            "create_shard",
+            Some("database:aaaaa-aa"),
+            request_hash.clone(),
+            3,
+        )
+        .expect("same shard operation should replay");
+    assert_eq!(replay.created_at_ms, 2);
+
+    let mismatch = service
+        .begin_shard_operation(
+            "op_shard_create",
+            "top_up_shard",
+            Some("database:aaaaa-aa"),
+            request_hash,
+            4,
+        )
+        .expect_err("different shard operation should be rejected");
+    assert!(mismatch.contains("shard operation request mismatch"));
+
+    let unknown = service
+        .update_shard_operation_status(
+            "op_shard_create",
+            RoutedOperationStatus::Unknown,
+            Some("bounded wait timed out"),
+            5,
+        )
+        .expect("shard operation should mark unknown");
+    assert_eq!(unknown.status, RoutedOperationStatus::Unknown);
+    assert_eq!(unknown.error.as_deref(), Some("bounded wait timed out"));
+
+    let operations = service
+        .list_shard_operations()
+        .expect("shard operations should list");
+    assert_eq!(operations.len(), 1);
+    assert_eq!(operations[0].operation_id, "op_shard_create");
+
+    let rejected_status = service
+        .reconcile_shard_operation("op_shard_create", RoutedOperationStatus::Pending, None, 6)
+        .expect_err("pending should not be a reconcile target");
+    assert!(rejected_status.contains("must be applied or failed"));
+
+    let rejected_error = service
+        .reconcile_shard_operation("op_shard_create", RoutedOperationStatus::Failed, None, 7)
+        .expect_err("failed reconcile should require an error");
+    assert!(rejected_error.contains("requires an error"));
+
+    let failed = service
+        .reconcile_shard_operation(
+            "op_shard_create",
+            RoutedOperationStatus::Failed,
+            Some("operator verified remote failure"),
+            8,
+        )
+        .expect("unknown operation should reconcile to failed");
+    assert_eq!(failed.status, RoutedOperationStatus::Failed);
+    assert_eq!(
+        failed.error.as_deref(),
+        Some("operator verified remote failure")
+    );
+
+    let already_resolved = service
+        .reconcile_shard_operation("op_shard_create", RoutedOperationStatus::Applied, None, 9)
+        .expect_err("resolved operation should not reconcile again");
+    assert!(already_resolved.contains("shard operation is not unknown"));
+}
+
+#[test]
+fn shard_placement_migration_backfills_existing_databases() {
+    let (service, root) = service_with_root();
+    service
+        .create_database("alpha", "owner", 1)
+        .expect("alpha should create");
+    service
+        .create_database("beta", "owner", 2)
+        .expect("beta should create");
+    service
+        .delete_database("beta", "owner", 3)
+        .expect("beta should delete");
+
+    index_execute(&root, "DROP TABLE database_shard_placements", Vec::new());
+    index_execute(
+        &root,
+        "DELETE FROM schema_migrations WHERE version = ?1",
+        vec![SqlValue::Text(
+            "database_index:014_shard_placements".to_string(),
+        )],
+    );
+    service
+        .run_index_migrations()
+        .expect("shard placement migration should backfill");
+
+    assert_eq!(
+        shard_placement_row(&root, "alpha"),
+        (
+            "local".to_string(),
+            Some(11),
+            "hot".to_string(),
+            None,
+            "sqlite:raw".to_string()
+        )
+    );
+    assert_eq!(
+        shard_placement_row(&root, "beta"),
+        (
+            "local".to_string(),
+            None,
+            "deleted".to_string(),
+            None,
+            "sqlite:raw".to_string()
+        )
     );
 }
 
@@ -1948,9 +3317,39 @@ fn enforces_reader_writer_owner_roles() {
         .expect("owner should list members");
     assert_eq!(members.len(), 3);
 
+    let archive = service
+        .begin_database_archive("shared", "owner", 15)
+        .expect("archive should begin");
+    let bytes = read_archive_in_chunks(&service, "shared", archive.size_bytes, 64);
+    service
+        .finalize_database_archive("shared", "owner", sha256_bytes(&bytes), 16)
+        .expect("archive should finalize");
+    let archived_members = service
+        .list_database_members("shared", "owner")
+        .expect("owner should list archived database members");
+    assert_eq!(archived_members.len(), 3);
+
     service
         .revoke_database_access("shared", "owner", "reader")
-        .expect("owner should revoke reader");
+        .expect_err("archived database should reject membership mutation");
+    service
+        .begin_database_restore(
+            "shared",
+            "owner",
+            sha256_bytes(&bytes),
+            archive.size_bytes,
+            17,
+        )
+        .expect("restore should begin");
+    service
+        .write_database_restore_chunk("shared", "owner", 0, &bytes)
+        .expect("restore chunk should write");
+    service
+        .finalize_database_restore("shared", "owner", 18)
+        .expect("restore should finalize");
+    service
+        .revoke_database_access("shared", "owner", "reader")
+        .expect("owner should revoke reader after restore");
     assert!(
         service
             .sql_query("reader", sql_request("shared", "SELECT 1"))

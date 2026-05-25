@@ -9,8 +9,6 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 candid = "0.10.26"
 ic-cdk = "0.20.0"
-ic-stable-structures = "0.7.2"
-ic-wasi-polyfill = "0.13.0"
 icrc-ledger-types = "0.1.13"
 serde_json = "1.0.145"
 serde = { version = "1.0.228", features = ["derive"] }
@@ -20,3 +18,9 @@ icpdb-types = { path = "../icpdb_types" }
 
 [dev-dependencies]
 tempfile = "3.23.0"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+ic-sqlite-vfs = { version = "=0.2.2", default-features = false, features = ["sqlite-precompiled", "bench-profile"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+ic-sqlite-vfs = { version = "=0.2.2", default-features = false, features = ["sqlite-bundled", "bench-profile"] }
