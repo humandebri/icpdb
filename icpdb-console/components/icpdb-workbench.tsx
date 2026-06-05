@@ -7,9 +7,10 @@ import { DatabaseNavigator, WorkbenchToolbar } from "@/components/icpdb-navigati
 import { ResponseSidebar } from "@/components/icpdb-response-sidebar";
 import { SqlEditorPanel } from "@/components/icpdb-sql-editor-panel";
 import { TableEditorPanel } from "@/components/icpdb-table-editor-panel";
+import type { ConsoleConnection } from "@/lib/console-connection";
 import { useIcpdbWorkbenchController } from "@/lib/use-icpdb-workbench-controller";
 
-export function IcpdbWorkbench() {
+export function IcpdbWorkbench({ connection }: { connection: ConsoleConnection }) {
   const {
     error,
     navigatorProps,
@@ -18,7 +19,7 @@ export function IcpdbWorkbench() {
     tableEditorProps,
     toolbarProps,
     view
-  } = useIcpdbWorkbenchController();
+  } = useIcpdbWorkbenchController(connection);
 
   return (
     <div className="grid gap-4 lg:grid-cols-[16rem_minmax(0,1fr)_18rem]">

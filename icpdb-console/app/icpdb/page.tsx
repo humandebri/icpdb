@@ -3,13 +3,20 @@
 
 import type { Metadata } from "next";
 import { IcpdbWorkbench } from "@/components/icpdb-workbench";
+import { consoleConnectionFromSearchParams, type ConsoleSearchParams } from "@/lib/console-connection";
 
 export const metadata: Metadata = {
   title: "ICPDB Console",
   description: "SQLite Admin Protocol console for Internet Computer canisters"
 };
 
-export default function IcpdbConsolePage() {
+type IcpdbConsolePageProps = {
+  searchParams?: Promise<ConsoleSearchParams>;
+};
+
+export default async function IcpdbConsolePage({ searchParams }: IcpdbConsolePageProps) {
+  const resolvedSearchParams = searchParams ? await searchParams : {};
+  const connection = consoleConnectionFromSearchParams(resolvedSearchParams, process.env.NEXT_PUBLIC_ICPDB_CANISTER_ID ?? "");
   return (
     <main className="min-h-screen bg-[#f7f8fb] text-[#182230]">
       <section className="border-b border-[#d5d9e2] bg-white">
@@ -24,7 +31,7 @@ export default function IcpdbConsolePage() {
 
       <section className="mx-auto max-w-7xl px-5 py-5">
         <Panel title="SQL Workbench">
-          <IcpdbWorkbench />
+          <IcpdbWorkbench connection={connection} />
         </Panel>
       </section>
     </main>

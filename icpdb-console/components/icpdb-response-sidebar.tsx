@@ -55,6 +55,7 @@ export type ResponseSidebarProps = {
   routedOperation: RoutedOperationInfo | null;
   selectedDatabase: DatabaseSummary | null;
   selectedTable: DatabaseTable | null;
+  showHostedPanels: boolean;
   shardJournalStatus: string;
   shardOperations: ShardOperationInfo[];
   shardPlacements: DatabaseShardPlacement[];
@@ -106,75 +107,79 @@ export function ResponseSidebar(props: ResponseSidebarProps) {
         tokens={props.tokens}
         usage={props.usage}
       />
-      <RoutedOperationPanel
-        canLoad={props.canLoadRoutedOperation}
-        operation={props.routedOperation}
-        operationId={props.operationId}
-        status={props.operationStatus}
-        onLoadOperation={props.onLoadRoutedOperation}
-        onOperationIdChange={props.onOperationIdChange}
-      />
-      <UsageEventSummaryPanel events={props.usageEvents} />
-      <ShardPlacementPanel
-        placements={props.shardPlacements}
-        status={props.shardPlacementStatus}
-        onRefreshAll={props.onRefreshAllShardPlacements}
-      />
-      <ShardOperationJournalPanel
-        failureReason={props.shardReconcileError}
-        operations={props.shardOperations}
-        status={props.shardJournalStatus}
-        onFailureReasonChange={props.onShardReconcileErrorChange}
-        onReconcile={props.onReconcileShardOperation}
-        onRefresh={props.onRefreshShardOperations}
-      />
-      <ResponseAccessPanel
-        canDeleteDatabase={props.canDeleteDatabase}
-        canGrantMember={props.canGrantMember}
-        canManageDatabase={props.canManageDatabase}
-        canMutateMembers={props.canMutateMembers}
-        canSetQuota={props.canSetQuota}
-        memberPrincipal={props.memberPrincipal}
-        memberRole={props.memberRole}
-        members={props.members}
-        principal={props.principal}
-        quotaBytes={props.quotaBytes}
-        tokenName={props.tokenName}
-        tokenScope={props.tokenScope}
-        tokens={props.tokens}
-        onCreateToken={props.onCreateToken}
-        onDeleteDatabase={props.onDeleteDatabase}
-        onGrantMember={props.onGrantMember}
-        onMemberPrincipalChange={props.onMemberPrincipalChange}
-        onMemberRoleChange={props.onMemberRoleChange}
-        onQuotaBytesChange={props.onQuotaBytesChange}
-        onRevokeMember={props.onRevokeMember}
-        onRevokeToken={props.onRevokeToken}
-        onSetQuota={props.onSetQuota}
-        onTokenNameChange={props.onTokenNameChange}
-        onTokenScopeChange={props.onTokenScopeChange}
-      />
-      <ResponseLifecyclePanel
-        archiveSnapshot={props.archiveSnapshot}
-        archiveSnapshotName={props.archiveSnapshotName}
-        archiveStatus={props.archiveStatus}
-        canArchive={props.canArchive}
-        canCancelArchive={props.canCancelArchive}
-        canDownloadArchive={props.canDownloadArchive}
-        canDownloadSqlDump={props.canDownloadSqlDump}
-        canLoadSqlDump={props.canLoadSqlDump}
-        canRestore={props.canRestore}
-        canRun={props.canRun}
-        selectedDatabaseStatus={props.selectedDatabase?.status ?? null}
-        sqlDumpStatus={props.sqlDumpStatus}
-        onArchiveDatabase={props.onArchiveDatabase}
-        onCancelArchive={props.onCancelArchive}
-        onDownloadArchiveSnapshot={props.onDownloadArchiveSnapshot}
-        onDownloadSqlDump={props.onDownloadSqlDump}
-        onLoadArchiveFile={props.onLoadArchiveFile}
-        onLoadSqlDumpFile={props.onLoadSqlDumpFile}
-        onRestoreArchive={props.onRestoreArchive}
-      />
+      {props.showHostedPanels ? (
+        <>
+          <RoutedOperationPanel
+            canLoad={props.canLoadRoutedOperation}
+            operation={props.routedOperation}
+            operationId={props.operationId}
+            status={props.operationStatus}
+            onLoadOperation={props.onLoadRoutedOperation}
+            onOperationIdChange={props.onOperationIdChange}
+          />
+          <UsageEventSummaryPanel events={props.usageEvents} />
+          <ShardPlacementPanel
+            placements={props.shardPlacements}
+            status={props.shardPlacementStatus}
+            onRefreshAll={props.onRefreshAllShardPlacements}
+          />
+          <ShardOperationJournalPanel
+            failureReason={props.shardReconcileError}
+            operations={props.shardOperations}
+            status={props.shardJournalStatus}
+            onFailureReasonChange={props.onShardReconcileErrorChange}
+            onReconcile={props.onReconcileShardOperation}
+            onRefresh={props.onRefreshShardOperations}
+          />
+          <ResponseAccessPanel
+            canDeleteDatabase={props.canDeleteDatabase}
+            canGrantMember={props.canGrantMember}
+            canManageDatabase={props.canManageDatabase}
+            canMutateMembers={props.canMutateMembers}
+            canSetQuota={props.canSetQuota}
+            memberPrincipal={props.memberPrincipal}
+            memberRole={props.memberRole}
+            members={props.members}
+            principal={props.principal}
+            quotaBytes={props.quotaBytes}
+            tokenName={props.tokenName}
+            tokenScope={props.tokenScope}
+            tokens={props.tokens}
+            onCreateToken={props.onCreateToken}
+            onDeleteDatabase={props.onDeleteDatabase}
+            onGrantMember={props.onGrantMember}
+            onMemberPrincipalChange={props.onMemberPrincipalChange}
+            onMemberRoleChange={props.onMemberRoleChange}
+            onQuotaBytesChange={props.onQuotaBytesChange}
+            onRevokeMember={props.onRevokeMember}
+            onRevokeToken={props.onRevokeToken}
+            onSetQuota={props.onSetQuota}
+            onTokenNameChange={props.onTokenNameChange}
+            onTokenScopeChange={props.onTokenScopeChange}
+          />
+          <ResponseLifecyclePanel
+            archiveSnapshot={props.archiveSnapshot}
+            archiveSnapshotName={props.archiveSnapshotName}
+            archiveStatus={props.archiveStatus}
+            canArchive={props.canArchive}
+            canCancelArchive={props.canCancelArchive}
+            canDownloadArchive={props.canDownloadArchive}
+            canDownloadSqlDump={props.canDownloadSqlDump}
+            canLoadSqlDump={props.canLoadSqlDump}
+            canRestore={props.canRestore}
+            canRun={props.canRun}
+            selectedDatabaseStatus={props.selectedDatabase?.status ?? null}
+            sqlDumpStatus={props.sqlDumpStatus}
+            onArchiveDatabase={props.onArchiveDatabase}
+            onCancelArchive={props.onCancelArchive}
+            onDownloadArchiveSnapshot={props.onDownloadArchiveSnapshot}
+            onDownloadSqlDump={props.onDownloadSqlDump}
+            onLoadArchiveFile={props.onLoadArchiveFile}
+            onLoadSqlDumpFile={props.onLoadSqlDumpFile}
+            onRestoreArchive={props.onRestoreArchive}
+          />
+        </>
+      ) : null}
     </aside>
   );
 }

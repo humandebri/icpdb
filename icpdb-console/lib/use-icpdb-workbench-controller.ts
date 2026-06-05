@@ -5,6 +5,7 @@
 
 import { useCallback, useEffect } from "react";
 import type { ResponseSidebarProps } from "@/components/icpdb-response-sidebar";
+import type { ConsoleConnection } from "@/lib/console-connection";
 import { useIcpdbAccountActions } from "@/lib/use-icpdb-account-actions";
 import { useIcpdbBackupActions } from "@/lib/use-icpdb-backup-actions";
 import { useIcpdbBillingActions } from "@/lib/use-icpdb-billing-actions";
@@ -32,9 +33,10 @@ import type { ShardOperationInfo, ShardOperationReconcileStatus, TableDescriptio
 const defaultWalletSignerUrl = "https://oisy.com/sign";
 const defaultWalletHost = "https://icp-api.io";
 
-export function useIcpdbWorkbenchController() {
+export function useIcpdbWorkbenchController(connection: ConsoleConnection) {
   const state = useIcpdbWorkbenchState();
-  const canisterId = process.env.NEXT_PUBLIC_ICPDB_CANISTER_ID ?? "";
+  const canisterId = connection.canisterId;
+  const hostedMode = connection.mode === "hosted";
   const walletSignerUrl = process.env.NEXT_PUBLIC_ICPDB_WALLET_SIGNER_URL ?? defaultWalletSignerUrl;
   const walletHost = process.env.NEXT_PUBLIC_ICPDB_WALLET_HOST ?? defaultWalletHost;
   const {
@@ -50,7 +52,7 @@ export function useIcpdbWorkbenchController() {
 
   const derived = useIcpdbWorkbenchDerivedState({
     archiveSnapshot, approvedDeposit, authReady: Boolean(authClient || tokenSession), canisterId: canisterId || tokenSession?.baseUrl || "", createTableColumns,
-    createTableName, databaseId, databases, depositAmount, depositQuote, loadState, memberPrincipal, memberRole: state.memberRole, members: state.members, principal, quotaBytes,
+    connectionMode: connection.mode, createTableName, databaseId, databases, depositAmount, depositQuote, loadState, memberPrincipal, memberRole: state.memberRole, members: state.members, principal, quotaBytes,
     selectedCellColumnName, selectedRowIndex, tableDescription, tableName, tablePreview, tables, walletStatus
   });
   const resetRowEditor = useCallback(() => {
@@ -60,7 +62,7 @@ export function useIcpdbWorkbenchController() {
     setCellValue("");
   }, [setCellValue, setRowJson, setSelectedCellColumnName, setSelectedRowIndex]);
   const resource = useIcpdbResourceRefresh({
-    canisterId, databases, tableLimit, tableName, resetRowEditor, setUsage: state.setUsage,
+    canisterId, databases, skipHostedResources: !hostedMode, tableLimit, tableName, resetRowEditor, setUsage: state.setUsage,
     setUsageEvents: state.setUsageEvents, setBilling: state.setBilling, setTokens: state.setTokens,
     setMembers: state.setMembers, setPayments: state.setPayments, setQuotaBytes: state.setQuotaBytes,
     setTables: state.setTables, setTableName: state.setTableName, setTableOffset: state.setTableOffset,
@@ -92,7 +94,7 @@ export function useIcpdbWorkbenchController() {
     resetRowEditor();
   }, [resetRowEditor, setTableDescription, setTableName, setTableOffset, setTablePreview, setTables]);
   const session = useIcpdbSessionActions({
-    canisterId, clearTableState, resetDepositApproval: billing.resetDepositApproval, setAuthClient: state.setAuthClient,
+    canisterId, connection, clearTableState, resetDepositApproval: billing.resetDepositApproval, setAuthClient: state.setAuthClient,
     setBilling: state.setBilling, setDatabaseId: state.setDatabaseId, setDatabases: state.setDatabases,
     setError: state.setError, setLoadState: state.setLoadState, setPrincipal: state.setPrincipal, setUsage: state.setUsage,
     setShardPlacements: state.setShardPlacements, setShardPlacementStatus: state.setShardPlacementStatus,
@@ -217,10 +219,10 @@ export function useIcpdbWorkbenchController() {
   ]);
 
   const navigatorProps = {
-    canCreateTable: derived.canCreateTable, canOpenSetupSql: derived.canWriteDatabase, canisterId, createTableColumns, createTableName, databaseId, databases,
+    canCreateTable: derived.canCreateTable, canOpenSetupSql: derived.canWriteDatabase, canisterId, connectionMode: connection.mode, createTableColumns, createTableName, databaseId, databases,
     loadState, principal, tableName, tables,
     tokenSession: {
-      connected: Boolean(tokenSession), databaseId: state.tokenDatabaseId, disabled: loadState === "loading",
+      connected: Boolean(tokenSession), databaseId: state.tokenDatabaseId, disabled: !hostedMode || loadState === "loading",
       httpBaseUrl: state.tokenHttpBaseUrl, token: state.tokenSecret, onConnect: tokenActions.connectTokenSession,
       onDatabaseIdChange: state.setTokenDatabaseId, onDisconnect: () => { tokenActions.disconnectTokenSession(); operationActions.clearRoutedOperation(); },
       onHttpBaseUrlChange: state.setTokenHttpBaseUrl, onTokenChange: state.setTokenSecret
@@ -234,7 +236,7 @@ export function useIcpdbWorkbenchController() {
     onSelectTable: (nextTableName: string) => void (tokenSession ? tokenActions.selectTable(nextTableName) : tableActions.selectTable(nextTableName))
   };
   const toolbarProps = {
-    authReady: Boolean(authClient), canCreateDatabase: !tokenSession, canIssueReadToken: !tokenSession, databaseId,
+    authReady: Boolean(authClient), canCreateDatabase: hostedMode && !tokenSession, canIssueReadToken: hostedMode && !tokenSession, databaseId,
     loadState, principal, view: state.view, onCreateDatabase: database.createDatabase,
     onCreateReadToken: account.createReadToken, onLogin: () => void session.login(authClient), onSetView: state.setView,
     onSync: () => {
@@ -278,7 +280,7 @@ export function useIcpdbWorkbenchController() {
     canDeleteDatabase: derived.canDeleteDatabase,
     canDownloadArchive: derived.canDownloadArchive, canDownloadSqlDump: derived.canDownloadSqlDump,
     canGrantMember: derived.canGrantMember, canLoadSqlDump: derived.canLoadSqlDump,
-    canLoadRoutedOperation: Boolean(tokenSession || (authClient && canisterId && databaseId)),
+    canLoadRoutedOperation: hostedMode && Boolean(tokenSession || (authClient && canisterId && databaseId)),
     canManageDatabase: derived.canManageDatabase, canMutateMembers: derived.canMutateMembers,
     canRestore: derived.canRestore, canRun: derived.canRun,
     canSetQuota: derived.canSetQuota, issuedToken: state.issuedToken, memberPrincipal,
@@ -289,7 +291,7 @@ export function useIcpdbWorkbenchController() {
     shardPlacements: state.shardPlacements, shardPlacementStatus: state.shardPlacementStatus,
     shardReconcileError: state.shardReconcileError,
     sqlDumpStatus: state.sqlDumpStatus, tokenName: state.tokenName, tokenScope: state.tokenScope, tokens: state.tokens,
-    usage: state.usage, usageEvents: state.usageEvents,
+    usage: state.usage, usageEvents: state.usageEvents, showHostedPanels: hostedMode,
     onArchiveDatabase: tokenSession ? tokenBackupActions.archiveDatabase : backup.archiveDatabase,
     onCancelArchive: tokenSession ? tokenBackupActions.cancelArchive : database.cancelArchive, onCreateToken: tokenSession ? tokenAdminActions.createToken : account.createToken,
     onDeleteDatabase: tokenSession ? tokenActions.deleteDatabase : database.deleteSelectedDatabase,

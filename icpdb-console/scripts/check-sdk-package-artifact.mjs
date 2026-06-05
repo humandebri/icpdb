@@ -68,6 +68,15 @@ function assertReadmeShowsFastStartSqlPath(readmeSource, label) {
   );
 }
 
+function assertRootReadmeShowsCompactSqlPath(readmeSource) {
+  assert.match(readmeSource, /## SDK Quickstart/, "root README should keep SDK quickstart section");
+  assert.match(readmeSource, /const db = createClient\(\{[\s\S]*canisterId,[\s\S]*identity: authClient\.getIdentity\(\),[\s\S]*setupSql: "CREATE TABLE notes\(id INTEGER PRIMARY KEY, body TEXT\)"[\s\S]*\}\);/, "root README should show app createClient setup");
+  assert.match(readmeSource, /await db\.execute\(sql`INSERT INTO notes\(body\) VALUES \(\$\{"hello"\}\)`\);[\s\S]*const result = await db\.query\("SELECT id, body FROM notes ORDER BY id DESC"\);[\s\S]*const connectionUrl = await db\.connectionUrl\(\);[\s\S]*const info = await db\.info\(\);/, "root README should show app execute/query/handoff order");
+  assert.match(readmeSource, /const libsqlDb = createLibsqlClient\(\{ url: connectionUrl, identity \}\);/, "root README should show libSQL connection/auth replacement");
+  assert.match(readmeSource, /## Server SDK[\s\S]*const db = await createClientFromEnvFile\(\);[\s\S]*await db\.execute\("INSERT INTO notes\(body\) VALUES \(\?1\)", \["from-ci"\]\);/, "root README should show Server/CI env-file SQL path");
+  assert.match(readmeSource, /\/icpdb\?mode=adapter&canisterId=<canister-id>&databaseId=<database-id>/, "root README should show adapter mode URL");
+}
+
 assert.equal(manifest.name, "@icpdb/client");
 assert.equal(manifest.description, "Identity-first TypeScript client for ICPDB hosted SQLite databases on the Internet Computer.");
 assert.deepEqual(manifest.keywords, ["icp", "internet-computer", "sqlite", "database", "libsql", "turso"]);
@@ -146,7 +155,7 @@ const readme = readFileSync("dist-sdk/README.md", "utf8");
 const rootReadme = readFileSync("../README.md", "utf8");
 
 assertReadmeShowsFastStartSqlPath(readme, "SDK README");
-assertReadmeShowsFastStartSqlPath(rootReadme, "root README");
+assertRootReadmeShowsCompactSqlPath(rootReadme);
 
 assert.equal(sdkSource.includes("next/"), false, "SDK artifact must not import Next.js");
 assert.equal(sdkSource.includes("react"), false, "SDK artifact must not import React");
@@ -1432,7 +1441,9 @@ assert.match(sdkCliHelp.stdout, /Server\/CI defaults to cwd-local service\.env/)
 assert.match(sdkCliHelp.stdout, /Use `icpdb help <topic-or-command>` for focused Server\/CI flows; the first help line lists discoverable topics and actual command names/);
 const sdkCliHelpTopics = helpTopicsFromUsage(sdkCliHelp.stdout);
 assertReadmeListsHelpTopics(readme, sdkCliHelpTopics, "SDK README");
-assertReadmeListsHelpTopics(rootReadme, sdkCliHelpTopics, "root README");
+assert.match(rootReadme, /## Server\/CI/, "root README should keep package CLI Server/CI section");
+assert.match(rootReadme, /icpdb init/, "root README should show package CLI init");
+assert.match(rootReadme, /icpdb check-env/, "root README should show package CLI check-env");
 const sdkCliExecutableQuickstartHelp = await execFileAsync("./icpdb-cli.js", ["help", "quickstart"], { cwd: "dist-sdk" });
 assert.match(sdkCliExecutableQuickstartHelp.stdout, /App SDK shortest path/);
 assert.match(sdkCliExecutableQuickstartHelp.stdout, /Browser\/II apps can import the same browser-safe client from "@icpdb\/client\/browser"/);

@@ -7,6 +7,7 @@ import { AuthClient } from "@icp-sdk/auth/client";
 import type { Dispatch, SetStateAction } from "react";
 import { useCallback, useEffect } from "react";
 import { DELEGATION_TTL_NS, identityProviderUrl } from "@/lib/auth";
+import { adapterDatabaseSummary, type ConsoleConnection } from "@/lib/console-connection";
 import { listDatabasePlacementsAuthenticated, listDatabasesAuthenticated } from "@/lib/icpdb-client";
 import type {
   DatabaseBilling,
@@ -20,6 +21,7 @@ type LoadState = "idle" | "loading" | "ready" | "error";
 
 type SessionActionOptions = {
   canisterId: string;
+  connection: ConsoleConnection;
   clearTableState: () => void;
   resetDepositApproval: () => void;
   setAuthClient: Dispatch<SetStateAction<AuthClient | null>>;
@@ -38,6 +40,7 @@ type SessionActionOptions = {
 export function useIcpdbSessionActions(options: SessionActionOptions) {
   const {
     canisterId,
+    connection,
     clearTableState,
     resetDepositApproval,
     setAuthClient,
@@ -56,7 +59,7 @@ export function useIcpdbSessionActions(options: SessionActionOptions) {
   const refreshDatabases = useCallback(
     async (client: AuthClient) => {
       if (!canisterId) {
-        setError("NEXT_PUBLIC_ICPDB_CANISTER_ID is not configured.");
+        setError(connection.mode === "adapter" ? "adapter canisterId query parameter is required." : "NEXT_PUBLIC_ICPDB_CANISTER_ID is not configured.");
         setLoadState("error");
         return;
       }
@@ -64,6 +67,16 @@ export function useIcpdbSessionActions(options: SessionActionOptions) {
       setError(null);
       try {
         const identity = client.getIdentity();
+        if (connection.mode === "adapter") {
+          const nextDatabases = [adapterDatabaseSummary(connection.databaseId)];
+          setDatabases(nextDatabases);
+          setShardPlacements([]);
+          setShardPlacementStatus("Adapter mode");
+          setPrincipal(identity.getPrincipal().toText());
+          setDatabaseId(connection.databaseId);
+          setLoadState("ready");
+          return;
+        }
         const [nextDatabases, nextShardPlacements] = await Promise.all([
           listDatabasesAuthenticated(canisterId, identity),
           listDatabasePlacementsAuthenticated(canisterId, identity)
@@ -79,7 +92,7 @@ export function useIcpdbSessionActions(options: SessionActionOptions) {
         setLoadState("error");
       }
     },
-    [canisterId, setDatabaseId, setDatabases, setError, setLoadState, setPrincipal, setShardPlacements, setShardPlacementStatus]
+    [canisterId, connection, setDatabaseId, setDatabases, setError, setLoadState, setPrincipal, setShardPlacements, setShardPlacementStatus]
   );
 
   useEffect(() => {

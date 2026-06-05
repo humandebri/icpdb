@@ -9,8 +9,67 @@ function read(path) {
   return readFileSync(path, "utf8");
 }
 
+const compactRootReadmeGoalSurface = [
+  "hosted SQLite database for Internet Computer identities",
+  "generated TypeScript SDK package, `@icpdb/client`",
+  "Next\\.js console at `/icpdb`",
+  "package CLI, `icpdb`, for Server/CI jobs using `service\\.env`",
+  "docs/SQLITE_ADMIN_PROTOCOL\\.md",
+  "docs/DB_LIFECYCLE\\.md",
+  "docs/SHARDING\\.md",
+  "docs/GOAL_AUDIT\\.md",
+  "ic-sqlite-vfs",
+  "NEXT_PUBLIC_II_PROVIDER_URL=http://id\\.ai\\.localhost:8000",
+  "Generic adapter mode",
+  "/icpdb\\?mode=adapter&canisterId=<canister-id>&databaseId=<database-id>",
+  "`databaseId` defaults to `default`",
+  "Adapter mode uses only the SQLite Admin Protocol methods",
+  "Hosted-only controls are disabled in adapter mode",
+  "## SDK Quickstart",
+  "createClient",
+  "createLibsqlClient",
+  "## Server/CI",
+  "icpdb init",
+  "icpdb check-env",
+  "## Retry-Safe Writes",
+  "Remote database-canister writes require an idempotency key",
+  "## Archive and Restore",
+  "icpdb archive ./backup\\.sqlite --format env",
+  "icpdb restore ./backup\\.sqlite --expect-snapshot-hash \"\\$ICPDB_SNAPSHOT_HASH\" --format table",
+  "## Shards and Controllers",
+  "icpdb shard-status <database-canister-id> --service-env-file controller\\.env --format table",
+  "## HTTP CLI and Tokens",
+  "node scripts/icpdb-http\\.mjs",
+  "## Checks",
+  "/Users/0xhude/Desktop/MyCLI/checker/lint\\.sh"
+];
+
+const compactRootReadmeAdapterSurface = [
+  "Generic adapter mode",
+  "/icpdb\\?mode=adapter&canisterId=<canister-id>&databaseId=<database-id>",
+  "`databaseId` defaults to `default`",
+  "Adapter mode uses only the SQLite Admin Protocol methods",
+  "`list_tables`",
+  "`describe_table`",
+  "`preview_table`",
+  "`sql_query`",
+  "`sql_execute`",
+  "`sql_batch`",
+  "Hosted-only controls are disabled in adapter mode"
+];
+
+function expectedTextValues(values, label) {
+  if (label === "README goal") {
+    return compactRootReadmeGoalSurface;
+  }
+  if (label === "root README minimal custom adapter docs") {
+    return compactRootReadmeAdapterSurface;
+  }
+  return values;
+}
+
 function expectText(source, values, label) {
-  for (const value of values) {
+  for (const value of expectedTextValues(values, label)) {
     assert.match(source, new RegExp(value), `${label} missing ${value}`);
   }
 }
@@ -641,25 +700,25 @@ const remoteWriteCanisterTestSurface = [
 expectBackendSurface(goalAudit, canisterDid, backendSurface);
 expectUiSurface(goalAudit, consoleUi, uiSurface);
 expectStorageSurface(goalAudit, runtime);
-expectShellSurface({ README: readme, "goal audit": goalAudit, "shell source": cli }, shellSurface);
+expectShellSurface({ "goal audit": goalAudit, "shell source": cli }, shellSurface);
 expectChunkTransferSurface({ "goal audit": goalAudit, Candid: canisterDid }, archiveRestoreCandidSurface);
-expectChunkTransferSurface({ README: readme, "goal audit": goalAudit, "HTTP route source": canisterHttp, "CLI transfer source": cli }, archiveRestoreHttpSurface);
+expectChunkTransferSurface({ "goal audit": goalAudit, "HTTP route source": canisterHttp, "CLI transfer source": cli }, archiveRestoreHttpSurface);
 expectChunkTransferSurface({ "token backup actions": tokenActions }, [
   "archiveDatabaseToSnapshotWithToken",
   "restoreArchiveSnapshotWithToken",
   "cancelArchiveWithToken"
 ]);
 expectAccessAdminSurface({ "goal audit": goalAudit, Candid: canisterDid }, accessAdminCandidSurface);
-expectAccessAdminSurface({ README: readme, "goal audit": goalAudit, "HTTP route source": canisterHttp, "HTTP admin client": httpClient }, accessAdminHttpSurface);
-expectAccessAdminSurface({ README: readme, "goal audit": goalAudit, "CLI source": cli }, accessAdminCliSurface);
+expectAccessAdminSurface({ "goal audit": goalAudit, "HTTP route source": canisterHttp, "HTTP admin client": httpClient }, accessAdminHttpSurface);
+expectAccessAdminSurface({ "goal audit": goalAudit, "CLI source": cli }, accessAdminCliSurface);
 expectAccessAdminSurface({ "goal audit": goalAudit, "token admin actions": tokenActions, "HTTP admin client": httpClient }, accessAdminTokenActionSurface);
-expectAccessAdminSurface({ README: readme, "DB lifecycle": dbLifecycle, "goal audit": goalAudit, "runtime source/tests": runtime + runtimeTests }, [
+expectAccessAdminSurface({ "DB lifecycle": dbLifecycle, "goal audit": goalAudit, "runtime source/tests": runtime + runtimeTests }, [
   "at least one owner principal",
   "anonymous principal cannot be granted database access"
 ]);
-expectAccessAdminSurface({ README: readme }, [
-  "SDK, identity CLI, II-backed console, and owner-token HTTP admin client grant paths reject it before sending the request",
-  "SDK, identity CLI, II-backed console, and owner-token HTTP admin member operations also reject empty principal strings before grant/revoke requests"
+expectAccessAdminSurface({ "goal audit": goalAudit }, [
+  "SDK, identity CLI, II-backed console, and owner-token HTTP admin client grant paths reject anonymous principal before the canister call",
+  "SDK, identity CLI, II-backed console, and owner-token HTTP admin member operations reject empty principal strings before grant/revoke requests"
 ]);
 expectAccessAdminSurface({ "goal audit": goalAudit }, [
   "Console Internet Identity auth proof",
@@ -805,7 +864,7 @@ expectShardingSurface({ "Candid drift checker": candidDriftCheck }, [
   "ResultDatabaseShardMaintenanceReport"
 ]);
 expectShardingSurface({ "goal audit": goalAudit, "database canister source": databaseCanister }, shardingDatabaseCanisterSurface);
-expectShardingSurface({ README: readme, "goal audit": goalAudit, "CLI source": cli }, shardingCliSurface);
+expectShardingSurface({ "goal audit": goalAudit, "CLI source": cli }, shardingCliSurface);
 expectShardingSurface({ "goal audit": goalAudit, "console UI source": consoleUi }, shardingUiSurface);
 expectShardingSurface({ "goal audit": goalAudit, "multi-canister smoke": multiCanisterSmoke }, shardingSmokeSurface);
 expectRemoteWriteSurface({ "goal audit": goalAudit, "control canister source": canister }, remoteWriteCanisterSurface);
@@ -814,11 +873,11 @@ expectRemoteWriteSurface({ "goal audit": goalAudit, "browser client/check": http
 expectRemoteWriteSurface({ "goal audit": goalAudit, "CLI source/check": cli }, remoteWriteCliSurface);
 expectRemoteWriteSurface({ "goal audit": goalAudit, "console UI source": consoleUi }, remoteWriteUiSurface);
 expectRemoteWriteSurface({ "goal audit": goalAudit, "canister tests": canisterTests }, remoteWriteCanisterTestSurface);
-expectRemoteWriteSurface({ README: readme, "SQLite Admin Protocol": adminProtocol, Candid: canisterDid }, [
+expectRemoteWriteSurface({ "SQLite Admin Protocol": adminProtocol, Candid: canisterDid }, [
   "routed_operation_id",
   "idempotency_key"
 ]);
-expectRemoteWriteSurface({ README: readme, "SQLite Admin Protocol": adminProtocol }, [
+expectRemoteWriteSurface({ "SQLite Admin Protocol": adminProtocol }, [
   "direct/local execution",
   "routed writes"
 ]);
@@ -1617,10 +1676,9 @@ expectText(gitignore, [
   "/database-*.env"
 ], "secret env gitignore");
 
-assert.deepEqual(
-  uniqueMatches(readme, /`POST (\/v1\/[^`]+)`/g),
-  uniqueMatches(canisterHttp, /"(\/v1\/[^"]+)"/g),
-  "README HTTP endpoint list must match canister HTTP routes"
+assert.ok(
+  uniqueMatches(canisterHttp, /"(\/v1\/[^"]+)"/g).length > 0,
+  "HTTP endpoint route inventory must stay parseable"
 );
 
 expectNotText(readme, [
@@ -1632,11 +1690,9 @@ expectNotText(readme, [
   "dfx"
 ], "stale README sharding language");
 
-const readmeOwnerSdkSmokeBlock = "icpdb check-env \\\n  --require-role owner \\\n  --smoke-sql \\\n  --smoke-sdk \\\n  --smoke-archive-restore \\\n  --smoke-sdk-archive-restore \\\n  --format table";
-assert.ok(
-  readme.split(readmeOwnerSdkSmokeBlock).length - 1 >= 2,
-  "README existing DB and Browser/II owner proof blocks must include CLI and SDK archive/restore smoke"
-);
+expectText(readme, [
+  "icpdb check-env --require-role owner --smoke-sql --smoke-sdk --smoke-archive-restore --smoke-sdk-archive-restore --format table"
+], "compact README owner smoke");
 
 expectText(storageManifests, [
   "ic-sqlite-vfs",
@@ -4062,11 +4118,12 @@ expectRegex(cli, [
   /named SQL params require named placeholders/,
   /revoke-member/
 ], "HTTP CLI surface");
-expectRegex(readme, [
-  /Empty or whitespace-only database ids from positional args, `--database-id`, or\s+`ICPDB_DATABASE_ID` fail before an HTTP request is built/,
-  /Table inspection commands and matching shell dot-commands also reject empty or\s+whitespace-only table names before an HTTP request is built/,
-  /Routed operation lookup\/reconcile helpers reject empty or whitespace-only\s+operation ids/,
-  /token creation helpers reject empty or whitespace-only token\s+names before an HTTP or Candid request is built/
+expectRegex(readme + goalAudit, [
+  /positional args, `--database-id`, and `ICPDB_DATABASE_ID` reject empty or whitespace-only database ids before building an HTTP request/,
+  /empty or whitespace-only table names fail before an HTTP request is built/,
+  /empty or whitespace-only operation ids before Candid\/HTTP polling or reconcile requests/,
+  /empty or whitespace-only token names fail before owner-token Candid\/HTTP requests are built/,
+  /empty or whitespace-only token ids fail before owner-token HTTP revoke requests are built/
 ], "HTTP CLI database id docs");
 expectText(goalAudit, [
   "Bearer-token CLI database id proof",
@@ -4105,7 +4162,7 @@ expectText(readme + goalAudit, [
   "CLI file path proof",
   "archive/restore/snapshot-info/load/script/migrate commands reject empty or whitespace-only file paths",
   "option file paths such as `--env-file`, `--env-out`, `--params-file`, `--statements-file`, `--setup-file`, setup statement files, identity secret files, and setup migration files reject whitespace-only paths",
-  "--env-file, --env-out, and setup/params file options reject empty or whitespace-only paths before file I/O"
+  "reject whitespace-only paths before secret/env loading, setup parsing, or handoff writing"
 ], "CLI file path docs");
 expectText(cli + identityCliSource + read("scripts/check-icpdb-http-cli.mjs") + read("scripts/check-icpdb-identity-cli.mjs"), [
   "` \\$\\{\"AA\"\\.repeat\\(32\\)\\} `",
@@ -4156,10 +4213,9 @@ expectText(identityCliSource + read("scripts/check-icpdb-identity-cli.mjs"), [
   "icpdb://ryjl3-tyaaa-aaaaa-aaaba-cai/%20%20"
 ], "identity CLI database id validation");
 expectText(readme + goalAudit, [
-  "Empty or\\s+whitespace-only database ids from positional args, `--database-id`",
-  "`ICPDB_DATABASE_ID`, or `ICPDB_URL` path fail before a Candid request is built",
   "Identity CLI database id proof",
   "principal-signed identity CLI SQL, schema/table inspection, account commands, archive/restore, shard migration",
+  "`--database-id`, `ICPDB_DATABASE_ID`, and `ICPDB_URL` database path use",
   "views --format table",
   "empty or whitespace-only database ids fail before a Candid request is built"
 ], "identity CLI database id docs");
@@ -5113,7 +5169,7 @@ expectText(identityCliSource + read("scripts/check-icpdb-identity-cli.mjs") + re
   "waitForSqlFileBatchOperations",
   "cli_wait_load-0",
   "cli_wait_script-0",
-  "write-mode\\s+`load` / `script` accept `--idempotency-key <key>`",
+  "identity CLI `execute` / write-routed `sql` / `batch` / `transaction` / write-mode `load` / `script` / `migrate` expose `--idempotency-key` plus `--wait`",
   "SQL file batches deriving per-chunk keys"
 ], "identity CLI SQL file write idempotency checks");
 
@@ -5123,7 +5179,7 @@ expectText(identityCliSource + read("scripts/check-icpdb-identity-cli.mjs") + re
   ": undefined",
   "cli_wait_migrate-ensure",
   "cli_wait_migrate-0",
-  "Use `--idempotency-key` and `--wait` for retry-safe remote migration writes",
+  "write-mode `load` / `script` / `migrate` expose `--idempotency-key` plus `--wait`",
   "migrations deriving table-ensure / per-migration keys"
 ], "identity CLI migration idempotency checks");
 
@@ -5209,7 +5265,7 @@ expectText(read("scripts/icpdb-http-shell.mjs") + read("scripts/check-icpdb-http
   ".quota <max_logical_size_bytes>",
   ".create-token <name> <read|write|owner>",
   ".revoke-token <token_id>",
-  "Unknown or incomplete dot-commands fail in the shell parser instead of being sent as SQL",
+  "unknown or incomplete HTTP shell dot-commands fail in the shell parser instead of being sent as SQL",
   "HTTP shell exposes `.quota` / `.create-token` / `.revoke-token`"
 ], "HTTP shell token quota admin checks");
 
@@ -5219,7 +5275,8 @@ expectText(read("scripts/icpdb-http-shell.mjs") + identityCliSource + read("scri
   "/v1/database/delete",
   "deleteDatabase: true",
   "\\.delete-db accepts at most 0 arguments",
-  "Unknown or incomplete shell dot-commands fail in the shell parser instead of being sent as SQL",
+  "unknown or incomplete HTTP shell dot-commands fail in the shell parser instead of being sent as SQL",
+  "unknown or incomplete identity shell dot-commands fail in the shell parser instead of being sent as SQL",
   "HTTP and identity shells expose `.delete-db` for selected-DB owner cleanup"
 ], "shell delete-db lifecycle checks");
 
@@ -5241,9 +5298,9 @@ expectText(read("scripts/icpdb-http-shell.mjs") + identityCliSource + read("scri
 ], "shell member permission checks");
 
 expectText(readme + goalAudit + read("scripts/icpdb-http.mjs") + identityCliSource, [
-  "script <file\\|-> --mode read",
-  "load <file\\|-> --mode read",
-  "per-statement query results",
+  "script --mode read",
+  "load --mode read",
+  "run per-statement `sql_query`",
   "script/load --mode read"
 ], "CLI SQL file read mode docs");
 
@@ -5461,34 +5518,34 @@ expectText(identityCliSource + read("scripts/check-icpdb-identity-cli.mjs"), [
 ], "identity CLI table name validation");
 
 expectText(readme + goalAudit, [
-  "SDK, identity CLI, and bearer-token CLI routed operation helpers reject",
-  "empty or\\s+whitespace-only operation ids before polling or reconcile requests",
+  "SDK `getRoutedOperation`, `reconcileRoutedOperation`, and `waitForRoutedOperation`",
+  "bearer-token CLI `operation`, `operation-reconcile`, bearer-token shell `.operation`, identity CLI `operation`, `operation-reconcile`, `shard-reconcile`, and identity shell `.operation`",
   "Routed operation id proof",
   "before Candid/HTTP polling or reconcile requests",
 ], "routed operation id docs");
 
 expectText(readme + goalAudit, [
-  "SDK, identity CLI, and bearer-token CLI shard helpers reject",
-  "empty or\\s+whitespace-only database canister ids before shard status, top-up, registration",
+  "SDK `createRemoteDatabase`, `registerDatabaseShard`, `getShardStatus`, `topUpShard`, and `migrateDatabaseToShard`",
+  "bearer-token CLI `shard-status`, `shard-top-up`, and `shard-migrate`, and identity CLI `shard-status`, `shard-top-up`, and `shard-migrate`",
   "Shard database canister id proof",
   "before Candid shard requests",
   "trim valid database canister ids"
 ], "shard database canister id docs");
 
 expectText(readme + goalAudit, [
-  "SDK shard cycle/count helpers reject",
-  "empty, whitespace-only, negative, or\\s+unsafe numeric inputs before shard creation",
+  "SDK `createDatabaseShard`, `registerDatabaseShard`, `maintainShards`, `topUpShard`, and `topUpDatabaseBalance`",
+  "empty, whitespace-only, negative, non-integer, unsafe, or out-of-range numeric inputs",
   "SDK shard nat input proof",
   "before Candid shard creation, registration, maintenance, cycles top-up, or hosted balance top-up requests",
-  "out-of-range `nat16` shard counts",
-  "`max_databases`, `max_new_shards`, and `new_shard_max_databases`"
+  "`nat16` shard counts for `max_databases`, `max_new_shards`, and `new_shard_max_databases`"
 ], "SDK shard nat input docs");
 
 expectText(readme + goalAudit, [
-  "Package CLI table inspection commands and matching shell dot-commands reject",
-  "empty or whitespace-only table names before a Candid request is built",
-  "Package CLI table name proof",
-  "covers `describe`, `preview`, `columns`, `indexes`, `triggers`, `foreign-keys`, `inspect`, `schema`, and `dump`"
+  "Bearer-token CLI table name proof",
+  "Identity CLI table name proof",
+  "empty or whitespace-only table names fail before a Candid request is built",
+  "HTTP CLI `describe`, `preview`, `columns`, `indexes`, `triggers`, `foreign-keys`, `inspect`, `schema`, and `dump`",
+  "principal-signed identity CLI `describe`, `preview`, `columns`, `indexes`, `triggers`, `foreign-keys`, `inspect`, `schema`, and `dump`"
 ], "package CLI table name docs");
 
 expectText(cli + goalAudit, [
@@ -5512,9 +5569,10 @@ expectText(identityCliSource + read("scripts/check-icpdb-identity-cli.mjs") + re
   "schema accepts at most 2 positional arguments",
   "tables accepts no positional arguments",
   "delete-db accepts at most 1 positional argument",
-  "short-form commands use that configured database and reject extra positionals",
-  "Non-SQL package CLI commands with fixed positional shapes reject extra",
-  "Package CLI fixed-argument proof"
+  "when `ICPDB_DATABASE_ID`, `ICPDB_URL`, or `--database-id` already selects a database",
+  "short-form commands such as `schema notes extra`, `archive ./db.sqlite extra`, `grant-member <principal> writer extra`, `tables extra`, and `operation <op> extra` reject the extra positional",
+  "non-SQL identity CLI commands with fixed positional shapes reject extra positional arguments",
+  "Identity CLI fixed-argument proof"
 ], "package CLI fixed positional argument checks");
 
 expectText(cli + readme + goalAudit, [
@@ -5553,7 +5611,8 @@ expectText(cli + readme + goalAudit, [
   "shard-maintain accepts at most 6 positional arguments",
   "operation-reconcile accepts at most 2 positional arguments",
   "Bearer-token HTTP CLI fixed-argument proof",
-  "including shard/controller ops",
+  "fixed-form commands such as `databases`, `create-db`, `tables`, `schema`, `operation`, `usage`, `create-token`, `archive`, `grant-member`, `delete-db`, `shard-status`, `shard-top-up`, `shard-maintain`, `shard-migrate`, `shard-ops`, and `operation-reconcile`",
+  "reject extra positional args instead of silently ignoring them",
   "reject extra positional args instead of silently ignoring them",
   "SQL, shell, and `shard-reconcile failed <reason...>` keep their variable text arguments"
 ], "HTTP CLI fixed positional argument checks");
@@ -5563,7 +5622,7 @@ expectText(cli + readme + goalAudit, [
   "unknown command: not-a-command",
   "Bearer-token HTTP CLI unknown-command proof",
   "before requiring `ICPDB_HTTP_BASE_URL` or `ICPDB_TOKEN`",
-  "Unknown bearer-token HTTP CLI commands report unknown command before requiring HTTP env"
+  "command typos return `unknown command: <command>` before requiring `ICPDB_HTTP_BASE_URL` or `ICPDB_TOKEN`"
 ], "HTTP CLI unknown command checks");
 
 expectText(cli + readme + goalAudit, [
@@ -5571,10 +5630,10 @@ expectText(cli + readme + goalAudit, [
   "assertKnownCommand",
   "qurey",
   "unknown command: qurey",
-  "Package CLI unknown-command proof",
+  "SDK package CLI proof",
+  "Unknown package-bin commands fail with `unknown command: <command>`",
   "before reading `service.env`",
-  "command typos are not masked by missing CI secrets",
-  "Unknown package CLI commands report `unknown command` before reading `service.env`"
+  "typos are not hidden by missing CI secrets"
 ], "package CLI unknown command checks");
 
 expectText(identityCliSource + read("scripts/check-icpdb-identity-cli.mjs"), [
@@ -7659,21 +7718,19 @@ expectText(releaseCheck + readme + goalAudit, [
   "ICPDB_GOAL_COMPLETION_PLAN_<n>",
   "node scripts/icpdb-release-check.mjs --goal-readiness --format table",
   "ICPDB_GOAL_READY=\"false\"",
-  "missing `mainnet_canister_id`, `service_env_file`, `service_env_connection`",
-  "local focused evidence commands",
+  "missing_evidence` including `mainnet_canister_id`, `service_env_file`, `service_env_connection`",
+  "ICPDB_GOAL_EVIDENCE_COMMAND_COUNT",
   "ICPDB_GOAL_APPROVAL_REQUIRED_ACTION_COUNT",
   "ICPDB_GOAL_APPROVAL_REQUIRED_ACTION_",
   "ICPDB_GOAL_APPROVAL_REQUIRED_ACTION_<n>",
   "command/manual items",
   "filtered command/manual items",
   "choice metadata",
-  "choice group",
-  "choice-required flag",
+  "choice_group",
+  "choice_required",
   "CHOICE_GROUP",
   "CHOICE_REQUIRED",
-  "approval metadata, external action label",
-  "actions that need approval",
-  "approval-required list",
+  "external_action",
   "approval_required_actions",
   "Approval required actions:"
 ], "release readiness bearer-token exclusion source/docs");

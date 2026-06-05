@@ -4,6 +4,7 @@
 // Derived workbench state: centralizes selected resources and permission gates for the console UI.
 
 import { useMemo } from "react";
+import type { ConsoleConnectionMode } from "@/lib/console-connection";
 import {
   canWriteColumn,
   isBlobColumn
@@ -36,6 +37,7 @@ type DerivedStateOptions = {
   approvedDeposit: ApprovedDeposit | null;
   authReady: boolean;
   canisterId: string;
+  connectionMode: ConsoleConnectionMode;
   createTableColumns: string;
   createTableName: string;
   databaseId: string;
@@ -95,6 +97,7 @@ export function useIcpdbWorkbenchDerivedState(options: DerivedStateOptions): Wor
     approvedDeposit,
     authReady,
     canisterId,
+    connectionMode,
     createTableColumns,
     createTableName,
     databaseId,
@@ -135,6 +138,7 @@ export function useIcpdbWorkbenchDerivedState(options: DerivedStateOptions): Wor
   const selectedRow = selectedRowIndex === null ? null : tablePreview?.rows[selectedRowIndex] ?? null;
   const selectedCellColumn = editableColumns.find((column) => column.name === selectedCellColumnName) ?? null;
   const canRun = Boolean(authReady && principal && databaseId && canisterId && loadState !== "loading");
+  const isHostedMode = connectionMode === "hosted";
   const canWriteDatabase = canRun && selectedDatabase?.status === "hot" && canWriteDatabaseRole(selectedDatabase.role);
   const canCreateTable = canWriteDatabase && createTableName.trim().length > 0 && createTableColumns.trim().length > 0;
   const canEditRows = canWriteDatabase && selectedTable?.objectType === "table" && Boolean(tableDescription);
@@ -147,13 +151,13 @@ export function useIcpdbWorkbenchDerivedState(options: DerivedStateOptions): Wor
     approvedDeposit?.amountE8s === depositQuote?.amountE8s &&
     approvedDeposit?.owner === principal &&
     depositQuoteMatchesAmount;
-  const canQuoteDeposit = canRun && !walletBusy;
-  const canApproveDeposit = canRun && depositQuoteMatchesAmount && !walletBusy;
-  const canDeposit = canRun && approvedDepositMatches && !walletBusy;
-  const canDownloadSqlDump = canRun && selectedDatabase?.status === "hot";
-  const canLoadSqlDump = canWriteDatabase;
-  const canDownloadArchive = canRun && archiveSnapshot?.databaseId === databaseId;
-  const canManageDatabase = canRun && selectedDatabase?.role === "owner";
+  const canQuoteDeposit = isHostedMode && canRun && !walletBusy;
+  const canApproveDeposit = isHostedMode && canRun && depositQuoteMatchesAmount && !walletBusy;
+  const canDeposit = isHostedMode && canRun && approvedDepositMatches && !walletBusy;
+  const canDownloadSqlDump = isHostedMode && canRun && selectedDatabase?.status === "hot";
+  const canLoadSqlDump = isHostedMode && canWriteDatabase;
+  const canDownloadArchive = isHostedMode && canRun && archiveSnapshot?.databaseId === databaseId;
+  const canManageDatabase = isHostedMode && canRun && selectedDatabase?.role === "owner";
   const canArchive = canManageDatabase && selectedDatabase?.status === "hot";
   const canCancelArchive = canManageDatabase && selectedDatabase?.status === "archiving";
   const canRestore =

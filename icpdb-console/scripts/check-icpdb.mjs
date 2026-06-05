@@ -113,6 +113,7 @@ const usageEventsPanelUrl = new URL("../components/icpdb-usage-events-panel.tsx"
 const workbenchUrl = new URL("../components/icpdb-workbench.tsx", import.meta.url);
 const permissionPanelUrl = new URL("../components/icpdb-permission-panel.tsx", import.meta.url);
 const authUrl = new URL("../lib/auth.ts", import.meta.url);
+const consoleConnectionUrl = new URL("../lib/console-connection.ts", import.meta.url);
 const tokenSessionHelperUrl = new URL("../lib/icpdb-token-session.ts", import.meta.url);
 const rowMutationsUrl = new URL("../lib/row-mutations.ts", import.meta.url);
 const icpdbClientUrl = new URL("../lib/icpdb-client.ts", import.meta.url);
@@ -166,7 +167,7 @@ for (const url of [
   pageUrl, rootPageUrl, accountPanelsUrl, backupBillingPanelsUrl, dataGridUrl, databaseListPanelUrl, displayPanelsUrl, navigationPanelsUrl, operationPanelUrl, responseAdminPanelsUrl, responseMetricsPanelUrl, responseSidebarUrl, resultGridUrl, rowEditorPanelUrl, schemaViewersUrl, shardPanelsUrl, sqlEditorPanelUrl, tableDataPanelUrl, tableEditorPanelUrl, tableListPanelUrl, tableOverviewPanelUrl, tableSchemaPanelUrl, tokenSessionPanelUrl, tokenPanelUrl, usageEventsPanelUrl, workbenchUrl, permissionPanelUrl, authUrl, tokenSessionHelperUrl, rowMutationsUrl, icpdbClientUrl, icpdbActorUrl, icpdbRawTypesUrl, icpdbDatabaseCodecUrl, icpdbTableCodecUrl, icpdbSdkUrl, icpdbServiceIdentityUrl, icpdbSqlScriptUrl, icpdbDatabaseApiUrl, icpdbAccountApiUrl, icpdbTransferApiUrl, icpdbTableApiUrl, httpAdminClientUrl, httpClientUrl, resultGridHelpersUrl, sqlDumpUrl, tableDataHelpersUrl, workbenchStateUrl,
   databaseTransferUrl, resourceRefreshUrl, accountActionsUrl, backupActionsUrl, billingActionsUrl, databaseActionsUrl, operationActionsUrl,
   controllerUrl, derivedStateUrl, sessionActionsUrl, shardActionsUrl, sqlActionsUrl, tableActionsUrl, tokenAdminActionsUrl, tokenActionsUrl, tokenBackupActionsUrl,
-  workbenchLocalStateUrl, readmeUrl, sdkTsconfigUrl, sdkPackageImportCheckUrl, sdkPackageArtifactCheckUrl, sdkPackageManifestWriterUrl, rowMutationCheckUrl, sqlDumpCheckUrl, httpAdminClientCheckUrl, httpClientCheckUrl
+  workbenchLocalStateUrl, readmeUrl, sdkTsconfigUrl, sdkPackageImportCheckUrl, sdkPackageArtifactCheckUrl, sdkPackageManifestWriterUrl, rowMutationCheckUrl, sqlDumpCheckUrl, httpAdminClientCheckUrl, httpClientCheckUrl, consoleConnectionUrl
 ]) {
   assert.equal(existsSync(url), true);
 }
@@ -199,6 +200,7 @@ const usageEventsPanel = readFileSync(usageEventsPanelUrl, "utf8");
 const workbench = readFileSync(workbenchUrl, "utf8");
 const permissionPanel = readFileSync(permissionPanelUrl, "utf8");
 const auth = readFileSync(authUrl, "utf8");
+const consoleConnection = readFileSync(consoleConnectionUrl, "utf8");
 const tokenSessionHelper = readFileSync(tokenSessionHelperUrl, "utf8");
 const rowMutations = readFileSync(rowMutationsUrl, "utf8");
 const icpdbClient = readFileSync(icpdbClientUrl, "utf8");
@@ -253,25 +255,17 @@ assertNoAnyAs(rootPage);
 
 assert.match(page, /Canister SQLite Console/);
 assert.match(page, /SQL Workbench/);
+assert.match(page, /consoleConnectionFromSearchParams/);
+assert.match(page, /IcpdbWorkbench connection=\{connection\}/);
 assertNoAnyAs(page);
 
-assert.match(readme, /SQL dump download \/ load controls/);
-assert.match(readme, /selected cell value/);
-assert.match(readme, /index column metadata/);
-assert.match(readme, /foreign key group\/seq\/match metadata/);
-assert.match(readme, /starter batch that creates `notes`, inserts a seed row, shows its schema SQL, and selects it/);
-assert.match(readme, /Console shortest path/);
-assert.match(readme, /Open `\/icpdb` and click `Login`/);
-assert.match(readme, /Click `Create database`/);
-assert.match(readme, /Click `Run batch`/);
-assert.match(readme, /`Search result rows`, `Copy result CSV`,/);
-assert.match(readme, /`Download result CSV`, the table list, and `Open SELECT SQL`/);
-assert.match(readme, /`Open SELECT SQL`/);
-assert.match(readme, /`Copy schema SQL`, `Open schema SQL`,/);
-assert.match(readme, /`Copy SQL` to copy the current editor SQL/);
-assert.match(readme, /`Open schema lookup SQL`, `Open column SQL`, `Open foreign key SQL`,/);
-assert.match(readme, /`Open INSERT SQL`, `Open count SQL`, `Open page SQL`, `Copy page SQL`, and `Copy table CSV`/);
-assert.match(readme, /Copy `Connection URL`/);
+assert.match(readme, /\/icpdb\?mode=adapter&canisterId=<canister-id>&databaseId=<database-id>/);
+assert.match(readme, /`databaseId` defaults to `default`/);
+assert.match(readme, /Adapter mode uses only the SQLite Admin Protocol methods/);
+assert.match(readme, /Hosted-only controls are disabled in adapter mode/);
+
+assertMatches(consoleConnection, [/consoleConnectionFromSearchParams/, /modeValue !== "adapter"/, /databaseId: databaseIdValue \|\| "default"/, /adapterDatabaseSummary/, /role: "writer"/, /status: "hot"/]);
+assertNoAnyAs(consoleConnection);
 
 assert.match(displayPanels, /Copy/);
 assert.match(displayPanels, /Copy \$\{label\}/);
@@ -342,7 +336,7 @@ assertNoAnyAs(backupBillingPanels);
 assertMatches(operationPanel, [/RoutedOperationPanel/, /Operation status/, /Lookup routed operation/, /idempotency key/, /operation\.operationId/, /operation\.databaseCanisterId/, /MetricRow/]);
 assertNoAnyAs(operationPanel);
 
-assertMatches(responseSidebar, [/ResponseSidebar/, /ResponseMetricsPanel/, /canisterId/, /RoutedOperationPanel/, /canLoadRoutedOperation/, /onLoadRoutedOperation/, /UsageEventSummaryPanel/, /ShardPlacementPanel/, /shardPlacementStatus/, /onRefreshAllShardPlacements/, /ShardOperationJournalPanel/, /onReconcileShardOperation/, /ResponseAccessPanel/, /ResponseLifecyclePanel/]);
+assertMatches(responseSidebar, [/ResponseSidebar/, /ResponseMetricsPanel/, /canisterId/, /showHostedPanels/, /RoutedOperationPanel/, /canLoadRoutedOperation/, /onLoadRoutedOperation/, /UsageEventSummaryPanel/, /ShardPlacementPanel/, /shardPlacementStatus/, /onRefreshAllShardPlacements/, /ShardOperationJournalPanel/, /onReconcileShardOperation/, /ResponseAccessPanel/, /ResponseLifecyclePanel/]);
 assertNoAnyAs(responseSidebar);
 
 assertMatches(responseAdminPanels, [/ResponseAccessPanel/, /StorageQuotaPanel/, /TokenPanel/, /PermissionPanel/, /ResponseLifecyclePanel/, /BackupRestorePanel/, /selectedDatabaseStatus/, /onDownloadSqlDump/]);
@@ -529,6 +523,8 @@ assert.match(resourceRefresh, /useIcpdbResourceRefresh/);
 assert.match(resourceRefresh, /loadTable/);
 assert.match(resourceRefresh, /refreshDatabaseDetails/);
 assert.match(resourceRefresh, /refreshDatabaseAccount/);
+assert.match(resourceRefresh, /skipHostedResources/);
+assert.match(resourceRefresh, /if \(skipHostedResources\)/);
 assert.match(resourceRefresh, /describeTableAuthenticated/);
 assert.match(resourceRefresh, /previewTableAuthenticated/);
 assert.match(resourceRefresh, /getUsageAuthenticated/);
@@ -601,10 +597,12 @@ assert.match(databaseActions, /setSql\(newDatabaseStarterSql\)/);
 assert.match(databaseActions, /setView\("sql"\)/);
 assertNoAnyAs(databaseActions);
 
-assertMatches(controller, [/useIcpdbWorkbenchController/, /navigatorProps/, /toolbarProps/, /tableEditorProps/, /sqlEditorProps/, /responseSidebarProps/, /useIcpdbShardActions/, /useIcpdbWorkbenchState/, /useIcpdbResourceRefresh/, /useIcpdbAccountActions/, /useIcpdbBackupActions/, /useIcpdbBillingActions/, /useIcpdbTokenAdminActions/, /useIcpdbTokenBackupActions/, /useIcpdbTokenActions/, /useIcpdbWorkbenchDerivedState/, /openCreateTableSetupSql/, /openTableSelectSql/, /openTableColumnSql/, /openTableForeignKeySql/, /openTableInsertSql/, /openTablePageSql/, /openSchemaLookupSql/, /openSchemaSql/, /onOpenSetupSql: openCreateTableSetupSql/, /onOpenColumnSql: openTableColumnSql/, /onOpenForeignKeySql: openTableForeignKeySql/, /onOpenInsertSql: openTableInsertSql/, /onOpenPageSql: openTablePageSql/, /onOpenSchemaLookupSql: openSchemaLookupSql/, /onOpenSchemaSql: openSchemaSql/, /onOpenTableSql: openTableSelectSql/, /buildNewRowDraft/, /canWriteColumn/, /quoteSqlIdentifier/, /tablePageSelectSql/, /normalizeCreateTableName/, /normalizeCreateTableColumns/, /sqlite_schema/, /WHERE tbl_name = \?1 OR name = \?1/, /quoteSqlString/, /INSERT INTO/, /hello from ICPDB/, /SELECT \* FROM/, /PRAGMA table_xinfo/, /PRAGMA foreign_key_list/, /LIMIT \$\{tableLimit\}/, /setSql\(tablePageSelectSql\(nextTableName, limit, offset\)\)/, /function openSchemaSql\(source: string\) \{\n    state\.setMode\("batch"\);/, /function openSchemaLookupSql\(nextTableName: string\) \{\n    if \(!nextTableName\) return;\n    state\.setTableName\(nextTableName\);\n    state\.setMode\("query"\);/, /setSql\(source\)/, /setOperationId: state\.setOperationId/, /setRoutedOperation: state\.setRoutedOperation/, /canLoadRoutedOperation: Boolean\(tokenSession \|\| \(authClient && canisterId && databaseId\)\)/, /setMode: state\.setMode/, /setParamsJson: state\.setParamsJson/, /setSql: state\.setSql/, /setView: state\.setView/]);
+assertMatches(controller, [/useIcpdbWorkbenchController\(connection: ConsoleConnection\)/, /hostedMode = connection\.mode === "hosted"/, /skipHostedResources: !hostedMode/, /connectionMode: connection\.mode/, /showHostedPanels: hostedMode/, /navigatorProps/, /toolbarProps/, /tableEditorProps/, /sqlEditorProps/, /responseSidebarProps/, /useIcpdbShardActions/, /useIcpdbWorkbenchState/, /useIcpdbResourceRefresh/, /useIcpdbAccountActions/, /useIcpdbBackupActions/, /useIcpdbBillingActions/, /useIcpdbTokenAdminActions/, /useIcpdbTokenBackupActions/, /useIcpdbTokenActions/, /useIcpdbWorkbenchDerivedState/, /openCreateTableSetupSql/, /openTableSelectSql/, /openTableColumnSql/, /openTableForeignKeySql/, /openTableInsertSql/, /openTablePageSql/, /openSchemaLookupSql/, /openSchemaSql/, /onOpenSetupSql: openCreateTableSetupSql/, /onOpenColumnSql: openTableColumnSql/, /onOpenForeignKeySql: openTableForeignKeySql/, /onOpenInsertSql: openTableInsertSql/, /onOpenPageSql: openTablePageSql/, /onOpenSchemaLookupSql: openSchemaLookupSql/, /onOpenSchemaSql: openSchemaSql/, /onOpenTableSql: openTableSelectSql/, /buildNewRowDraft/, /canWriteColumn/, /quoteSqlIdentifier/, /tablePageSelectSql/, /normalizeCreateTableName/, /normalizeCreateTableColumns/, /sqlite_schema/, /WHERE tbl_name = \?1 OR name = \?1/, /quoteSqlString/, /INSERT INTO/, /hello from ICPDB/, /SELECT \* FROM/, /PRAGMA table_xinfo/, /PRAGMA foreign_key_list/, /LIMIT \$\{tableLimit\}/, /setSql\(tablePageSelectSql\(nextTableName, limit, offset\)\)/, /function openSchemaSql\(source: string\) \{\n    state\.setMode\("batch"\);/, /function openSchemaLookupSql\(nextTableName: string\) \{\n    if \(!nextTableName\) return;\n    state\.setTableName\(nextTableName\);\n    state\.setMode\("query"\);/, /setSql\(source\)/, /setOperationId: state\.setOperationId/, /setRoutedOperation: state\.setRoutedOperation/, /canLoadRoutedOperation: hostedMode && Boolean\(tokenSession \|\| \(authClient && canisterId && databaseId\)\)/, /setMode: state\.setMode/, /setParamsJson: state\.setParamsJson/, /setSql: state\.setSql/, /setView: state\.setView/]);
 assertNoAnyAs(controller);
 
 assert.match(derivedState, /useIcpdbWorkbenchDerivedState/);
+assert.match(derivedState, /connectionMode/);
+assert.match(derivedState, /isHostedMode/);
 assert.match(derivedState, /selectedDatabase/);
 assert.match(derivedState, /selectedTable/);
 assert.match(derivedState, /primaryKeyColumns/);
@@ -622,6 +620,9 @@ assert.match(derivedState, /value !== ANONYMOUS_PRINCIPAL/);
 assertNoAnyAs(derivedState);
 
 assert.match(sessionActions, /useIcpdbSessionActions/);
+assert.match(sessionActions, /adapterDatabaseSummary/);
+assert.match(sessionActions, /connection\.mode === "adapter"/);
+assert.match(sessionActions, /setShardPlacementStatus\("Adapter mode"\)/);
 assert.match(sessionActions, /AuthClient\.create/);
 assert.match(sessionActions, /listDatabasesAuthenticated/);
 assert.match(sessionActions, /listDatabasePlacementsAuthenticated/);

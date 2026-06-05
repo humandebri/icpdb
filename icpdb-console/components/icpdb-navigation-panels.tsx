@@ -8,6 +8,7 @@ import { DatabaseList } from "@/components/icpdb-database-list-panel";
 import { CanisterField } from "@/components/icpdb-display-panels";
 import { TableList } from "@/components/icpdb-table-list-panel";
 import { TokenSessionPanel, type TokenSessionPanelProps } from "@/components/icpdb-token-session-panel";
+import type { ConsoleConnectionMode } from "@/lib/console-connection";
 import type { WorkbenchView } from "@/lib/use-icpdb-sql-actions";
 import type {
   DatabaseSummary,
@@ -20,6 +21,7 @@ type DatabaseNavigatorProps = {
   canCreateTable: boolean;
   canOpenSetupSql: boolean;
   canisterId: string;
+  connectionMode: ConsoleConnectionMode;
   createTableColumns: string;
   createTableName: string;
   databaseId: string;
@@ -58,6 +60,7 @@ export function DatabaseNavigator(props: DatabaseNavigatorProps) {
     canCreateTable,
     canOpenSetupSql,
     canisterId,
+    connectionMode,
     createTableColumns,
     createTableName,
     databaseId,
@@ -79,8 +82,9 @@ export function DatabaseNavigator(props: DatabaseNavigatorProps) {
   return (
     <aside className="space-y-3">
       <CanisterField label="Canister" value={canisterId || "not configured"} />
+      <CanisterField label="Mode" value={connectionMode} />
       {principal ? <CanisterField label="Principal" value={principal} /> : null}
-      <TokenSessionPanel {...tokenSession} />
+      {connectionMode === "hosted" ? <TokenSessionPanel {...tokenSession} /> : null}
       <select
         className="w-full rounded-md border border-[#c9ced8] bg-white px-3 py-2 text-sm text-[#182230]"
         disabled={!principal || databases.length === 0}

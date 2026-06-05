@@ -36,6 +36,7 @@ import type {
 type ResourceRefreshOptions = {
   canisterId: string;
   databases: DatabaseSummary[];
+  skipHostedResources: boolean;
   tableLimit: number;
   tableName: string;
   resetRowEditor: () => void;
@@ -59,6 +60,7 @@ export function useIcpdbResourceRefresh(options: ResourceRefreshOptions) {
   const {
     canisterId,
     databases,
+    skipHostedResources,
     tableLimit,
     tableName,
     resetRowEditor,
@@ -104,6 +106,26 @@ export function useIcpdbResourceRefresh(options: ResourceRefreshOptions) {
   const refreshDatabaseDetails = useCallback(
     async (client: AuthClient, nextDatabaseId: string, preferredTableName: string) => {
       const identity = client.getIdentity();
+      if (skipHostedResources) {
+        const nextTables = await listTablesAuthenticated(canisterId, identity, nextDatabaseId);
+        setUsage(null);
+        setUsageEvents([]);
+        setBilling(null);
+        setTokens([]);
+        setMembers([]);
+        setPayments([]);
+        setQuotaBytes("");
+        setTables(nextTables);
+        const nextTableName = selectPreferredTableName(nextTables, preferredTableName);
+        if (!nextTableName) {
+          setTableName("");
+          setTableDescription(null);
+          setTablePreview(null);
+          return;
+        }
+        await loadTable(client, nextDatabaseId, nextTableName, 0);
+        return;
+      }
       const shouldLoadOwnerResources = canLoadOwnerResources(databases, nextDatabaseId);
       const [nextUsage, nextUsageEvents, nextBilling, nextTokens, nextMembers, nextPayments, nextTables] = await Promise.all([
         getUsageAuthenticated(canisterId, identity, nextDatabaseId),
@@ -135,6 +157,7 @@ export function useIcpdbResourceRefresh(options: ResourceRefreshOptions) {
       canisterId,
       databases,
       loadTable,
+      skipHostedResources,
       setBilling,
       setMembers,
       setPayments,
@@ -152,6 +175,23 @@ export function useIcpdbResourceRefresh(options: ResourceRefreshOptions) {
   const refreshDatabaseAccount = useCallback(
     async (client: AuthClient, nextDatabaseId: string) => {
       const identity = client.getIdentity();
+      if (skipHostedResources) {
+        setUsage(null);
+        setUsageEvents([]);
+        setBilling(null);
+        setTokens([]);
+        setMembers([]);
+        setPayments([]);
+        setQuotaBytes("");
+        setTables([]);
+        setTableName("");
+        setTableOffset(0);
+        setTableDescription(null);
+        setTablePreview(null);
+        setSelectedRowIndex(null);
+        setRowJson("{}");
+        return;
+      }
       const shouldLoadOwnerResources = canLoadOwnerResources(databases, nextDatabaseId);
       const [nextUsage, nextUsageEvents, nextBilling, nextTokens, nextMembers, nextPayments] = await Promise.all([
         getUsageAuthenticated(canisterId, identity, nextDatabaseId),
@@ -179,6 +219,7 @@ export function useIcpdbResourceRefresh(options: ResourceRefreshOptions) {
     [
       canisterId,
       databases,
+      skipHostedResources,
       setBilling,
       setMembers,
       setPayments,
