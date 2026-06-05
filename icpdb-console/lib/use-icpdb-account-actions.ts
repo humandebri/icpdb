@@ -21,6 +21,7 @@ import type {
   DatabaseTokenScope,
   DatabaseUsage
 } from "@/lib/types";
+import { normalizeMemberPrincipalInput } from "@/lib/workbench-state";
 
 type LoadState = "idle" | "loading" | "ready" | "error";
 
@@ -37,6 +38,7 @@ type AccountActionOptions = {
   tokenScope: DatabaseTokenScope;
   memberPrincipal: string;
   memberRole: DatabaseRole;
+  members: DatabaseMember[];
   quotaBytes: string;
   setError: Dispatch<SetStateAction<string | null>>;
   setIssuedToken: Dispatch<SetStateAction<string | null>>;
@@ -62,6 +64,7 @@ export function useIcpdbAccountActions(options: AccountActionOptions) {
     tokenScope,
     memberPrincipal,
     memberRole,
+    members,
     quotaBytes,
     setError,
     setIssuedToken,
@@ -129,7 +132,7 @@ export function useIcpdbAccountActions(options: AccountActionOptions) {
     setError(null);
     try {
       const identity = authClient.getIdentity();
-      await grantDatabaseAccessAuthenticated(canisterId, identity, databaseId, memberPrincipal.trim(), memberRole);
+      await grantDatabaseAccessAuthenticated(canisterId, identity, databaseId, normalizeMemberPrincipalInput(memberPrincipal), memberRole);
       setMembers(await listDatabaseMembersAuthenticated(canisterId, identity, databaseId));
       setMemberPrincipal("");
       setLoadState("ready");
@@ -141,6 +144,7 @@ export function useIcpdbAccountActions(options: AccountActionOptions) {
 
   async function revokeMember(member: DatabaseMember) {
     if (!authClient || !canMutateMembers || !databaseId || !canisterId || member.principal === principal) return;
+    if (isLastOwnerMember(member, members)) return;
     setLoadState("loading");
     setError(null);
     try {
@@ -170,6 +174,10 @@ export function useIcpdbAccountActions(options: AccountActionOptions) {
   }
 
   return { createReadToken, createToken, grantMember, revokeMember, revokeToken, setQuota };
+}
+
+function isLastOwnerMember(member: DatabaseMember, members: DatabaseMember[]): boolean {
+  return member.role === "owner" && members.filter((item) => item.role === "owner").length <= 1;
 }
 
 function errorMessage(cause: unknown): string {

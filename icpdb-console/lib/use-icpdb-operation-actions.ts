@@ -4,12 +4,17 @@
 // Routed operation lookup actions: keep remote write status inspection separate from SQL execution.
 
 import type { Dispatch, SetStateAction } from "react";
+import type { AuthClient } from "@icp-sdk/auth/client";
+import { getRoutedOperationAuthenticated } from "@/lib/icpdb-client";
 import { getRoutedOperationWithToken, type IcpdbTokenSession } from "@/lib/icpdb-http-client";
 import type { RoutedOperationInfo } from "@/lib/types";
 
 type LoadState = "idle" | "loading" | "ready" | "error";
 
 type OperationActionOptions = {
+  authClient: AuthClient | null;
+  canisterId: string;
+  databaseId: string;
   operationId: string;
   tokenSession: IcpdbTokenSession | null;
   setError: Dispatch<SetStateAction<string | null>>;
@@ -19,7 +24,17 @@ type OperationActionOptions = {
 };
 
 export function useIcpdbOperationActions(options: OperationActionOptions) {
-  const { operationId, tokenSession, setError, setLoadState, setOperationStatus, setRoutedOperation } = options;
+  const {
+    authClient,
+    canisterId,
+    databaseId,
+    operationId,
+    tokenSession,
+    setError,
+    setLoadState,
+    setOperationStatus,
+    setRoutedOperation
+  } = options;
 
   function clearRoutedOperation() {
     setRoutedOperation(null);
@@ -27,7 +42,7 @@ export function useIcpdbOperationActions(options: OperationActionOptions) {
   }
 
   async function loadRoutedOperation() {
-    if (!tokenSession) return;
+    if (!tokenSession && (!authClient || !canisterId || !databaseId)) return;
     const nextOperationId = operationId.trim();
     if (!nextOperationId) {
       setOperationStatus("Operation id required");
@@ -36,7 +51,9 @@ export function useIcpdbOperationActions(options: OperationActionOptions) {
     setLoadState("loading");
     setError(null);
     try {
-      const operation = await getRoutedOperationWithToken(tokenSession, nextOperationId);
+      const operation = tokenSession
+        ? await getRoutedOperationWithToken(tokenSession, nextOperationId)
+        : await getRoutedOperationAuthenticated(canisterId, requireIdentity(), databaseId, nextOperationId);
       setRoutedOperation(operation);
       setOperationStatus(`Operation ${operation.status}`);
       setLoadState("ready");
@@ -47,4 +64,11 @@ export function useIcpdbOperationActions(options: OperationActionOptions) {
   }
 
   return { clearRoutedOperation, loadRoutedOperation };
+
+  function requireIdentity() {
+    if (!authClient || !canisterId || !databaseId) {
+      throw new Error("Login and database required");
+    }
+    return authClient.getIdentity();
+  }
 }

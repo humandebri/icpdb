@@ -38,6 +38,30 @@ export function formatCreatedDatabase(value) {
   }]);
 }
 
+export function formatCreatedDatabaseEnv(value, command) {
+  const canisterId = requiredNonEmptyString(command.canisterId, "canisterId");
+  const networkUrl = requiredNonEmptyString(command.networkUrl, "networkUrl");
+  const databaseId = requiredNonEmptyString(value.database_id, "databaseId");
+  const ownerToken = requiredNonEmptyString(value.owner_token?.token, "ownerToken");
+  const env = {
+    ICPDB_CANISTER_ID: canisterId,
+    ICPDB_NETWORK_URL: networkUrl,
+    ICPDB_DATABASE_ID: databaseId,
+    ICPDB_URL: `icpdb://${canisterId}/${encodeURIComponent(databaseId)}`,
+    ICPDB_TOKEN: ownerToken
+  };
+  if (command.rootKey) env.ICPDB_ROOT_KEY = command.rootKey;
+  if (command.baseUrl) env.ICPDB_HTTP_BASE_URL = command.baseUrl;
+  return Object.entries(env).map(([key, nextValue]) => `${key}=${JSON.stringify(nextValue)}`).join("\n");
+}
+
+function requiredNonEmptyString(value, label) {
+  if (typeof value !== "string") throw new Error(`${label} must be a non-empty string`);
+  const trimmed = value.trim();
+  if (trimmed.length === 0) throw new Error(`${label} must be a non-empty string`);
+  return trimmed;
+}
+
 export function formatCreatedToken(value) {
   const info = value.info ?? {};
   return formatRecordTable([{ token: value.token, ...tokenRecord(info) }]);

@@ -3,7 +3,7 @@
 // icpdb-console/components/icpdb-result-grid.tsx
 // SQL result grids and spreadsheet-style table grid rendering.
 
-import { Download, Search } from "lucide-react";
+import { Check, Copy, Download, Search } from "lucide-react";
 import { useMemo, useState } from "react";
 import type { SqlExecuteResponse, SqlValue } from "@/lib/types";
 import { DataGrid } from "@/components/icpdb-data-grid";
@@ -11,11 +11,12 @@ import {
   downloadSqlRowsCsv,
   filterResultRows,
   nextColumnSort,
+  sqlRowsCsv,
   sortResultRows,
   type GridColumnSort,
 } from "@/lib/result-grid-helpers";
 export { DataGrid } from "@/components/icpdb-data-grid";
-export { downloadSqlRowsCsv, downloadTextFile, formatSqlValue, type GridColumnSort, type GridColumnSortDirection } from "@/lib/result-grid-helpers";
+export { downloadSqlRowsCsv, downloadTextFile, formatSqlValue, sqlRowsCsv, type GridColumnSort, type GridColumnSortDirection } from "@/lib/result-grid-helpers";
 
 export function ResultTable({
   emptyLabel = "(no rows)",
@@ -34,6 +35,7 @@ export function ResultTable({
 }) {
   const [resultSearch, setResultSearch] = useState("");
   const [resultColumnSort, setResultColumnSort] = useState<GridColumnSort | null>(null);
+  const [copiedResultCsv, setCopiedResultCsv] = useState(false);
   const visibleRowEntries = useMemo(
     () => sortResultRows(filterResultRows(response.columns, response.rows, resultSearch), response.columns, resultColumnSort),
     [response.columns, response.rows, resultColumnSort, resultSearch]
@@ -41,6 +43,12 @@ export function ResultTable({
   const visibleRows = useMemo(() => visibleRowEntries.map((entry) => entry.row), [visibleRowEntries]);
   const visibleRowNumbers = useMemo(() => visibleRowEntries.map((entry) => entry.rowNumber), [visibleRowEntries]);
   const resultCountLabel = resultSearch.trim() ? `${visibleRows.length}/${response.rows.length}` : String(response.rows.length);
+  async function copyResultCsv() {
+    await navigator.clipboard.writeText(sqlRowsCsv(response.columns, visibleRows));
+    setCopiedResultCsv(true);
+    window.setTimeout(() => setCopiedResultCsv(false), 1200);
+  }
+
   return (
     <div>
       {response.rows.length > 0 ? (
@@ -56,6 +64,14 @@ export function ResultTable({
             />
             <span className="font-mono text-[#667085]">{resultCountLabel}</span>
           </label>
+          <button
+            className="inline-flex h-9 items-center gap-2 rounded-md border border-[#c9ced8] bg-white px-3 text-xs font-medium text-[#344054]"
+            type="button"
+            onClick={copyResultCsv}
+          >
+            {copiedResultCsv ? <Check aria-hidden size={14} /> : <Copy aria-hidden size={14} />}
+            <span>{copiedResultCsv ? "Copied result CSV" : "Copy result CSV"}</span>
+          </button>
           <button
             className="inline-flex h-9 items-center gap-2 rounded-md border border-[#c9ced8] bg-white px-3 text-xs font-medium text-[#344054]"
             type="button"
@@ -82,12 +98,13 @@ export function SqlResultSummary({ response }: { response: SqlExecuteResponse })
   return (
     <div className="rounded-md border border-[#d5d9e2] bg-white p-3">
       <h3 className="text-sm font-semibold">SQL result</h3>
-      <dl className="mt-3 grid gap-3 text-xs sm:grid-cols-5">
+      <dl className="mt-3 grid gap-3 text-xs sm:grid-cols-6">
         <ResultMetric label="Rows" value={String(response.rows.length)} />
         <ResultMetric label="Columns" value={String(response.columns.length)} />
         <ResultMetric label="Affected" value={response.rowsAffected} />
         <ResultMetric label="Rowid" value={response.lastInsertRowId} />
         <ResultMetric label="Truncated" value={response.truncated ? "yes" : "no"} />
+        <ResultMetric label="Operation" value={response.routedOperationId ?? "none"} />
       </dl>
     </div>
   );
@@ -110,7 +127,8 @@ export function BatchResultList({ responses }: { responses: SqlExecuteResponse[]
               <th className="border-b border-[#eef1f5] py-2 pr-3 font-medium">Affected</th>
               <th className="border-b border-[#eef1f5] py-2 pr-3 font-medium">Rowid</th>
               <th className="border-b border-[#eef1f5] py-2 pr-3 font-medium">Grid</th>
-              <th className="border-b border-[#eef1f5] py-2 font-medium">Truncated</th>
+              <th className="border-b border-[#eef1f5] py-2 pr-3 font-medium">Truncated</th>
+              <th className="border-b border-[#eef1f5] py-2 font-medium">Operation</th>
             </tr>
           </thead>
           <tbody>
@@ -122,7 +140,8 @@ export function BatchResultList({ responses }: { responses: SqlExecuteResponse[]
                 <td className="border-b border-[#f2f4f7] py-2 pr-3 font-mono">{nextResponse.rowsAffected}</td>
                 <td className="border-b border-[#f2f4f7] py-2 pr-3 font-mono">{nextResponse.lastInsertRowId}</td>
                 <td className="border-b border-[#f2f4f7] py-2 pr-3">{nextResponse.columns.length > 0 ? "yes" : "no"}</td>
-                <td className="border-b border-[#f2f4f7] py-2">{nextResponse.truncated ? "yes" : "no"}</td>
+                <td className="border-b border-[#f2f4f7] py-2 pr-3">{nextResponse.truncated ? "yes" : "no"}</td>
+                <td className="border-b border-[#f2f4f7] py-2 font-mono">{nextResponse.routedOperationId ?? "none"}</td>
               </tr>
             ))}
           </tbody>

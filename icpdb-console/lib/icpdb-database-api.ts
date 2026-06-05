@@ -6,12 +6,14 @@ import { callIcpdb, createAuthenticatedActor, throwCanisterError } from "@/lib/i
 import {
   normalizeDatabaseShardPlacement,
   normalizeDatabaseSummary,
+  normalizeRoutedOperationInfo,
   normalizeShardOperationInfo,
   rawShardOperationReconcileRequest
 } from "@/lib/icpdb-database-codec";
 import type {
   DatabaseShardPlacement,
   DatabaseSummary,
+  RoutedOperationInfo,
   ShardOperationInfo,
   ShardOperationReconcileRequest
 } from "@/lib/types";
@@ -49,6 +51,20 @@ export async function listShardOperationsAuthenticated(canisterId: string, ident
     const result = await actor.list_shard_operations();
     if ("Err" in result) throwCanisterError(result.Err);
     return result.Ok.map(normalizeShardOperationInfo);
+  });
+}
+
+export async function getRoutedOperationAuthenticated(
+  canisterId: string,
+  identity: Identity,
+  databaseId: string,
+  operationId: string
+): Promise<RoutedOperationInfo> {
+  return callIcpdb(async () => {
+    const actor = await createAuthenticatedActor(canisterId, identity);
+    const result = await actor.get_routed_operation({ database_id: databaseId, operation_id: operationId });
+    if ("Err" in result) throwCanisterError(result.Err);
+    return normalizeRoutedOperationInfo(result.Ok);
   });
 }
 

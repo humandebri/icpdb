@@ -58,3 +58,13 @@ export function sqlValueToDisplay(value) {
   if (Object.hasOwn(value, "Blob")) return `<${value.Blob.length} bytes>`;
   return JSON.stringify(value);
 }
+
+export function sqlScalarRecord(result) {
+  return {
+    column: result.column ?? "",
+    value: result.row_found ? sqlValueToDisplay(result.value) : "",
+    row_found: result.row_found ? "yes" : "no",
+    rows_returned: result.rows_returned ?? 0,
+    truncated: result.truncated ? "yes" : "no"
+  };
+}

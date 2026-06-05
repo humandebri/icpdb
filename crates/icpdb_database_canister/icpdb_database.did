@@ -120,16 +120,19 @@ type SqlBatchRequest = record {
   max_rows : opt nat32;
   database_id : text;
   statements : vec SqlStatement;
+  idempotency_key : opt text;
 };
 type SqlExecuteRequest = record {
   sql : text;
   max_rows : opt nat32;
   database_id : text;
   params : vec SqlValue;
+  idempotency_key : opt text;
 };
 type SqlExecuteResponse = record {
   truncated : bool;
   rows : vec vec SqlValue;
+  routed_operation_id : opt text;
   rows_affected : nat64;
   last_insert_rowid : int64;
   columns : vec text;

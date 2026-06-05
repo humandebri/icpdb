@@ -21,6 +21,7 @@ import {
 import { parseTableLimit } from "@/lib/workbench-state";
 import type {
   DatabaseColumn,
+  RoutedOperationInfo,
   SqlExecuteResponse,
   SqlValue,
   TableDescription,
@@ -53,8 +54,11 @@ type TableActionOptions = {
   setCellValue: Dispatch<SetStateAction<string>>;
   setError: Dispatch<SetStateAction<string | null>>;
   setLoadState: Dispatch<SetStateAction<LoadState>>;
+  setOperationId: Dispatch<SetStateAction<string>>;
+  setOperationStatus: Dispatch<SetStateAction<string>>;
   setResponse: Dispatch<SetStateAction<SqlExecuteResponse | null>>;
   setRowJson: Dispatch<SetStateAction<string>>;
+  setRoutedOperation: Dispatch<SetStateAction<RoutedOperationInfo | null>>;
   setSelectedCellColumnName: Dispatch<SetStateAction<string>>;
   setSelectedRowIndex: Dispatch<SetStateAction<number | null>>;
   setTableLimit: Dispatch<SetStateAction<number>>;
@@ -87,8 +91,11 @@ export function useIcpdbTableActions(options: TableActionOptions) {
     setCellValue,
     setError,
     setLoadState,
+    setOperationId,
+    setOperationStatus,
     setResponse,
     setRowJson,
+    setRoutedOperation,
     setSelectedCellColumnName,
     setSelectedRowIndex,
     setTableLimit,
@@ -130,6 +137,7 @@ export function useIcpdbTableActions(options: TableActionOptions) {
           : buildSelectedRowMutationRequest(databaseId, tableDescription, tablePreview, selectedRowIndex, rowJson, mutation);
       const nextResponse = await sqlExecuteAuthenticated(canisterId, authClient.getIdentity(), request);
       setResponse(nextResponse);
+      recordSqlResponseOperation(nextResponse);
       await refreshDatabaseDetails(authClient, databaseId, tableName);
       resetRowEditor();
       setLoadState("ready");
@@ -154,6 +162,7 @@ export function useIcpdbTableActions(options: TableActionOptions) {
       );
       const nextResponse = await sqlExecuteAuthenticated(canisterId, authClient.getIdentity(), request);
       setResponse(nextResponse);
+      recordSqlResponseOperation(nextResponse);
       await refreshDatabaseDetails(authClient, databaseId, tableName);
       resetRowEditor();
       setLoadState("ready");
@@ -243,6 +252,13 @@ export function useIcpdbTableActions(options: TableActionOptions) {
     startNewRow,
     updateCell
   };
+
+  function recordSqlResponseOperation(response: SqlExecuteResponse) {
+    if (!response.routedOperationId) return;
+    setOperationId(response.routedOperationId);
+    setOperationStatus("Last write operation");
+    setRoutedOperation(null);
+  }
 }
 
 function preferredCellColumnName(columns: DatabaseColumn[], currentColumnName: string): string {

@@ -3,15 +3,16 @@
 // icpdb-console/components/icpdb-table-data-panel.tsx
 // Current-page Table Editor grid controls, pagination, row search state, and cell edit wiring.
 
-import { ChevronLeft, ChevronRight, Download, RefreshCw, Search } from "lucide-react";
+import { Check, ChevronLeft, ChevronRight, Copy, Download, RefreshCw, Search } from "lucide-react";
 import { useMemo, useState } from "react";
 import {
   DataGrid,
   EmptyPanel,
   downloadSqlRowsCsv,
+  sqlRowsCsv,
   type GridColumnSort
 } from "@/components/icpdb-display-panels";
-import { activeVisibleRowIndex, filterPreviewRows, nextColumnSort, sortPreviewRows, tableCsvFileName } from "@/lib/table-data-helpers";
+import { activeVisibleRowIndex, filterPreviewRows, nextColumnSort, sortPreviewRows, tableCsvFileName, tablePageSelectSql } from "@/lib/table-data-helpers";
 import { hasNextTablePage, tableLimitOptions, tablePageLabel } from "@/lib/workbench-state";
 import type { DatabaseColumn, DatabaseTable, TableDescription, TablePreviewResponse } from "@/lib/types";
 
@@ -30,6 +31,7 @@ type TableDataPanelProps = {
   onCellValueChange: (value: string) => void;
   onChangeTableLimit: (value: string) => void;
   onLoadTablePage: (offset: number) => void;
+  onOpenPageSql: (tableName: string, limit: number, offset: number) => void;
   onSelectPreviewCell: (rowIndex: number, columnName: string) => void;
   onSelectPreviewRow: (rowIndex: number) => void;
   onUpdateCell: () => void;
@@ -39,6 +41,8 @@ export function TableDataPanel(props: TableDataPanelProps) {
   const { canUpdateCell, cellValue, editableColumns, loadState, selectedCellColumnName, selectedRowIndex, selectedTable, tableDescription, tableLimit, tableOffset, tablePreview } = props;
   const [tableRowSearch, setTableRowSearch] = useState("");
   const [columnSort, setColumnSort] = useState<GridColumnSort | null>(null);
+  const [copiedPageSql, setCopiedPageSql] = useState(false);
+  const [copiedTableCsv, setCopiedTableCsv] = useState(false);
   const previewColumns = useMemo(() => tablePreview?.columns ?? [], [tablePreview]);
   const previewRows = useMemo(() => tablePreview?.rows ?? [], [tablePreview]);
   const visibleRowEntries = useMemo(
@@ -50,6 +54,21 @@ export function TableDataPanel(props: TableDataPanelProps) {
   const activeSelectedRowIndex = activeVisibleRowIndex(selectedRowIndex, visibleRowEntries);
   const isFilteringRows = tableRowSearch.trim().length > 0;
   const rowCountLabel = isFilteringRows && tablePreview ? `${visibleRowEntries.length}/${previewRows.length}` : String(previewRows.length);
+  const pageSqlLabel = selectedTable && tablePreview
+    ? `Open page SQL for ${selectedTable.name} limit ${tableLimit} offset ${tablePreview.offset}`
+    : "Open page SQL";
+  const currentPageSql = selectedTable && tablePreview ? tablePageSelectSql(selectedTable.name, tableLimit, tablePreview.offset) : "";
+  async function copyPageSql() {
+    if (!currentPageSql) return;
+    await navigator.clipboard.writeText(currentPageSql);
+    setCopiedPageSql(true);
+    window.setTimeout(() => setCopiedPageSql(false), 1200);
+  }
+  async function copyTableCsv() {
+    await navigator.clipboard.writeText(sqlRowsCsv(previewColumns, visibleRows));
+    setCopiedTableCsv(true);
+    window.setTimeout(() => setCopiedTableCsv(false), 1200);
+  }
 
   return (
     <section className="rounded-md border border-[#d5d9e2] bg-white">
@@ -68,6 +87,40 @@ export function TableDataPanel(props: TableDataPanelProps) {
               />
               <span className="font-mono text-[#667085]">{rowCountLabel}</span>
             </label>
+          ) : null}
+          {tablePreview ? (
+            <button
+              aria-label={pageSqlLabel}
+              className="inline-flex h-8 items-center gap-1 rounded-md border border-[#c9ced8] bg-white px-2 text-xs font-medium text-[#344054]"
+              title="Open page SQL"
+              type="button"
+              onClick={() => props.onOpenPageSql(selectedTable?.name ?? "", tableLimit, tablePreview.offset)}
+            >
+              <Search aria-hidden size={14} />
+              <span>Open page SQL</span>
+            </button>
+          ) : null}
+          {tablePreview ? (
+            <button
+              aria-label={selectedTable && tablePreview ? `Copy page SQL for ${selectedTable.name} limit ${tableLimit} offset ${tablePreview.offset}` : "Copy page SQL"}
+              className="inline-flex h-8 items-center gap-1 rounded-md border border-[#c9ced8] bg-white px-2 text-xs font-medium text-[#344054]"
+              title={copiedPageSql ? "Copied" : "Copy page SQL"}
+              type="button"
+              onClick={() => void copyPageSql()}
+            >
+              {copiedPageSql ? <Check aria-hidden size={14} /> : <Copy aria-hidden size={14} />}
+              <span>{copiedPageSql ? "Copied page SQL" : "Copy page SQL"}</span>
+            </button>
+          ) : null}
+          {tablePreview && previewRows.length > 0 ? (
+            <button
+              className="inline-flex h-8 items-center gap-1 rounded-md border border-[#c9ced8] bg-white px-2 text-xs font-medium text-[#344054]"
+              type="button"
+              onClick={() => void copyTableCsv()}
+            >
+              {copiedTableCsv ? <Check aria-hidden size={14} /> : <Copy aria-hidden size={14} />}
+              <span>{copiedTableCsv ? "Copied table CSV" : "Copy table CSV"}</span>
+            </button>
           ) : null}
           {tablePreview && previewRows.length > 0 ? (
             <button

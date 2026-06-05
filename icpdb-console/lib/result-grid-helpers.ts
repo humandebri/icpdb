@@ -25,6 +25,10 @@ export function downloadSqlRowsCsv(columns: string[], rows: SqlValue[][], fileNa
   downloadTextFile(buildResultCsv(columns, rows), fileName, "text/csv;charset=utf-8");
 }
 
+export function sqlRowsCsv(columns: string[], rows: SqlValue[][]): string {
+  return buildResultCsv(columns, rows);
+}
+
 export function downloadTextFile(data: string, fileName: string, type: string) {
   const blob = new Blob([data], { type });
   const url = URL.createObjectURL(blob);

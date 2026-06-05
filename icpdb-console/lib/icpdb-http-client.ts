@@ -36,67 +36,67 @@ export type IcpdbWriteOptions = {
 };
 
 export async function getSessionInfoWithToken(session: IcpdbTokenSession): Promise<IcpdbTokenSessionInfo> {
-  return normalizeSessionInfo(await postJson(session, "/v1/session", { database_id: session.databaseId }));
+  return normalizeSessionInfo(await postJson(session, "/v1/session", { database_id: sessionDatabaseId(session) }));
 }
 
 export async function getUsageWithToken(session: IcpdbTokenSession): Promise<DatabaseUsage> {
-  return normalizeUsage(await postJson(session, "/v1/usage", { database_id: session.databaseId }));
+  return normalizeUsage(await postJson(session, "/v1/usage", { database_id: sessionDatabaseId(session) }));
 }
 
 export async function getUsageEventsWithToken(session: IcpdbTokenSession): Promise<DatabaseUsageEventSummary[]> {
-  const value = await postJson(session, "/v1/usage/events", { database_id: session.databaseId });
+  const value = await postJson(session, "/v1/usage/events", { database_id: sessionDatabaseId(session) });
   return arrayValue(value, "usage events").map(normalizeUsageEvent);
 }
 
 export async function getRoutedOperationWithToken(session: IcpdbTokenSession, operationId: string): Promise<RoutedOperationInfo> {
   return normalizeRoutedOperation(await postJson(session, "/v1/operations/get", {
-    database_id: session.databaseId,
-    operation_id: operationId
+    database_id: sessionDatabaseId(session),
+    operation_id: requiredClientString(operationId, "operation_id")
   }));
 }
 
 export async function listTablesWithToken(session: IcpdbTokenSession): Promise<DatabaseTable[]> {
-  const value = await postJson(session, "/v1/tables/list", { database_id: session.databaseId });
+  const value = await postJson(session, "/v1/tables/list", { database_id: sessionDatabaseId(session) });
   return arrayValue(value, "tables").map(normalizeTable);
 }
 
 export async function describeTableWithToken(session: IcpdbTokenSession, tableName: string): Promise<TableDescription> {
   return normalizeDescription(await postJson(session, "/v1/tables/describe", {
-    database_id: session.databaseId,
-    table_name: tableName
+    database_id: sessionDatabaseId(session),
+    table_name: requiredClientString(tableName, "table_name")
   }));
 }
 
 export async function previewTableWithToken(session: IcpdbTokenSession, request: TablePreviewRequest): Promise<TablePreviewResponse> {
   return normalizePreview(await postJson(session, "/v1/tables/preview", {
-    database_id: session.databaseId,
-    table_name: request.tableName,
+    database_id: requestDatabaseId(session, request.databaseId),
+    table_name: requiredClientString(request.tableName, "table_name"),
     limit: request.limit ?? 100,
     offset: request.offset ?? 0
   }));
 }
 
 export async function sqlQueryWithToken(session: IcpdbTokenSession, request: SqlExecuteRequest): Promise<SqlExecuteResponse> {
-  return normalizeSqlResponse(await postJson(session, "/v1/sql/query", sqlRequestBody(request)));
+  return normalizeSqlResponse(await postJson(session, "/v1/sql/query", sqlRequestBody(session, request)));
 }
 
 export async function sqlExecuteWithToken(session: IcpdbTokenSession, request: SqlExecuteRequest, options?: IcpdbWriteOptions): Promise<SqlExecuteResponse> {
-  const idempotencyKey = nextIdempotencyKey("sql_execute", request.databaseId);
+  const body = sqlRequestBody(session, request);
+  const idempotencyKey = writeIdempotencyKey("sql_execute", body.database_id, request.idempotencyKey);
   options?.onIdempotencyKey?.(idempotencyKey);
-  return normalizeSqlResponse(await postJson(session, "/v1/sql/execute", sqlRequestBody(request), {
+  return normalizeSqlResponse(await postJson(session, "/v1/sql/execute", body, {
     "idempotency-key": idempotencyKey
   }));
 }
 
 export async function sqlBatchWithToken(session: IcpdbTokenSession, request: SqlBatchRequest, options?: IcpdbWriteOptions): Promise<SqlExecuteResponse[]> {
-  const idempotencyKey = nextIdempotencyKey("sql_batch", request.databaseId);
+  const databaseId = requestDatabaseId(session, request.databaseId);
+  const statements = request.statements.map(sqlStatementBody);
+  const idempotencyKey = writeIdempotencyKey("sql_batch", databaseId, request.idempotencyKey);
   options?.onIdempotencyKey?.(idempotencyKey);
   const value = await postJson(session, "/v1/sql/batch", {
-    database_id: session.databaseId,
-    statements: request.statements.map((statement) => ({
-      sql: statement.sql,
-      params: statement.params.map(sqlValueBody)
-    })),
+    database_id: databaseId,
+    statements,
     max_rows: request.maxRows
   }, {
     "idempotency-key": idempotencyKey
@@ -105,10 +105,12 @@ export async function sqlBatchWithToken(session: IcpdbTokenSession, request: Sql
 }
 
 async function postJson(session: IcpdbTokenSession, path: string, body: unknown, extraHeaders?: Record<string, string>): Promise<unknown> {
-  const response = await fetch(`${session.baseUrl.replace(/\/+$/, "")}${path}`, {
+  const baseUrl = sessionBaseUrl(session);
+  const token = sessionToken(session);
+  const response = await fetch(`${baseUrl.replace(/\/+$/, "")}${path}`, {
     method: "POST",
     headers: {
-      authorization: `Bearer ${session.token}`,
+      authorization: `Bearer ${token}`,
       "content-type": "application/json",
       ...extraHeaders
     },
@@ -125,13 +127,55 @@ function nextIdempotencyKey(operation: string, databaseId: string): string {
   return `icpdb-web-${operation}-${databaseId}-${crypto.randomUUID()}`;
 }
 
-function sqlRequestBody(request: SqlExecuteRequest) {
+function writeIdempotencyKey(operation: string, databaseId: string, idempotencyKey: string | null | undefined): string {
+  return optionalClientString(idempotencyKey, "idempotencyKey") ?? nextIdempotencyKey(operation, databaseId);
+}
+
+function sqlRequestBody(session: IcpdbTokenSession, request: SqlExecuteRequest) {
   return {
-    database_id: request.databaseId,
-    sql: request.sql,
+    database_id: requestDatabaseId(session, request.databaseId),
+    sql: requiredClientString(request.sql, "SQL text"),
     params: request.params.map(sqlValueBody),
     max_rows: request.maxRows
   };
+}
+
+function sqlStatementBody(statement: SqlBatchRequest["statements"][number]) {
+  return {
+    sql: requiredClientString(statement.sql, "SQL text"),
+    params: statement.params.map(sqlValueBody)
+  };
+}
+
+function sessionBaseUrl(session: IcpdbTokenSession): string {
+  return requiredClientString(session.baseUrl, "HTTP base URL");
+}
+
+function sessionToken(session: IcpdbTokenSession): string {
+  return requiredClientString(session.token, "api token");
+}
+
+function sessionDatabaseId(session: IcpdbTokenSession): string {
+  return requiredClientString(session.databaseId, "token session database_id");
+}
+
+function requestDatabaseId(session: IcpdbTokenSession, databaseId: string): string {
+  const requestDatabaseIdValue = requiredClientString(databaseId, "request database_id");
+  const normalizedSessionDatabaseId = sessionDatabaseId(session);
+  if (requestDatabaseIdValue !== normalizedSessionDatabaseId) throw new Error("request database_id must match token session database_id");
+  return requestDatabaseIdValue;
+}
+
+function requiredClientString(value: unknown, label: string): string {
+  if (typeof value !== "string") throw new Error(`${label} must be a non-empty string`);
+  const trimmed = value.trim();
+  if (trimmed.length === 0) throw new Error(`${label} must be a non-empty string`);
+  return trimmed;
+}
+
+function optionalClientString(value: unknown, label: string): string | null {
+  if (value === undefined || value === null) return null;
+  return requiredClientString(value, label);
 }
 
 function sqlValueBody(value: SqlValue): unknown {
@@ -269,7 +313,8 @@ function normalizeSqlResponse(value: unknown): SqlExecuteResponse {
     rows: arrayValue(field(value, "rows"), "rows").map(normalizeSqlRow),
     rowsAffected: numericString(value, "rows_affected"),
     lastInsertRowId: numericString(value, "last_insert_rowid"),
-    truncated: booleanField(value, "truncated")
+    truncated: booleanField(value, "truncated"),
+    routedOperationId: stringField(value, "routed_operation_id")
   };
 }
 

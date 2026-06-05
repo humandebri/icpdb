@@ -1,6 +1,6 @@
 // Where: crates/icpdb_types/src/lib.rs
-// What: Shared contracts for the ICPDB canister, runtime, and frontend bindings.
-// Why: SQL hosting clients need stable database, billing, deposit, and SQL transport types.
+// What: Shared contracts for the SQLite admin protocol, ICPDB canister, and frontend bindings.
+// Why: Protocol clients and the hosted reference canister need stable SQL transport types.
 mod fs;
 mod sql;
 

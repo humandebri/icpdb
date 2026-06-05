@@ -1,17 +1,17 @@
 "use client";
 
 // icpdb-console/components/icpdb-response-metrics-panel.tsx
-// Response metrics, issued token copy, and storage usage meter for the ICPDB sidebar.
+// Response metrics, issued token copy, and storage usage meter for the SQLite admin sidebar.
 
 import { Check, Copy } from "lucide-react";
 import { useState } from "react";
 import { MetricRow } from "@/components/icpdb-display-panels";
 import { formatBytes, quotaUsagePercent } from "@/lib/workbench-state";
-import type { DatabaseBilling, DatabaseSummary, DatabaseTable, DatabaseTokenInfo, DatabaseUsage, SqlExecuteResponse } from "@/lib/types";
+import type { DatabaseSummary, DatabaseTable, DatabaseTokenInfo, DatabaseUsage, SqlExecuteResponse } from "@/lib/types";
 
 type ResponseMetricsProps = {
   batchResponses: SqlExecuteResponse[];
-  billing: DatabaseBilling | null;
+  canisterId: string;
   response: SqlExecuteResponse | null;
   selectedDatabase: DatabaseSummary | null;
   selectedTable: DatabaseTable | null;
@@ -56,7 +56,7 @@ function IssuedTokenPanel({ token }: { token: string }) {
 
 function ResponseMetrics({
   batchResponses,
-  billing,
+  canisterId,
   response,
   selectedDatabase,
   selectedTable,
@@ -67,17 +67,18 @@ function ResponseMetrics({
   const batchRowSetCount = batchResponses.filter((nextResponse) => nextResponse.columns.length > 0).length;
   const batchAffectedCount = batchResponses.reduce((total, nextResponse) => total + BigInt(nextResponse.rowsAffected), 0n);
   const selectedDatabaseId = selectedDatabase?.databaseId ?? "none";
+  const callerRole = selectedDatabase?.role ?? "none";
+  const connectionUrl = selectedDatabase && canisterId ? formatConsoleConnectionUrl(canisterId, selectedDatabase.databaseId) : "none";
   return (
     <dl className="mt-4 space-y-3 text-sm">
       <MetricRow copyValue={selectedDatabase?.databaseId} label="Database" value={selectedDatabaseId} />
+      <MetricRow label="Caller role" value={callerRole} />
+      <MetricRow copyValue={selectedDatabase && canisterId ? connectionUrl : undefined} label="Connection URL" value={connectionUrl} />
       <MetricRow label="Table" value={selectedTable?.name ?? "none"} />
       <MetricRow label="Size" value={usage ? formatBytes(usage.logicalSizeBytes) : "0 B"} />
       <MetricRow label="Quota" value={usage ? formatBytes(usage.maxLogicalSizeBytes) : "0 B"} />
       <StorageUsageMeter usage={usage} />
       <MetricRow label="Usage events" value={usage?.usageEventCount ?? "0"} />
-      <MetricRow label="Billing" value={billing?.status ?? "active"} />
-      <MetricRow label="Balance units" value={billing?.balanceUnits ?? "0"} />
-      <MetricRow label="Spent units" value={billing?.spentUnits ?? "0"} />
       <MetricRow label="API tokens" value={String(tokens.length)} />
       <MetricRow label="Rows" value={String(response?.rows.length ?? 0)} />
       <MetricRow label="Columns" value={String(response?.columns.length ?? 0)} />
@@ -90,6 +91,10 @@ function ResponseMetrics({
       <MetricRow label="Truncated" value={response?.truncated ? "yes" : "no"} />
     </dl>
   );
+}
+
+function formatConsoleConnectionUrl(canisterId: string, databaseId: string): string {
+  return `icpdb://${canisterId}/${encodeURIComponent(databaseId)}`;
 }
 
 function StorageUsageMeter({ usage }: { usage: DatabaseUsage | null }) {

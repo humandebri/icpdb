@@ -3,7 +3,7 @@
 // icpdb-console/components/icpdb-shard-panels.tsx
 // Shard placement and shard journal panels for database-canister routing operations.
 
-import { Check, RefreshCw, Search, X } from "lucide-react";
+import { Check, Copy, RefreshCw, Search, X } from "lucide-react";
 import { useMemo, useState } from "react";
 import type { DatabaseShardPlacement, ShardOperationInfo, ShardOperationReconcileStatus } from "@/lib/types";
 import { formatEventTimestamp } from "@/components/icpdb-usage-events-panel";
@@ -18,6 +18,7 @@ export function ShardPlacementPanel({
   onRefreshAll: () => void;
 }) {
   const [placementSearch, setPlacementSearch] = useState("");
+  const [copiedPlacementValue, setCopiedPlacementValue] = useState<string | null>(null);
   const visiblePlacements = useMemo(() => filterShardPlacements(placements, placementSearch), [placementSearch, placements]);
   const placementCountLabel = placementSearch.trim() ? `${visiblePlacements.length}/${placements.length}` : String(placements.length);
   return (
@@ -57,12 +58,13 @@ export function ShardPlacementPanel({
                 <th className="border-b border-[#eef1f5] py-2 pr-3 font-medium">Shard</th>
                 <th className="border-b border-[#eef1f5] py-2 pr-3 font-medium">Status</th>
                 <th className="border-b border-[#eef1f5] py-2 font-medium">Slot</th>
+                <th className="border-b border-[#eef1f5] py-2 font-medium">Copy</th>
               </tr>
             </thead>
             <tbody>
               {visiblePlacements.length === 0 ? (
                 <tr>
-                  <td className="border-b border-[#f2f4f7] py-3 text-center text-[#667085]" colSpan={4}>
+                  <td className="border-b border-[#f2f4f7] py-3 text-center text-[#667085]" colSpan={5}>
                     No matching shard placements
                   </td>
                 </tr>
@@ -77,12 +79,37 @@ export function ShardPlacementPanel({
                   </td>
                   <td className="border-b border-[#f2f4f7] py-2 pr-3">{placement.status}</td>
                   <td className="border-b border-[#f2f4f7] py-2 font-mono">{placement.mountId ?? "-"}</td>
+                  <td className="border-b border-[#f2f4f7] py-2">
+                    <div className="flex min-w-16 gap-1">
+                      <button
+                        aria-label={`Copy shard placement database id ${placement.databaseId}`}
+                        className="inline-flex size-7 items-center justify-center rounded-md border border-[#c9ced8] text-[#344054]"
+                        title="Copy DB id"
+                        type="button"
+                        onClick={() => copyShardText(placement.databaseId, setCopiedPlacementValue)}
+                      >
+                        <Copy aria-hidden size={12} />
+                      </button>
+                      {placement.canisterId ? (
+                        <button
+                          aria-label={`Copy shard placement canister id ${placement.canisterId}`}
+                          className="inline-flex size-7 items-center justify-center rounded-md border border-[#c9ced8] text-[#344054]"
+                          title="Copy shard canister"
+                          type="button"
+                          onClick={() => copyShardText(placement.canisterId ?? "", setCopiedPlacementValue)}
+                        >
+                          <Copy aria-hidden size={12} />
+                        </button>
+                      ) : null}
+                    </div>
+                  </td>
                 </tr>
               ))}
             </tbody>
           </table>
         </div>
       ) : null}
+      {copiedPlacementValue ? <p className="mt-2 truncate font-mono text-xs text-[#027a48]">Copied {copiedPlacementValue}</p> : null}
     </div>
   );
 }
@@ -103,6 +130,7 @@ export function ShardOperationJournalPanel({
   onRefresh: () => void;
 }) {
   const [operationSearch, setOperationSearch] = useState("");
+  const [copiedOperationId, setCopiedOperationId] = useState<string | null>(null);
   const visibleOperations = useMemo(() => filterShardOperations(operations, operationSearch), [operationSearch, operations]);
   const operationCountLabel = operationSearch.trim() ? `${visibleOperations.length}/${operations.length}` : String(operations.length);
   const hasUnknownOperation = visibleOperations.some((operation) => operation.status === "unknown");
@@ -183,6 +211,15 @@ export function ShardOperationJournalPanel({
                     {operation.status === "unknown" ? (
                       <div className="flex min-w-40 flex-wrap gap-1">
                         <button
+                          aria-label={`Copy shard operation id ${operation.operationId}`}
+                          className="inline-flex size-7 items-center justify-center rounded-md border border-[#c9ced8] text-[#344054]"
+                          title="Copy operation id"
+                          type="button"
+                          onClick={() => copyShardText(operation.operationId, setCopiedOperationId)}
+                        >
+                          <Copy aria-hidden size={12} />
+                        </button>
+                        <button
                           className="inline-flex h-7 items-center gap-1 rounded-md border border-[#a6d8b8] px-2 text-xs font-medium text-[#027a48]"
                           type="button"
                           onClick={() => onReconcile(operation, "applied")}
@@ -200,7 +237,17 @@ export function ShardOperationJournalPanel({
                           <span>Mark failed</span>
                         </button>
                       </div>
-                    ) : "-"}
+                    ) : (
+                      <button
+                        aria-label={`Copy shard operation id ${operation.operationId}`}
+                        className="inline-flex size-7 items-center justify-center rounded-md border border-[#c9ced8] text-[#344054]"
+                        title="Copy operation id"
+                        type="button"
+                        onClick={() => copyShardText(operation.operationId, setCopiedOperationId)}
+                      >
+                        <Copy aria-hidden size={12} />
+                      </button>
+                    )}
                   </td>
                 </tr>
               ))}
@@ -208,8 +255,17 @@ export function ShardOperationJournalPanel({
           </table>
         </div>
       ) : null}
+      {copiedOperationId ? <p className="mt-2 truncate font-mono text-xs text-[#027a48]">Copied {copiedOperationId}</p> : null}
     </div>
   );
+}
+
+function copyShardText(value: string, setCopiedValue: (value: string | null) => void): void {
+  void navigator.clipboard.writeText(value).then(() => {
+    setCopiedValue(value);
+  }).catch(() => {
+    setCopiedValue(null);
+  });
 }
 
 function filterShardPlacements(placements: DatabaseShardPlacement[], placementSearch: string): DatabaseShardPlacement[] {

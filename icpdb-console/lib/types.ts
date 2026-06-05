@@ -14,6 +14,17 @@ export type DatabaseSummary = {
   deletedAtMs: string | null;
 };
 
+export type DatabaseInfo = {
+  databaseId: string;
+  status: DatabaseStatus;
+  logicalSizeBytes: string;
+  schemaVersion: string;
+  mountId: number | null;
+  snapshotHash: number[] | null;
+  archivedAtMs: string | null;
+  deletedAtMs: string | null;
+};
+
 export type DatabaseShardPlacement = {
   databaseId: string;
   shardId: string;
@@ -23,6 +34,63 @@ export type DatabaseShardPlacement = {
   schemaVersion: string;
   createdAtMs: string;
   updatedAtMs: string;
+};
+
+export type DatabaseShardInfo = {
+  shardId: string;
+  canisterId: string;
+  status: string;
+  maxDatabases: number;
+  assignedDatabases: string;
+  createdAtMs: string;
+  updatedAtMs: string;
+};
+
+export type DatabaseShardStatus = {
+  shard: DatabaseShardInfo;
+  canisterStatus: string;
+  cyclesBalance: string;
+  memorySizeBytes: string;
+  idleCyclesBurnedPerDay: string;
+  moduleHash: number[] | null;
+};
+
+export type CreateDatabaseShardRequest = {
+  initialCycles: string | number | bigint;
+  maxDatabases: number;
+};
+
+export type RegisterDatabaseShardRequest = {
+  databaseCanisterId: string;
+  maxDatabases: number;
+};
+
+export type CreateRemoteDatabaseRequest = {
+  databaseId: string;
+  databaseCanisterId: string;
+};
+
+export type DatabaseShardMaintenanceAction = {
+  action: string;
+  databaseCanisterId: string | null;
+  shardId: string | null;
+  cycles: string;
+  reason: string;
+};
+
+export type DatabaseShardMaintenanceReport = {
+  availableSlots: string;
+  inspectedShards: DatabaseShardStatus[];
+  actions: DatabaseShardMaintenanceAction[];
+};
+
+export type MaintainDatabaseShardsRequest = {
+  minAvailableSlots: string | number | bigint;
+  minCyclesBalance: string | number | bigint;
+  topUpCycles: string | number | bigint;
+  maxNewShards: number;
+  newShardMaxDatabases: number;
+  newShardInitialCycles: string | number | bigint;
 };
 
 export type RoutedOperationStatus = "pending" | "applied" | "failed" | "unknown";
@@ -237,6 +305,7 @@ export type SqlExecuteRequest = {
   sql: string;
   params: SqlValue[];
   maxRows: number | null;
+  idempotencyKey?: string | null;
 };
 
 export type SqlStatement = {
@@ -248,6 +317,7 @@ export type SqlBatchRequest = {
   databaseId: string;
   statements: SqlStatement[];
   maxRows: number | null;
+  idempotencyKey?: string | null;
 };
 
 export type SqlExecuteResponse = {
@@ -256,4 +326,5 @@ export type SqlExecuteResponse = {
   rowsAffected: string;
   lastInsertRowId: string;
   truncated: boolean;
+  routedOperationId: string | null;
 };

@@ -13,6 +13,8 @@ export async function executeIcpdbCommand(command, handlers) {
   if (command.tableForeignKeys) return handlers.tableForeignKeys(command);
   if (command.dump) return handlers.dump(command);
   if (command.load) return handlers.load(command);
+  if (command.script) return handlers.script(command);
+  if (command.migrate) return handlers.migrate(command);
   if (command.createDatabase) return handlers.createDatabase(command);
   if (command.databases) return handlers.databases(command);
   if (command.databasePlacements) return handlers.databasePlacements(command);
@@ -20,11 +22,13 @@ export async function executeIcpdbCommand(command, handlers) {
   if (command.databaseShardStatus) return handlers.databaseShardStatus(command);
   if (command.topUpDatabaseShard) return handlers.topUpDatabaseShard(command);
   if (command.maintainDatabaseShards) return handlers.maintainDatabaseShards(command);
+  if (command.migrateDatabaseToShard) return handlers.migrateDatabaseToShard(command);
   if (command.shardOperations) return handlers.shardOperations(command);
   if (command.reconcileShardOperation) return handlers.reconcileShardOperation(command);
   if (command.reconcileRoutedOperation) return handlers.reconcileRoutedOperation(command);
   if (command.archive) return handlers.archive(command);
   if (command.restore) return handlers.restore(command);
+  if (command.snapshotInfo) return handlers.snapshotInfo(command);
   return handlers.http(command);
 }
 
@@ -38,5 +42,11 @@ export async function executeShellCommand(command, handlers) {
   if (command.tableForeignKeys) return handlers.tableForeignKeys(command);
   if (command.schema) return handlers.schema(command);
   if (command.dump) return handlers.dump(command);
+  if (command.load) return handlers.load(command);
+  if (command.script) return handlers.script(command);
+  if (command.migrate) return handlers.migrate(command);
+  if (command.archive) return handlers.archive(command);
+  if (command.restore) return handlers.restore(command);
+  if (command.snapshotInfo) return handlers.snapshotInfo(command);
   return handlers.http(command);
 }

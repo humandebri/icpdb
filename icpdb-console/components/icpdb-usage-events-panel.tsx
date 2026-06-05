@@ -1,7 +1,7 @@
 "use client";
 
 // icpdb-console/components/icpdb-usage-events-panel.tsx
-// Searchable usage-event summary table for quota, billing, and activity inspection.
+// Searchable usage-event summary table for quota and activity inspection.
 
 import { HardDrive, Search } from "lucide-react";
 import { useMemo, useState } from "react";

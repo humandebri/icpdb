@@ -36,6 +36,45 @@ jobs:
       - name: Build Cloudflare Worker
         run: pnpm build:worker
 
+  icpdb-root-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Enable corepack
+        run: corepack enable
+      - name: Setup Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: icpdb-console/pnpm-lock.yaml
+      - name: Install console dependencies
+        run: pnpm --dir icpdb-console install --frozen-lockfile
+      - name: Check CI workflow wiring
+        run: node scripts/check-ci-workflow.mjs
+      - name: Check HTTP CLI surface
+        run: node scripts/check-icpdb-http-cli.mjs
+      - name: Check identity CLI surface
+        run: node scripts/check-icpdb-identity-cli.mjs
+      - name: Check local network diagnosis
+        run: node scripts/check-icpdb-local-network.mjs
+      - name: Check service env verification
+        run: node scripts/check-icpdb-service-env-check.mjs
+      - name: Check release readiness self-test
+        run: node scripts/icpdb-release-check.mjs --self-test
+      - name: Check non-live release gate
+        run: node scripts/icpdb-release-check.mjs --skip-build --skip-console
+      - name: Check mainnet preflight self-test
+        run: node scripts/icpdb-mainnet-preflight.mjs --self-test
+      - name: Check mainnet postdeploy self-test
+        run: node scripts/icpdb-mainnet-postdeploy.mjs --self-test
+      - name: Check goal coverage
+        run: node scripts/check-icpdb-goal.mjs
+      - name: Check mainnet preflight wiring
+        run: node scripts/icpdb-mainnet-preflight.mjs --skip-build
+      - name: Check mainnet postdeploy wiring
+        run: node scripts/icpdb-mainnet-postdeploy.mjs --skip-call
+
   rust-check:
     runs-on: ubuntu-latest
     steps:
@@ -56,14 +95,20 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Run tests
-        run: cargo test -p icpdb-runtime -p icpdb-canister --locked
+        env:
+          RUST_TEST_THREADS: 1
+        run: cargo test -p icpdb-runtime -p icpdb-canister -p icpdb-database-canister --locked
       - name: Run clippy
-        run: cargo clippy -p icpdb-runtime -p icpdb-canister --all-targets --locked -- -D warnings
+        run: cargo clippy -p icpdb-runtime -p icpdb-canister -p icpdb-database-canister --all-targets --locked -- -D warnings
 
   canister-build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+      - name: Setup Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: 24
       - name: Cache cargo registry
         uses: actions/cache@v4
         with:
@@ -78,12 +123,16 @@ jobs:
       - name: Use stable Rust
         run: rustup default stable
       - name: Add wasm target
-        run: rustup target add wasm32-wasip1
-      - name: Install WASI sysroot
-        run: sudo apt-get update && sudo apt-get install -y wasi-libc
+        run: rustup target add wasm32-unknown-unknown
       - name: Install wasm tooling
-        run: cargo install wasi2ic ic-wasm --locked
-      - name: Build canister artifact
+        run: cargo install ic-wasm --locked
+      - name: Build database canister artifact
+        env:
+          ICP_WASM_OUTPUT_PATH: /tmp/icpdb_database_canister.wasm
+        run: bash scripts/build-icpdb-database-canister.sh
+      - name: Build control canister artifact
         env:
           ICP_WASM_OUTPUT_PATH: /tmp/icpdb_canister.wasm
         run: bash scripts/build-icpdb-canister.sh
+      - name: Run mainnet preflight
+        run: node scripts/icpdb-mainnet-preflight.mjs

@@ -3,8 +3,9 @@
 // icpdb-console/components/icpdb-table-overview-panel.tsx
 // Table overview metrics for selected row/cell state in the ICPDB Table Editor.
 
+import { Code2, Hash, Plus, Search } from "lucide-react";
 import { formatSqlValue } from "@/components/icpdb-display-panels";
-import { columnKindLabel } from "@/lib/row-mutations";
+import { canWriteColumn, columnKindLabel } from "@/lib/row-mutations";
 import type { TableDescription, TablePreviewResponse } from "@/lib/types";
 
 type TableOverviewPanelProps = {
@@ -12,14 +13,26 @@ type TableOverviewPanelProps = {
   selectedRowIndex: number | null;
   tableDescription: TableDescription | null;
   tablePreview: TablePreviewResponse | null;
+  onOpenCountSql: (tableName: string) => void;
+  onOpenInsertSql: (tableDescription: TableDescription) => void;
+  onOpenSchemaLookupSql: (tableName: string) => void;
+  onOpenTableSql: (tableName: string) => void;
 };
 
 export function TableOverviewPanel({
   selectedCellColumnName,
   selectedRowIndex,
   tableDescription,
-  tablePreview
+  tablePreview,
+  onOpenCountSql,
+  onOpenInsertSql,
+  onOpenSchemaLookupSql,
+  onOpenTableSql
 }: TableOverviewPanelProps) {
+  const canOpenInsertSql = Boolean(
+    tableDescription?.objectType === "table" &&
+    tableDescription.columns.some((column) => canWriteColumn(column) && column.defaultValue === null)
+  );
   const selectedRowNumber = tablePreview && selectedRowIndex !== null
     ? String(tablePreview.offset + selectedRowIndex + 1)
     : "none";
@@ -50,9 +63,61 @@ export function TableOverviewPanel({
     <section className="rounded-md border border-[#d5d9e2] bg-white p-3">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <h3 className="text-sm font-semibold">Table overview</h3>
-        <span className="rounded-md border border-[#eef1f5] px-2 py-1 font-mono text-xs text-[#5f6c7b]">
-          {tableDescription?.objectType ?? "none"}
-        </span>
+        <div className="flex flex-wrap items-center justify-end gap-2">
+          <button
+            aria-label={tableDescription ? `Open SELECT SQL for ${tableDescription.tableName}` : "Open SELECT SQL"}
+            className="inline-flex h-8 items-center gap-1 rounded-md border border-[#c9ced8] bg-white px-2 text-xs font-medium text-[#344054] disabled:opacity-50"
+            disabled={!tableDescription}
+            type="button"
+            onClick={() => {
+              if (tableDescription) onOpenTableSql(tableDescription.tableName);
+            }}
+          >
+            <Search aria-hidden size={14} />
+            <span>Open SELECT SQL</span>
+          </button>
+          <button
+            aria-label={tableDescription ? `Open INSERT SQL for ${tableDescription.tableName}` : "Open INSERT SQL"}
+            className="inline-flex h-8 items-center gap-1 rounded-md border border-[#c9ced8] bg-white px-2 text-xs font-medium text-[#344054] disabled:opacity-50"
+            disabled={!canOpenInsertSql}
+            type="button"
+            onClick={() => {
+              if (tableDescription) onOpenInsertSql(tableDescription);
+            }}
+          >
+            <Plus aria-hidden size={14} />
+            <span>Open INSERT SQL</span>
+          </button>
+          <button
+            aria-label={tableDescription ? `Open count SQL for ${tableDescription.tableName}` : "Open count SQL"}
+            className="inline-flex h-8 items-center gap-1 rounded-md border border-[#c9ced8] bg-white px-2 text-xs font-medium text-[#344054] disabled:opacity-50"
+            disabled={!tableDescription}
+            title="Open count SQL"
+            type="button"
+            onClick={() => {
+              if (tableDescription) onOpenCountSql(tableDescription.tableName);
+            }}
+          >
+            <Hash aria-hidden size={14} />
+            <span>Open count SQL</span>
+          </button>
+          <button
+            aria-label={tableDescription ? `Open schema lookup SQL for ${tableDescription.tableName}` : "Open schema lookup SQL"}
+            className="inline-flex h-8 items-center gap-1 rounded-md border border-[#c9ced8] bg-white px-2 text-xs font-medium text-[#344054] disabled:opacity-50"
+            disabled={!tableDescription}
+            title="Open schema lookup SQL"
+            type="button"
+            onClick={() => {
+              if (tableDescription) onOpenSchemaLookupSql(tableDescription.tableName);
+            }}
+          >
+            <Code2 aria-hidden size={14} />
+            <span>Open schema lookup SQL</span>
+          </button>
+          <span className="rounded-md border border-[#eef1f5] px-2 py-1 font-mono text-xs text-[#5f6c7b]">
+            {tableDescription?.objectType ?? "none"}
+          </span>
+        </div>
       </div>
       <dl className="mt-3 grid gap-2 sm:grid-cols-3 xl:grid-cols-[repeat(auto-fit,minmax(7rem,1fr))]">
         {metrics.map((metric) => (

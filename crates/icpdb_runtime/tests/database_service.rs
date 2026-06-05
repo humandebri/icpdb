@@ -287,6 +287,7 @@ fn sql_request(database_id: &str, sql: &str) -> SqlExecuteRequest {
         sql: sql.to_string(),
         params: Vec::new(),
         max_rows: None,
+        idempotency_key: None,
     }
 }
 
@@ -356,6 +357,60 @@ fn index_migrations_create_usage_events_and_mount_history_once() {
 }
 
 #[test]
+fn lifecycle_migration_rejects_missing_initial_mount_index() {
+    let dir = tempdir().expect("tempdir should create");
+    let root = dir.keep();
+    let service = index_service(&root);
+
+    index_execute(
+        &root,
+        "CREATE TABLE schema_migrations (
+           version TEXT PRIMARY KEY,
+           applied_at INTEGER NOT NULL
+         )",
+        Vec::new(),
+    );
+    index_execute(
+        &root,
+        "INSERT INTO schema_migrations (version, applied_at)
+         VALUES ('database_index:000_initial', 1)",
+        Vec::new(),
+    );
+    index_execute(
+        &root,
+        "CREATE TABLE databases (
+           database_id TEXT PRIMARY KEY,
+           db_file_name TEXT NOT NULL,
+           mount_id INTEGER NOT NULL,
+           schema_version TEXT NOT NULL,
+           created_at_ms INTEGER NOT NULL,
+           updated_at_ms INTEGER NOT NULL
+         )",
+        Vec::new(),
+    );
+    index_execute(
+        &root,
+        "CREATE TABLE database_members (
+           database_id TEXT NOT NULL,
+           principal TEXT NOT NULL,
+           role TEXT NOT NULL,
+           created_at_ms INTEGER NOT NULL,
+           PRIMARY KEY (database_id, principal),
+           FOREIGN KEY (database_id) REFERENCES databases(database_id)
+         )",
+        Vec::new(),
+    );
+
+    let error = service
+        .run_index_migrations()
+        .expect_err("lifecycle migration should reject missing initial mount index");
+    assert!(
+        error.contains("no such index: databases_mount_id_idx"),
+        "unexpected migration error: {error}"
+    );
+}
+
+#[test]
 fn generated_database_create_returns_hash_id_and_owner_member() {
     let (service, root) = service_with_root();
 
@@ -417,6 +472,7 @@ fn sql_execute_writes_and_sql_query_reads_rows() {
                     .to_string(),
                 params: vec![],
                 max_rows: None,
+                idempotency_key: None,
             },
         )
         .expect("table create should execute");
@@ -428,6 +484,7 @@ fn sql_execute_writes_and_sql_query_reads_rows() {
                 sql: "INSERT INTO accounts (name) VALUES (?1)".to_string(),
                 params: vec![SqlValue::Text("alice".to_string())],
                 max_rows: None,
+                idempotency_key: None,
             },
         )
         .expect("insert should execute");
@@ -436,10 +493,11 @@ fn sql_execute_writes_and_sql_query_reads_rows() {
         .sql_query(
             "owner",
             SqlExecuteRequest {
-                database_id: meta.database_id,
+                database_id: meta.database_id.clone(),
                 sql: "SELECT id, name FROM accounts WHERE name = ?1".to_string(),
                 params: vec![SqlValue::Text("alice".to_string())],
                 max_rows: Some(10),
+                idempotency_key: None,
             },
         )
         .expect("select should query");
@@ -453,6 +511,20 @@ fn sql_execute_writes_and_sql_query_reads_rows() {
         ]]
     );
     assert!(!response.truncated);
+
+    let cte_response = service
+        .sql_query(
+            "owner",
+            SqlExecuteRequest {
+                database_id: meta.database_id,
+                sql: "WITH named(name) AS (SELECT ?1) SELECT id FROM accounts WHERE name IN (SELECT name FROM named)".to_string(),
+                params: vec![SqlValue::Text("alice".to_string())],
+                max_rows: Some(10),
+                idempotency_key: None,
+            },
+        )
+        .expect("read CTE should query");
+    assert_eq!(cte_response.rows, vec![vec![SqlValue::Integer(1)]]);
 }
 
 #[test]
@@ -470,6 +542,7 @@ fn table_inspection_lists_describes_and_previews_rows() {
                     .to_string(),
                 params: vec![],
                 max_rows: None,
+                idempotency_key: None,
             },
         )
         .expect("parent table should create");
@@ -487,6 +560,7 @@ fn table_inspection_lists_describes_and_previews_rows() {
                 .to_string(),
                 params: vec![],
                 max_rows: None,
+                idempotency_key: None,
             },
         )
         .expect("child table should create");
@@ -498,6 +572,7 @@ fn table_inspection_lists_describes_and_previews_rows() {
                 sql: "CREATE INDEX members_team_name_idx ON members (team_id, name)".to_string(),
                 params: vec![],
                 max_rows: None,
+                idempotency_key: None,
             },
         )
         .expect("index should create");
@@ -515,6 +590,7 @@ fn table_inspection_lists_describes_and_previews_rows() {
                 .to_string(),
                 params: vec![],
                 max_rows: None,
+                idempotency_key: None,
             },
         )
         .expect("trigger should create");
@@ -523,9 +599,22 @@ fn table_inspection_lists_describes_and_previews_rows() {
             "owner",
             SqlExecuteRequest {
                 database_id: meta.database_id.clone(),
+                sql: "CREATE TABLE text_keys (key TEXT PRIMARY KEY, value TEXT)".to_string(),
+                params: vec![],
+                max_rows: None,
+                idempotency_key: None,
+            },
+        )
+        .expect("text primary key table should create");
+    service
+        .sql_execute(
+            "owner",
+            SqlExecuteRequest {
+                database_id: meta.database_id.clone(),
                 sql: "INSERT INTO teams (name) VALUES ('core')".to_string(),
                 params: vec![],
                 max_rows: None,
+                idempotency_key: None,
             },
         )
         .expect("team should insert");
@@ -538,6 +627,7 @@ fn table_inspection_lists_describes_and_previews_rows() {
                     .to_string(),
                 params: vec![],
                 max_rows: None,
+                idempotency_key: None,
             },
         )
         .expect("members should insert");
@@ -550,7 +640,7 @@ fn table_inspection_lists_describes_and_previews_rows() {
             .iter()
             .map(|table| table.name.as_str())
             .collect::<Vec<_>>(),
-        vec!["members", "teams"]
+        vec!["members", "teams", "text_keys"]
     );
     assert!(
         tables
@@ -605,6 +695,20 @@ fn table_inspection_lists_describes_and_previews_rows() {
             .unwrap_or_default()
             .contains("CREATE TRIGGER members_name_guard")
     );
+    let text_key_description = service
+        .describe_table(&meta.database_id, "text_keys", "owner")
+        .expect("text primary key table should describe");
+    let text_key_index = text_key_description
+        .indexes
+        .iter()
+        .find(|index| index.origin == "pk")
+        .expect("text primary key should create an autoindex");
+    assert!(
+        text_key_index
+            .columns
+            .iter()
+            .any(|column| column.name.is_none())
+    );
 
     let preview = service
         .preview_table(
@@ -645,13 +749,45 @@ fn sql_query_rejects_writes() {
         .sql_query(
             "owner",
             SqlExecuteRequest {
-                database_id: meta.database_id,
+                database_id: meta.database_id.clone(),
                 sql: "CREATE TABLE blocked (id INTEGER)".to_string(),
                 params: vec![],
                 max_rows: None,
+                idempotency_key: None,
             },
         )
         .expect_err("query endpoint should reject write SQL");
+
+    assert_eq!(error, "sql_query only accepts read-only SQL");
+
+    let error = service
+        .sql_query(
+            "owner",
+            SqlExecuteRequest {
+                database_id: meta.database_id.clone(),
+                sql: "PRAGMA foreign_keys=OFF".to_string(),
+                params: vec![],
+                max_rows: None,
+                idempotency_key: None,
+            },
+        )
+        .expect_err("query endpoint should reject setting PRAGMA");
+
+    assert_eq!(error, "sql_query only accepts read-only SQL");
+
+    let error = service
+        .sql_query(
+            "owner",
+            SqlExecuteRequest {
+                database_id: meta.database_id,
+                sql: "WITH payload(id) AS (SELECT 1) INSERT INTO blocked SELECT id FROM payload"
+                    .to_string(),
+                params: vec![],
+                max_rows: None,
+                idempotency_key: None,
+            },
+        )
+        .expect_err("query endpoint should reject CTE-leading write SQL");
 
     assert_eq!(error, "sql_query only accepts read-only SQL");
 }
@@ -674,6 +810,7 @@ fn sql_query_is_free_and_allows_empty_balance() {
                 sql: "SELECT 1".to_string(),
                 params: vec![],
                 max_rows: Some(1),
+                idempotency_key: None,
             },
         )
         .expect("query should succeed");
@@ -696,6 +833,7 @@ fn sql_query_is_free_and_allows_empty_balance() {
                 sql: "SELECT 1".to_string(),
                 params: vec![],
                 max_rows: Some(1),
+                idempotency_key: None,
             },
         )
         .expect("empty balance should still allow query");
@@ -732,11 +870,54 @@ fn sql_execute_rejects_file_affecting_statements() {
                     sql: sql.to_string(),
                     params: vec![],
                     max_rows: None,
+                    idempotency_key: None,
                 },
             )
             .expect_err("file-affecting SQL should be rejected");
         assert_eq!(error, "sql statement is not allowed for hosted databases");
     }
+}
+
+#[test]
+fn sql_execute_allows_hosted_safe_pragma_settings() {
+    let service = service();
+    let meta = service
+        .create_generated_database("owner", 1)
+        .expect("database should create");
+
+    for sql in [
+        "PRAGMA foreign_keys=OFF",
+        "PRAGMA foreign_keys(ON)",
+        "PRAGMA defer_foreign_keys = ON",
+        "PRAGMA user_version = 7",
+    ] {
+        service
+            .sql_execute(
+                "owner",
+                SqlExecuteRequest {
+                    database_id: meta.database_id.clone(),
+                    sql: sql.to_string(),
+                    params: vec![],
+                    max_rows: None,
+                    idempotency_key: None,
+                },
+            )
+            .expect("hosted-safe PRAGMA should execute");
+    }
+
+    let version = service
+        .sql_query(
+            "owner",
+            SqlExecuteRequest {
+                database_id: meta.database_id,
+                sql: "PRAGMA user_version".to_string(),
+                params: vec![],
+                max_rows: Some(1),
+                idempotency_key: None,
+            },
+        )
+        .expect("user_version should be readable");
+    assert_eq!(version.rows[0][0], SqlValue::Integer(7));
 }
 
 #[test]
@@ -762,6 +943,7 @@ fn sql_batch_rejects_forbidden_statement_and_rolls_back() {
                     },
                 ],
                 max_rows: None,
+                idempotency_key: None,
             },
         )
         .expect_err("forbidden batch statement should fail");
@@ -775,6 +957,7 @@ fn sql_batch_rejects_forbidden_statement_and_rolls_back() {
                 sql: "SELECT COUNT(*) FROM rollback_probe".to_string(),
                 params: vec![],
                 max_rows: Some(1),
+                idempotency_key: None,
             },
         )
         .expect_err("table creation should roll back");
@@ -886,6 +1069,7 @@ fn data_plane_writes_refresh_size_without_charging_billing() {
                 sql: "INSERT INTO notes (body) VALUES (?1)".to_string(),
                 params: vec![SqlValue::Text("from data plane".to_string())],
                 max_rows: None,
+                idempotency_key: None,
             },
         )
         .expect("data-plane insert should succeed");
@@ -966,6 +1150,38 @@ fn routed_write_completion_charges_and_syncs_logical_size() {
         )
         .expect("routed write replay should load existing operation");
     assert_eq!(replay.status, RoutedOperationStatus::Applied);
+
+    let principal_pending = service
+        .begin_routed_write(
+            "owner",
+            "alpha",
+            RoutedWriteBegin {
+                operation_id: "op_principal_insert",
+                database_canister_id: "aaaaa-aa",
+                method: "sql_execute_internal",
+                request_hash: sha256_bytes(b"principal remote write request"),
+                billing_units: SQL_EXECUTE_BILLING_UNITS,
+                now: 5,
+            },
+        )
+        .expect("principal routed write should begin");
+    assert_eq!(principal_pending.status, RoutedOperationStatus::Pending);
+
+    let completed = service
+        .complete_routed_write(
+            "owner",
+            "alpha",
+            "op_principal_insert",
+            SQL_EXECUTE_BILLING_UNITS,
+            55_555,
+            6,
+        )
+        .expect("principal routed write should complete");
+    assert_eq!(completed.status, RoutedOperationStatus::Applied);
+    let usage = service
+        .database_usage("alpha", "owner")
+        .expect("usage should load");
+    assert_eq!(usage.logical_size_bytes, 55_555);
 }
 
 #[test]
@@ -1090,6 +1306,7 @@ fn database_quota_blocks_oversized_sql_write_and_rolls_back() {
                 sql: "CREATE TABLE quota_probe (payload BLOB)".to_string(),
                 params: vec![],
                 max_rows: None,
+                idempotency_key: None,
             },
         )
         .expect("table should create before quota is lowered");
@@ -1114,6 +1331,7 @@ fn database_quota_blocks_oversized_sql_write_and_rolls_back() {
                 sql: "INSERT INTO quota_probe (payload) VALUES (zeroblob(1000000))".to_string(),
                 params: vec![],
                 max_rows: None,
+                idempotency_key: None,
             },
         )
         .expect_err("oversized insert should fail");
@@ -1127,6 +1345,7 @@ fn database_quota_blocks_oversized_sql_write_and_rolls_back() {
                 sql: "SELECT COUNT(*) FROM quota_probe".to_string(),
                 params: vec![],
                 max_rows: Some(1),
+                idempotency_key: None,
             },
         )
         .expect("count query should work");
@@ -1187,6 +1406,7 @@ fn database_tokens_authorize_http_sql_by_scope_and_track_last_use() {
                 sql: "SELECT 1".to_string(),
                 params: Vec::new(),
                 max_rows: None,
+                idempotency_key: None,
             },
         )
         .expect("read token should query");
@@ -1263,6 +1483,7 @@ fn billing_units_are_charged_and_exhaustion_suspends_database() {
                 sql: "CREATE TABLE billing_probe (id INTEGER)".to_string(),
                 params: Vec::new(),
                 max_rows: None,
+                idempotency_key: None,
             },
         )
         .expect("write should charge");
@@ -1288,6 +1509,7 @@ fn billing_units_are_charged_and_exhaustion_suspends_database() {
                 sql: "INSERT INTO billing_probe (id) VALUES (1)".to_string(),
                 params: Vec::new(),
                 max_rows: None,
+                idempotency_key: None,
             },
         )
         .expect_err("empty balance should block write");
@@ -1463,6 +1685,7 @@ fn sql_batch_runs_statements_in_one_write_call() {
                     },
                 ],
                 max_rows: Some(10),
+                idempotency_key: None,
             },
         )
         .expect("batch should execute");
@@ -1764,6 +1987,7 @@ fn isolates_sql_tables_between_databases() {
                     sql: "CREATE TABLE shared (body TEXT)".to_string(),
                     params: vec![],
                     max_rows: None,
+                    idempotency_key: None,
                 },
             )
             .expect("table create should succeed");
@@ -1775,6 +1999,7 @@ fn isolates_sql_tables_between_databases() {
                     sql: "INSERT INTO shared (body) VALUES (?1)".to_string(),
                     params: vec![SqlValue::Text(format!("{database_id} body"))],
                     max_rows: None,
+                    idempotency_key: None,
                 },
             )
             .expect("insert should succeed");
@@ -1814,6 +2039,7 @@ fn reopens_database_content_from_same_mount_id_after_service_recreation() {
                 sql: "INSERT INTO persisted_notes (body) VALUES (?1)".to_string(),
                 params: vec![SqlValue::Text("survives reopen".to_string())],
                 max_rows: None,
+                idempotency_key: None,
             },
         )
         .expect("insert should succeed");
@@ -1968,6 +2194,7 @@ fn archives_and_restores_database_bytes() {
                 sql: "INSERT INTO archived_rows (body) VALUES (?1)".to_string(),
                 params: vec![SqlValue::Text("alpha body".to_string())],
                 max_rows: None,
+                idempotency_key: None,
             },
         )
         .expect("insert should succeed");
@@ -2583,6 +2810,28 @@ fn remote_delete_marker_preserves_remote_placement_and_frees_capacity() {
         .list_database_shards()
         .expect("database shards should load");
     assert_eq!(shards[0].assigned_databases, 0);
+
+    service
+        .register_remote_database(
+            CreateRemoteDatabaseRequest {
+                database_id: "remote_delete_principal".to_string(),
+                database_canister_id: "aaaaa-aa".to_string(),
+            },
+            "owner",
+            4,
+        )
+        .expect("remote database should register after token delete frees capacity");
+    service
+        .mark_remote_database_deleted("owner", "remote_delete_principal", 5)
+        .expect("principal owner should mark remote database deleted");
+    let usage = service
+        .database_usage("remote_delete_principal", "owner")
+        .expect("principal deleted usage should load");
+    assert_eq!(usage.status, DatabaseStatus::Deleted);
+    let shards = service
+        .list_database_shards()
+        .expect("database shards should reload");
+    assert_eq!(shards[0].assigned_databases, 0);
 }
 
 #[test]
@@ -3166,6 +3415,7 @@ fn restore_accepts_in_range_chunks_written_out_of_order() {
                 sql: "INSERT INTO t (body) VALUES (?1)".to_string(),
                 params: vec![SqlValue::Text("alpha body".repeat(100))],
                 max_rows: None,
+                idempotency_key: None,
             },
         )
         .expect("insert should succeed");
@@ -3365,15 +3615,15 @@ fn enforces_reader_writer_owner_roles() {
 }
 
 #[test]
-fn anonymous_principal_can_only_receive_reader_access() {
+fn anonymous_principal_cannot_receive_database_access() {
     let service = service();
     service
         .create_database("public", "owner", 1)
         .expect("database should create");
 
-    service
+    let reader_error = service
         .grant_database_access("public", "owner", "2vxsx-fae", DatabaseRole::Reader, 2)
-        .expect("anonymous reader should be allowed");
+        .expect_err("anonymous reader should fail");
     let writer_error = service
         .grant_database_access("public", "owner", "2vxsx-fae", DatabaseRole::Writer, 3)
         .expect_err("anonymous writer should fail");
@@ -3381,18 +3631,63 @@ fn anonymous_principal_can_only_receive_reader_access() {
         .grant_database_access("public", "owner", "2vxsx-fae", DatabaseRole::Owner, 4)
         .expect_err("anonymous owner should fail");
 
+    assert!(reader_error.contains("anonymous principal"));
     assert!(writer_error.contains("anonymous principal"));
     assert!(owner_error.contains("anonymous principal"));
-    service
-        .sql_query("2vxsx-fae", sql_request("public", "SELECT 1"))
-        .expect("anonymous reader query should pass");
+    assert!(
+        service
+            .sql_query("2vxsx-fae", sql_request("public", "SELECT 1"))
+            .expect_err("anonymous query should fail")
+            .contains("no access")
+    );
     assert!(
         service
             .sql_execute(
                 "2vxsx-fae",
                 sql_request("public", "CREATE TABLE nope (id INTEGER)")
             )
-            .expect_err("anonymous reader write should fail")
-            .contains("lacks required database role")
+            .expect_err("anonymous write should fail")
+            .contains("no access")
+    );
+}
+
+#[test]
+fn owner_token_cannot_remove_last_owner_principal() {
+    let service = service();
+    service
+        .create_database("owned", "owner", 1)
+        .expect("database should create");
+    let owner_auth = AuthenticatedDatabaseToken {
+        token_id: "tok_owner".to_string(),
+        database_id: "owned".to_string(),
+        scope: DatabaseTokenScope::Owner,
+    };
+
+    let downgrade_error = service
+        .grant_database_access_with_token(&owner_auth, "owned", "owner", DatabaseRole::Reader, 2)
+        .expect_err("owner token should not downgrade the only owner principal");
+    let revoke_error = service
+        .revoke_database_access_with_token(&owner_auth, "owned", "owner")
+        .expect_err("owner token should not revoke the only owner principal");
+
+    assert!(downgrade_error.contains("at least one owner principal"));
+    assert!(revoke_error.contains("at least one owner principal"));
+    service
+        .grant_database_access_with_token(
+            &owner_auth,
+            "owned",
+            "backup-owner",
+            DatabaseRole::Owner,
+            3,
+        )
+        .expect("owner token should add backup owner");
+    service
+        .grant_database_access_with_token(&owner_auth, "owned", "owner", DatabaseRole::Reader, 4)
+        .expect("owner token should downgrade owner when another owner remains");
+    assert!(
+        service
+            .revoke_database_access_with_token(&owner_auth, "owned", "backup-owner")
+            .expect_err("owner token should not revoke the remaining owner principal")
+            .contains("at least one owner principal")
     );
 }

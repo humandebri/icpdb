@@ -517,27 +517,31 @@ async fn migrate_database_to_shard(
         shard_request_hash(&request)?,
         now,
     )?;
+    let mut migration_started = false;
     let result = match with_service(|service| {
         service.begin_local_database_migration(&request, now_millis())
     }) {
-        Ok(started) => migrate_local_archive_to_database_canister(&request, started.size_bytes)
-            .await
-            .and_then(|remote_info| {
-                with_service(|service| {
-                    service.complete_local_database_migration(
-                        &request,
-                        remote_info.logical_size_bytes,
-                        now_millis(),
-                    )
+        Ok(started) => {
+            migration_started = true;
+            migrate_local_archive_to_database_canister(&request, started.size_bytes)
+                .await
+                .and_then(|remote_info| {
+                    with_service(|service| {
+                        service.complete_local_database_migration(
+                            &request,
+                            remote_info.logical_size_bytes,
+                            now_millis(),
+                        )
+                    })
+                    .map(|(placement, old_meta)| {
+                        unmount_database_file(&old_meta.db_file_name);
+                        placement
+                    })
                 })
-                .map(|(placement, old_meta)| {
-                    unmount_database_file(&old_meta.db_file_name);
-                    placement
-                })
-            }),
+        }
         Err(error) => Err(error),
     };
-    if result.is_err() {
+    if result.is_err() && migration_started {
         let _ = call_database_canister_with_arg::<(), _>(
             &request.database_canister_id,
             "discard_database_slot_internal",
@@ -795,174 +799,580 @@ fn revoke_database_token(
 }
 
 #[update]
-fn delete_database(database_id: String) -> Result<(), String> {
-    with_usage(
-        "delete_database",
-        Some(database_id.clone()),
-        |service, caller, now| {
-            let meta = service.delete_database(&database_id, caller, now)?;
-            unmount_database_file(&meta.db_file_name);
-            Ok(())
-        },
-    )
+async fn delete_database(database_id: String) -> Result<(), String> {
+    let caller = caller_text();
+    let now = now_millis();
+    let route = route_for_caller(
+        &caller,
+        RequiredRole::Owner,
+        &database_id,
+        &[DatabaseStatus::Hot, DatabaseStatus::Archived],
+    )?;
+    match route.canister_id.clone() {
+        Some(canister_id) => {
+            let operation_hash = shard_request_hash(&(database_id.clone(), canister_id.clone()))?;
+            let operation_id = begin_shard_operation_journal(
+                "delete_remote_database",
+                Some(&database_id),
+                operation_hash,
+                now,
+            )?;
+            let remote_result = call_database_canister_with_arg::<(), _>(
+                &canister_id,
+                "delete_database_slot",
+                database_id.clone(),
+            )
+            .await;
+            let result = match &remote_result {
+                Ok(()) => with_service(|service| {
+                    service.mark_remote_database_deleted(&caller, &database_id, now)
+                }),
+                Err(error) => Err(error.clone()),
+            };
+            let status = match (&remote_result, &result) {
+                (Err(_), _) => RoutedOperationStatus::Failed,
+                (Ok(()), Ok(())) => RoutedOperationStatus::Applied,
+                (Ok(()), Err(_)) => RoutedOperationStatus::Unknown,
+            };
+            let error = result.as_ref().err().map(String::as_str);
+            finish_shard_operation_journal_with_status(&operation_id, status, error, now_millis());
+            result
+        }
+        None => with_usage(
+            "delete_database",
+            Some(database_id.clone()),
+            |service, caller, now| {
+                let meta = service.delete_database(&database_id, caller, now)?;
+                unmount_database_file(&meta.db_file_name);
+                Ok(())
+            },
+        ),
+    }
 }
 
 #[update]
-fn begin_database_archive(database_id: String) -> Result<DatabaseArchiveInfo, String> {
-    with_usage(
-        "begin_database_archive",
-        Some(database_id.clone()),
-        |service, caller, now| service.begin_database_archive(&database_id, caller, now),
-    )
+async fn begin_database_archive(database_id: String) -> Result<DatabaseArchiveInfo, String> {
+    let caller = caller_text();
+    let now = now_millis();
+    let route = hot_route_for_caller(&caller, RequiredRole::Owner, &database_id)?;
+    match route.canister_id {
+        Some(canister_id) => {
+            let operation_hash = shard_request_hash(&(canister_id.clone(), database_id.clone()))?;
+            let operation_id = begin_shard_operation_journal(
+                "begin_remote_database_archive",
+                Some(&database_id),
+                operation_hash,
+                now,
+            )?;
+            let remote_result = call_database_canister_with_arg::<DatabaseArchiveInfo, _>(
+                &canister_id,
+                "begin_database_archive_internal",
+                database_id.clone(),
+            )
+            .await;
+            let remote_succeeded = remote_result.is_ok();
+            let result = match remote_result {
+                Ok(info) => with_service(|service| {
+                    service.mark_remote_database_archiving(&caller, &database_id, now)
+                })
+                .map(|_| info),
+                Err(error) => Err(error),
+            };
+            finish_remote_lifecycle_operation_journal(
+                &operation_id,
+                remote_succeeded,
+                &result,
+                now_millis(),
+            );
+            result
+        }
+        None => with_usage(
+            "begin_database_archive",
+            Some(database_id.clone()),
+            |service, caller, now| service.begin_database_archive(&database_id, caller, now),
+        ),
+    }
 }
 
-#[query]
-fn read_database_archive_chunk(
+#[update]
+async fn read_database_archive_chunk(
     database_id: String,
     offset: u64,
     max_bytes: u32,
 ) -> Result<DatabaseArchiveChunk, String> {
-    with_service(|service| {
-        service
-            .read_database_archive_chunk(&database_id, &caller_text(), offset, max_bytes)
-            .map(|bytes| DatabaseArchiveChunk { bytes })
-    })
+    let caller = caller_text();
+    let route = route_for_caller(
+        &caller,
+        RequiredRole::Owner,
+        &database_id,
+        &[DatabaseStatus::Archiving],
+    )?;
+    match route.canister_id {
+        Some(canister_id) => {
+            call_database_canister_with_arg(
+                &canister_id,
+                "read_database_archive_chunk_internal",
+                DatabaseArchiveReadRequest {
+                    database_id,
+                    offset,
+                    max_bytes,
+                },
+            )
+            .await
+        }
+        None => with_service(|service| {
+            service
+                .read_database_archive_chunk(&database_id, &caller, offset, max_bytes)
+                .map(|bytes| DatabaseArchiveChunk { bytes })
+        }),
+    }
 }
 
 #[update]
-fn finalize_database_archive(database_id: String, snapshot_hash: Vec<u8>) -> Result<(), String> {
-    with_usage(
-        "finalize_database_archive",
-        Some(database_id.clone()),
-        |service, caller, now| {
-            let meta =
-                service.finalize_database_archive(&database_id, caller, snapshot_hash, now)?;
-            unmount_database_file(&meta.db_file_name);
-            Ok(())
-        },
-    )
+async fn finalize_database_archive(
+    database_id: String,
+    snapshot_hash: Vec<u8>,
+) -> Result<(), String> {
+    let caller = caller_text();
+    let now = now_millis();
+    let route = route_for_caller(
+        &caller,
+        RequiredRole::Owner,
+        &database_id,
+        &[DatabaseStatus::Archiving],
+    )?;
+    match route.canister_id {
+        Some(canister_id) => {
+            let operation_hash = shard_request_hash(&(
+                canister_id.clone(),
+                database_id.clone(),
+                snapshot_hash.clone(),
+            ))?;
+            let operation_id = begin_shard_operation_journal(
+                "finalize_remote_database_archive",
+                Some(&database_id),
+                operation_hash,
+                now,
+            )?;
+            let remote_result = call_database_canister_with_arg::<(), _>(
+                &canister_id,
+                "finalize_database_archive_internal",
+                DatabaseArchiveFinalizeRequest {
+                    database_id: database_id.clone(),
+                    snapshot_hash: snapshot_hash.clone(),
+                },
+            )
+            .await;
+            let remote_succeeded = remote_result.is_ok();
+            let result = match remote_result {
+                Ok(()) => with_service(|service| {
+                    service.mark_remote_database_archived(&caller, &database_id, snapshot_hash, now)
+                }),
+                Err(error) => Err(error),
+            };
+            finish_remote_lifecycle_operation_journal(
+                &operation_id,
+                remote_succeeded,
+                &result,
+                now_millis(),
+            );
+            result
+        }
+        None => with_usage(
+            "finalize_database_archive",
+            Some(database_id.clone()),
+            |service, caller, now| {
+                let meta =
+                    service.finalize_database_archive(&database_id, caller, snapshot_hash, now)?;
+                unmount_database_file(&meta.db_file_name);
+                Ok(())
+            },
+        ),
+    }
 }
 
 #[update]
-fn cancel_database_archive(database_id: String) -> Result<(), String> {
-    with_usage(
-        "cancel_database_archive",
-        Some(database_id.clone()),
-        |service, caller, now| {
-            service.cancel_database_archive(&database_id, caller, now)?;
-            Ok(())
-        },
-    )
+async fn cancel_database_archive(database_id: String) -> Result<(), String> {
+    let caller = caller_text();
+    let now = now_millis();
+    let route = route_for_caller(
+        &caller,
+        RequiredRole::Owner,
+        &database_id,
+        &[DatabaseStatus::Archiving],
+    )?;
+    match route.canister_id {
+        Some(canister_id) => {
+            let operation_hash = shard_request_hash(&(canister_id.clone(), database_id.clone()))?;
+            let operation_id = begin_shard_operation_journal(
+                "cancel_remote_database_archive",
+                Some(&database_id),
+                operation_hash,
+                now,
+            )?;
+            let remote_result = call_database_canister_with_arg::<(), _>(
+                &canister_id,
+                "cancel_database_archive_internal",
+                database_id.clone(),
+            )
+            .await;
+            let remote_succeeded = remote_result.is_ok();
+            let result = match remote_result {
+                Ok(()) => with_service(|service| service.database_usage(&database_id, &caller))
+                    .and_then(|usage| {
+                        with_service(|service| {
+                            service.mark_remote_database_hot(
+                                &caller,
+                                &database_id,
+                                usage.logical_size_bytes,
+                                now,
+                            )
+                        })
+                    }),
+                Err(error) => Err(error),
+            };
+            finish_remote_lifecycle_operation_journal(
+                &operation_id,
+                remote_succeeded,
+                &result,
+                now_millis(),
+            );
+            result
+        }
+        None => with_usage(
+            "cancel_database_archive",
+            Some(database_id.clone()),
+            |service, caller, now| {
+                service.cancel_database_archive(&database_id, caller, now)?;
+                Ok(())
+            },
+        ),
+    }
 }
 
 #[update]
-fn begin_database_restore(
+async fn begin_database_restore(
     database_id: String,
     snapshot_hash: Vec<u8>,
     size_bytes: u64,
 ) -> Result<(), String> {
-    with_usage(
-        "begin_database_restore",
-        Some(database_id.clone()),
-        |service, caller, now| {
-            let restore = service.begin_database_restore_session(
-                &database_id,
-                caller,
-                snapshot_hash,
+    let caller = caller_text();
+    let now = now_millis();
+    let route = route_for_caller(
+        &caller,
+        RequiredRole::Owner,
+        &database_id,
+        &[DatabaseStatus::Archived, DatabaseStatus::Deleted],
+    )?;
+    match route.canister_id {
+        Some(canister_id) => {
+            let operation_hash = shard_request_hash(&(
+                canister_id.clone(),
+                database_id.clone(),
+                snapshot_hash.clone(),
                 size_bytes,
+            ))?;
+            let operation_id = begin_shard_operation_journal(
+                "begin_remote_database_restore",
+                Some(&database_id),
+                operation_hash,
                 now,
             )?;
-            if let Err(error) = mount_database_file(&restore.meta) {
-                service
-                    .rollback_database_restore_begin(restore.rollback, now)
-                    .map_err(|rollback_error| {
-                        format!("{error}; restore rollback failed: {rollback_error}")
-                    })?;
-                return Err(error);
-            }
-            Ok(())
-        },
-    )
-}
-
-#[update]
-fn write_database_restore_chunk(request: DatabaseRestoreChunkRequest) -> Result<(), String> {
-    let database_id = request.database_id.clone();
-    with_usage(
-        "write_database_restore_chunk",
-        Some(database_id),
-        |service, caller, _now| {
-            service.write_database_restore_chunk(
-                &request.database_id,
-                caller,
-                request.offset,
-                &request.bytes,
+            let remote_result = call_database_canister_with_arg::<DatabaseInfo, _>(
+                &canister_id,
+                "begin_database_restore_internal",
+                DatabaseRestoreBeginRequest {
+                    database_id: database_id.clone(),
+                    snapshot_hash: snapshot_hash.clone(),
+                    size_bytes,
+                },
             )
-        },
-    )
+            .await;
+            let remote_succeeded = remote_result.is_ok();
+            let result = match remote_result {
+                Ok(_) => with_service(|service| {
+                    service.mark_remote_database_restoring(
+                        &caller,
+                        &database_id,
+                        snapshot_hash,
+                        size_bytes,
+                        now,
+                    )
+                }),
+                Err(error) => Err(error),
+            };
+            finish_remote_lifecycle_operation_journal(
+                &operation_id,
+                remote_succeeded,
+                &result,
+                now_millis(),
+            );
+            result
+        }
+        None => with_usage(
+            "begin_database_restore",
+            Some(database_id.clone()),
+            |service, caller, now| {
+                let restore = service.begin_database_restore_session(
+                    &database_id,
+                    caller,
+                    snapshot_hash,
+                    size_bytes,
+                    now,
+                )?;
+                if let Err(error) = mount_database_file(&restore.meta) {
+                    service
+                        .rollback_database_restore_begin(restore.rollback, now)
+                        .map_err(|rollback_error| {
+                            format!("{error}; restore rollback failed: {rollback_error}")
+                        })?;
+                    return Err(error);
+                }
+                Ok(())
+            },
+        ),
+    }
 }
 
 #[update]
-fn finalize_database_restore(database_id: String) -> Result<(), String> {
-    with_usage(
-        "finalize_database_restore",
-        Some(database_id.clone()),
-        |service, caller, now| {
-            let meta = service.prepare_database_restore_finalize(&database_id, caller)?;
-            mount_database_file(&meta)?;
-            if let Err(error) = service.complete_database_restore(&database_id, caller, now) {
-                unmount_database_file(&meta.db_file_name);
-                return Err(error);
-            }
-            Ok(())
-        },
-    )
-}
-
-#[query]
-fn sql_query(request: SqlExecuteRequest) -> Result<SqlExecuteResponse, String> {
-    with_service(|service| service.sql_query(&caller_text(), request))
-}
-
-#[query]
-fn list_tables(database_id: String) -> Result<Vec<DatabaseTable>, String> {
-    with_service(|service| service.list_tables(&database_id, &caller_text()))
-}
-
-#[query]
-fn describe_table(database_id: String, table_name: String) -> Result<TableDescription, String> {
-    with_service(|service| service.describe_table(&database_id, &table_name, &caller_text()))
-}
-
-#[query]
-fn preview_table(request: TablePreviewRequest) -> Result<TablePreviewResponse, String> {
-    with_service(|service| service.preview_table(&caller_text(), request))
+async fn write_database_restore_chunk(request: DatabaseRestoreChunkRequest) -> Result<(), String> {
+    let database_id = request.database_id.clone();
+    let caller = caller_text();
+    let route = route_for_caller(
+        &caller,
+        RequiredRole::Owner,
+        &database_id,
+        &[DatabaseStatus::Restoring],
+    )?;
+    match route.canister_id {
+        Some(canister_id) => {
+            call_database_canister_with_arg::<(), _>(
+                &canister_id,
+                "write_database_restore_chunk_internal",
+                request,
+            )
+            .await
+        }
+        None => with_usage(
+            "write_database_restore_chunk",
+            Some(database_id),
+            |service, caller, _now| {
+                service.write_database_restore_chunk(
+                    &request.database_id,
+                    caller,
+                    request.offset,
+                    &request.bytes,
+                )
+            },
+        ),
+    }
 }
 
 #[update]
-fn sql_execute(request: SqlExecuteRequest) -> Result<SqlExecuteResponse, String> {
+async fn finalize_database_restore(database_id: String) -> Result<(), String> {
+    let caller = caller_text();
+    let now = now_millis();
+    let route = route_for_caller(
+        &caller,
+        RequiredRole::Owner,
+        &database_id,
+        &[DatabaseStatus::Restoring],
+    )?;
+    match route.canister_id {
+        Some(canister_id) => {
+            let operation_hash = shard_request_hash(&(canister_id.clone(), database_id.clone()))?;
+            let operation_id = begin_shard_operation_journal(
+                "finalize_remote_database_restore",
+                Some(&database_id),
+                operation_hash,
+                now,
+            )?;
+            let remote_result = call_database_canister_with_arg::<DatabaseInfo, _>(
+                &canister_id,
+                "finalize_database_restore_internal",
+                database_id.clone(),
+            )
+            .await;
+            let remote_succeeded = remote_result.is_ok();
+            let result = match remote_result {
+                Ok(info) => with_service(|service| {
+                    service.mark_remote_database_hot(
+                        &caller,
+                        &database_id,
+                        info.logical_size_bytes,
+                        now,
+                    )
+                }),
+                Err(error) => Err(error),
+            };
+            finish_remote_lifecycle_operation_journal(
+                &operation_id,
+                remote_succeeded,
+                &result,
+                now_millis(),
+            );
+            result
+        }
+        None => with_usage(
+            "finalize_database_restore",
+            Some(database_id.clone()),
+            |service, caller, now| {
+                let meta = service.prepare_database_restore_finalize(&database_id, caller)?;
+                mount_database_file(&meta)?;
+                if let Err(error) = service.complete_database_restore(&database_id, caller, now) {
+                    unmount_database_file(&meta.db_file_name);
+                    return Err(error);
+                }
+                Ok(())
+            },
+        ),
+    }
+}
+
+#[update]
+async fn sql_query(request: SqlExecuteRequest) -> Result<SqlExecuteResponse, String> {
+    let caller = caller_text();
+    let route = hot_route_for_caller(&caller, RequiredRole::Reader, &request.database_id)?;
+    match route.canister_id {
+        Some(canister_id) => {
+            call_database_canister_with_arg(&canister_id, "sql_query_internal", request).await
+        }
+        None => with_service(|service| service.sql_query(&caller, request)),
+    }
+}
+
+#[update]
+async fn list_tables(database_id: String) -> Result<Vec<DatabaseTable>, String> {
+    let caller = caller_text();
+    let route = hot_route_for_caller(&caller, RequiredRole::Reader, &database_id)?;
+    match route.canister_id {
+        Some(canister_id) => {
+            call_database_canister_with_arg(&canister_id, "list_tables_internal", database_id).await
+        }
+        None => with_service(|service| service.list_tables(&database_id, &caller)),
+    }
+}
+
+#[update]
+async fn describe_table(
+    database_id: String,
+    table_name: String,
+) -> Result<TableDescription, String> {
+    let caller = caller_text();
+    let route = hot_route_for_caller(&caller, RequiredRole::Reader, &database_id)?;
+    match route.canister_id {
+        Some(canister_id) => {
+            call_database_canister_describe(&canister_id, database_id, table_name).await
+        }
+        None => with_service(|service| service.describe_table(&database_id, &table_name, &caller)),
+    }
+}
+
+#[update]
+async fn preview_table(request: TablePreviewRequest) -> Result<TablePreviewResponse, String> {
+    let caller = caller_text();
+    let route = hot_route_for_caller(&caller, RequiredRole::Reader, &request.database_id)?;
+    match route.canister_id {
+        Some(canister_id) => {
+            call_database_canister_with_arg(&canister_id, "preview_table_internal", request).await
+        }
+        None => with_service(|service| service.preview_table(&caller, request)),
+    }
+}
+
+#[update]
+async fn sql_execute(request: SqlExecuteRequest) -> Result<SqlExecuteResponse, String> {
     let database_id = request.database_id.clone();
     let operation = sql_operation(&request.sql);
-    with_usage_metrics(
-        "sql_execute",
-        operation.as_deref(),
-        Some(database_id),
-        |service, caller, _now| service.sql_execute(caller, request),
-        sql_response_usage_metrics,
-    )
+    let caller = caller_text();
+    let now = now_millis();
+    let route = hot_route_for_caller(&caller, RequiredRole::Writer, &database_id)?;
+    match route.canister_id {
+        Some(canister_id) => {
+            let operation_id = candid_routed_operation_id("sql_execute", &request)?;
+            let response = remote_sql_write_for_caller(
+                &caller,
+                &request,
+                DataPlaneSqlExecuteRequest {
+                    operation_id: operation_id.clone(),
+                    request: request.clone(),
+                },
+                RemotePrincipalWriteContext {
+                    canister_id: &canister_id,
+                    internal_method: "sql_execute_internal",
+                    operation_id: &operation_id,
+                    billing_units: SQL_EXECUTE_BILLING_UNITS,
+                    now,
+                    method: "sql_execute",
+                    operation: operation.as_deref(),
+                    database_id: &database_id,
+                },
+                sql_response_usage_metrics,
+                applied_replay_sql_response,
+            )
+            .await?;
+            Ok(sql_response_with_routed_operation_id(
+                response,
+                &operation_id,
+            ))
+        }
+        None => with_usage_metrics(
+            "sql_execute",
+            operation.as_deref(),
+            Some(database_id),
+            |service, caller, _now| service.sql_execute(caller, request),
+            sql_response_usage_metrics,
+        ),
+    }
 }
 
 #[update]
-fn sql_batch(request: SqlBatchRequest) -> Result<Vec<SqlExecuteResponse>, String> {
+async fn sql_batch(request: SqlBatchRequest) -> Result<Vec<SqlExecuteResponse>, String> {
     let database_id = request.database_id.clone();
     let operation = sql_batch_operation(&request);
-    with_usage_metrics(
-        "sql_batch",
-        operation.as_deref(),
-        Some(database_id),
-        |service, caller, _now| service.sql_batch(caller, request),
-        |responses| sql_batch_usage_metrics(responses),
-    )
+    let billing_units =
+        SQL_EXECUTE_BILLING_UNITS.saturating_mul(request.statements.len().max(1) as u64);
+    let caller = caller_text();
+    let now = now_millis();
+    let route = hot_route_for_caller(&caller, RequiredRole::Writer, &database_id)?;
+    match route.canister_id {
+        Some(canister_id) => {
+            let operation_id = candid_routed_operation_id("sql_batch", &request)?;
+            let statement_count = request.statements.len();
+            let responses = remote_sql_write_for_caller(
+                &caller,
+                &request,
+                DataPlaneSqlBatchRequest {
+                    operation_id: operation_id.clone(),
+                    request: request.clone(),
+                },
+                RemotePrincipalWriteContext {
+                    canister_id: &canister_id,
+                    internal_method: "sql_batch_internal",
+                    operation_id: &operation_id,
+                    billing_units,
+                    now,
+                    method: "sql_batch",
+                    operation: operation.as_deref(),
+                    database_id: &database_id,
+                },
+                |responses: &Vec<SqlExecuteResponse>| sql_batch_usage_metrics(responses),
+                || applied_replay_sql_batch_response(statement_count),
+            )
+            .await?;
+            Ok(sql_batch_response_with_routed_operation_id(
+                responses,
+                &operation_id,
+            ))
+        }
+        None => with_usage_metrics(
+            "sql_batch",
+            operation.as_deref(),
+            Some(database_id),
+            |service, caller, _now| service.sql_batch(caller, request),
+            |responses| sql_batch_usage_metrics(responses),
+        ),
+    }
 }
 
 #[query]
@@ -1155,6 +1565,39 @@ fn finish_shard_operation_journal_with_status(
 ) {
     let _ = with_service(|service| {
         service.update_shard_operation_status(operation_id, status, error, now)
+    });
+}
+
+fn remote_lifecycle_operation_status<T>(
+    remote_succeeded: bool,
+    result: &Result<T, String>,
+) -> RoutedOperationStatus {
+    match (remote_succeeded, result.is_ok()) {
+        (false, _) => RoutedOperationStatus::Failed,
+        (true, true) => RoutedOperationStatus::Applied,
+        (true, false) => RoutedOperationStatus::Unknown,
+    }
+}
+
+fn finish_remote_lifecycle_operation_journal<T>(
+    operation_id: &str,
+    remote_succeeded: bool,
+    result: &Result<T, String>,
+    now: i64,
+) {
+    let status = remote_lifecycle_operation_status(remote_succeeded, result);
+    let error = result.as_ref().err().map(String::as_str);
+    finish_shard_operation_journal_with_status(operation_id, status, error, now);
+}
+
+fn mark_routed_write_completion_failed(operation_id: &str, error: &str, now: i64) {
+    let _ = with_service(|service| {
+        service.update_routed_operation_status(
+            operation_id,
+            RoutedOperationStatus::Unknown,
+            Some(error),
+            now,
+        )
     });
 }
 
@@ -2044,22 +2487,40 @@ async fn http_begin_database_archive(
     let route = hot_route_for_token(token, RequiredRole::Owner, now, &request.database_id)?;
     match route.placement.canister_id.clone() {
         Some(canister_id) => {
-            let result = call_database_canister_with_arg::<DatabaseArchiveInfo, _>(
+            let operation_hash =
+                shard_request_hash(&(canister_id.clone(), request.database_id.clone()))
+                    .map_err(|error| (400, error))?;
+            let operation_id = begin_shard_operation_journal(
+                "begin_remote_database_archive",
+                Some(&request.database_id),
+                operation_hash,
+                now,
+            )
+            .map_err(|error| (http_error_status(&error), error))?;
+            let remote_result = call_database_canister_with_arg::<DatabaseArchiveInfo, _>(
                 &canister_id,
                 "begin_database_archive_internal",
                 request.database_id.clone(),
             )
-            .await
-            .and_then(|info| {
-                with_service(|service| {
+            .await;
+            let remote_succeeded = remote_result.is_ok();
+            let result = match remote_result {
+                Ok(info) => with_service(|service| {
                     service.mark_remote_database_archiving_with_token(
                         &route.auth,
                         &request.database_id,
                         now,
                     )
-                })?;
-                Ok(info)
-            });
+                })
+                .map(|_| info),
+                Err(error) => Err(error),
+            };
+            finish_remote_lifecycle_operation_journal(
+                &operation_id,
+                remote_succeeded,
+                &result,
+                now_millis(),
+            );
             http_json_result(result)
         }
         None => http_json_with_token(token, RequiredRole::Owner, now, |service, auth| {
@@ -2117,22 +2578,43 @@ async fn http_finalize_database_archive(
     )?;
     match route.placement.canister_id.clone() {
         Some(canister_id) => {
-            let result = call_database_canister_with_arg::<(), _>(
+            let operation_hash = shard_request_hash(&(
+                canister_id.clone(),
+                request.database_id.clone(),
+                request.snapshot_hash.clone(),
+            ))
+            .map_err(|error| (400, error))?;
+            let operation_id = begin_shard_operation_journal(
+                "finalize_remote_database_archive",
+                Some(&request.database_id),
+                operation_hash,
+                now,
+            )
+            .map_err(|error| (http_error_status(&error), error))?;
+            let remote_result = call_database_canister_with_arg::<(), _>(
                 &canister_id,
                 "finalize_database_archive_internal",
                 request.clone(),
             )
-            .await
-            .and_then(|_| {
-                with_service(|service| {
+            .await;
+            let remote_succeeded = remote_result.is_ok();
+            let result = match remote_result {
+                Ok(()) => with_service(|service| {
                     service.mark_remote_database_archived_with_token(
                         &route.auth,
                         &request.database_id,
                         request.snapshot_hash,
                         now,
                     )
-                })
-            });
+                }),
+                Err(error) => Err(error),
+            };
+            finish_remote_lifecycle_operation_journal(
+                &operation_id,
+                remote_succeeded,
+                &result,
+                now_millis(),
+            );
             http_json_result(result)
         }
         None => {
@@ -2169,25 +2651,45 @@ async fn http_cancel_database_archive(
     )?;
     match route.placement.canister_id.clone() {
         Some(canister_id) => {
-            let result = call_database_canister_with_arg::<(), _>(
+            let operation_hash =
+                shard_request_hash(&(canister_id.clone(), request.database_id.clone()))
+                    .map_err(|error| (400, error))?;
+            let operation_id = begin_shard_operation_journal(
+                "cancel_remote_database_archive",
+                Some(&request.database_id),
+                operation_hash,
+                now,
+            )
+            .map_err(|error| (http_error_status(&error), error))?;
+            let remote_result = call_database_canister_with_arg::<(), _>(
                 &canister_id,
                 "cancel_database_archive_internal",
                 request.database_id.clone(),
             )
-            .await
-            .and_then(|_| {
-                let usage = with_service(|service| {
+            .await;
+            let remote_succeeded = remote_result.is_ok();
+            let result = match remote_result {
+                Ok(()) => with_service(|service| {
                     service.database_usage_with_token(&route.auth, &request.database_id)
-                })?;
-                with_service(|service| {
-                    service.mark_remote_database_hot_with_token(
-                        &route.auth,
-                        &request.database_id,
-                        usage.logical_size_bytes,
-                        now,
-                    )
                 })
-            });
+                .and_then(|usage| {
+                    with_service(|service| {
+                        service.mark_remote_database_hot_with_token(
+                            &route.auth,
+                            &request.database_id,
+                            usage.logical_size_bytes,
+                            now,
+                        )
+                    })
+                }),
+                Err(error) => Err(error),
+            };
+            finish_remote_lifecycle_operation_journal(
+                &operation_id,
+                remote_succeeded,
+                &result,
+                now_millis(),
+            );
             http_json_result(result)
         }
         None => http_json_with_token(token, RequiredRole::Owner, now, |service, auth| {
@@ -2276,14 +2778,29 @@ async fn http_begin_database_restore(
     )?;
     match route.placement.canister_id.clone() {
         Some(canister_id) => {
-            let result = call_database_canister_with_arg::<DatabaseInfo, _>(
+            let operation_hash = shard_request_hash(&(
+                canister_id.clone(),
+                request.database_id.clone(),
+                request.snapshot_hash.clone(),
+                request.size_bytes,
+            ))
+            .map_err(|error| (400, error))?;
+            let operation_id = begin_shard_operation_journal(
+                "begin_remote_database_restore",
+                Some(&request.database_id),
+                operation_hash,
+                now,
+            )
+            .map_err(|error| (http_error_status(&error), error))?;
+            let remote_result = call_database_canister_with_arg::<DatabaseInfo, _>(
                 &canister_id,
                 "begin_database_restore_internal",
                 request.clone(),
             )
-            .await
-            .and_then(|_| {
-                with_service(|service| {
+            .await;
+            let remote_succeeded = remote_result.is_ok();
+            let result = match remote_result {
+                Ok(_) => with_service(|service| {
                     service.mark_remote_database_restoring_with_token(
                         &route.auth,
                         &request.database_id,
@@ -2291,8 +2808,15 @@ async fn http_begin_database_restore(
                         request.size_bytes,
                         now,
                     )
-                })
-            });
+                }),
+                Err(error) => Err(error),
+            };
+            finish_remote_lifecycle_operation_journal(
+                &operation_id,
+                remote_succeeded,
+                &result,
+                now_millis(),
+            );
             http_json_result(result)
         }
         None => {
@@ -2371,22 +2895,40 @@ async fn http_finalize_database_restore(
     )?;
     match route.placement.canister_id.clone() {
         Some(canister_id) => {
-            let result = call_database_canister_with_arg::<DatabaseInfo, _>(
+            let operation_hash =
+                shard_request_hash(&(canister_id.clone(), request.database_id.clone()))
+                    .map_err(|error| (400, error))?;
+            let operation_id = begin_shard_operation_journal(
+                "finalize_remote_database_restore",
+                Some(&request.database_id),
+                operation_hash,
+                now,
+            )
+            .map_err(|error| (http_error_status(&error), error))?;
+            let remote_result = call_database_canister_with_arg::<DatabaseInfo, _>(
                 &canister_id,
                 "finalize_database_restore_internal",
                 request.database_id.clone(),
             )
-            .await
-            .and_then(|info| {
-                with_service(|service| {
+            .await;
+            let remote_succeeded = remote_result.is_ok();
+            let result = match remote_result {
+                Ok(info) => with_service(|service| {
                     service.mark_remote_database_hot_with_token(
                         &route.auth,
                         &request.database_id,
                         info.logical_size_bytes,
                         now,
                     )
-                })
-            });
+                }),
+                Err(error) => Err(error),
+            };
+            finish_remote_lifecycle_operation_journal(
+                &operation_id,
+                remote_succeeded,
+                &result,
+                now_millis(),
+            );
             http_json_result(result)
         }
         None => {
@@ -2422,6 +2964,36 @@ struct RemoteWriteContext<'a> {
     operation_id: &'a str,
     billing_units: u64,
     usage: HttpUsageContext<'a>,
+}
+
+struct RemotePrincipalWriteContext<'a> {
+    canister_id: &'a str,
+    internal_method: &'static str,
+    operation_id: &'a str,
+    billing_units: u64,
+    now: i64,
+    method: &'static str,
+    operation: Option<&'a str>,
+    database_id: &'a str,
+}
+
+fn hot_route_for_caller(
+    caller: &str,
+    required_role: RequiredRole,
+    database_id: &str,
+) -> Result<DatabaseShardPlacement, String> {
+    with_service(|service| service.hot_database_route(database_id, caller, required_role))
+}
+
+fn route_for_caller(
+    caller: &str,
+    required_role: RequiredRole,
+    database_id: &str,
+    allowed_statuses: &[DatabaseStatus],
+) -> Result<DatabaseShardPlacement, String> {
+    with_service(|service| {
+        service.database_route(database_id, caller, required_role, allowed_statuses)
+    })
 }
 
 fn hot_route_for_token(
@@ -2507,8 +3079,10 @@ async fn http_sql_execute_with_token(
                     },
                 },
                 sql_response_usage_metrics,
+                applied_replay_sql_response,
             )
-            .await;
+            .await
+            .map(|response| sql_response_with_routed_operation_id(response, operation_id));
             http_json_result(result)
         }
         None => http_json_with_token_usage_metrics(
@@ -2541,6 +3115,7 @@ async fn http_sql_batch_with_token(
         Some(canister_id) => {
             let operation_id = idempotency_key(headers)
                 .ok_or_else(|| (400, "missing idempotency-key header".to_string()))?;
+            let statement_count = request.statements.len();
             let result = remote_sql_write_with_token(
                 route,
                 &request,
@@ -2562,8 +3137,10 @@ async fn http_sql_batch_with_token(
                     },
                 },
                 |responses: &Vec<SqlExecuteResponse>| sql_batch_usage_metrics(responses),
+                || applied_replay_sql_batch_response(statement_count),
             )
-            .await;
+            .await
+            .map(|responses| sql_batch_response_with_routed_operation_id(responses, operation_id));
             http_json_result(result)
         }
         None => http_json_with_token_usage_metrics(
@@ -2646,6 +3223,7 @@ async fn remote_sql_write_with_token<T, H, A, M>(
     call_request: A,
     context: RemoteWriteContext<'_>,
     metrics: M,
+    applied_replay_response: impl FnOnce() -> T,
 ) -> Result<T, String>
 where
     T: CandidType + for<'de> Deserialize<'de> + serde::Serialize,
@@ -2669,9 +3247,7 @@ where
     })?;
     match started.status {
         RoutedOperationStatus::Pending | RoutedOperationStatus::Failed => {}
-        RoutedOperationStatus::Applied => {
-            return Err("routed operation already applied".to_string());
-        }
+        RoutedOperationStatus::Applied => return Ok(applied_replay_response()),
         RoutedOperationStatus::Unknown => {
             return Err("routed operation outcome is unknown".to_string());
         }
@@ -2693,7 +3269,7 @@ where
             .await;
             match usage {
                 Ok(usage) => {
-                    with_service(|service| {
+                    let completion = with_service(|service| {
                         service.complete_routed_write_with_token(
                             &route.auth,
                             context.operation_id,
@@ -2701,7 +3277,24 @@ where
                             usage.logical_size_bytes,
                             context.usage.now,
                         )
-                    })?;
+                    });
+                    if let Err(error) = completion {
+                        mark_routed_write_completion_failed(
+                            context.operation_id,
+                            &error,
+                            context.usage.now,
+                        );
+                        record_token_usage(
+                            &route.auth,
+                            &context.usage,
+                            false,
+                            cycles_delta,
+                            0,
+                            0,
+                            Some(&error),
+                        );
+                        return Err(error);
+                    }
                     let (rows_returned, rows_affected) = metrics(&response);
                     record_token_usage(
                         &route.auth,
@@ -2754,6 +3347,135 @@ where
                 0,
                 Some(&error),
             );
+            Err(error)
+        }
+    }
+}
+
+async fn remote_sql_write_for_caller<T, H, A, M>(
+    caller: &str,
+    hash_request: &H,
+    call_request: A,
+    context: RemotePrincipalWriteContext<'_>,
+    metrics: M,
+    applied_replay_response: impl FnOnce() -> T,
+) -> Result<T, String>
+where
+    T: CandidType + for<'de> Deserialize<'de> + serde::Serialize,
+    H: serde::Serialize,
+    A: CandidType,
+    M: FnOnce(&T) -> (u64, u64),
+{
+    let request_hash = routed_request_hash(context.internal_method, hash_request)?;
+    let started = with_service(|service| {
+        service.begin_routed_write(
+            caller,
+            context.database_id,
+            RoutedWriteBegin {
+                operation_id: context.operation_id,
+                database_canister_id: context.canister_id,
+                method: context.internal_method,
+                request_hash,
+                billing_units: context.billing_units,
+                now: context.now,
+            },
+        )
+    })?;
+    match started.status {
+        RoutedOperationStatus::Pending | RoutedOperationStatus::Failed => {}
+        RoutedOperationStatus::Applied => return Ok(applied_replay_response()),
+        RoutedOperationStatus::Unknown => {
+            return Err("routed operation outcome is unknown".to_string());
+        }
+    }
+
+    let before_cycles = cycle_balance();
+    let result =
+        call_database_canister_with_arg(context.canister_id, context.internal_method, call_request)
+            .await;
+    let after_cycles = cycle_balance();
+    let cycles_delta = before_cycles.saturating_sub(after_cycles);
+    match result {
+        Ok(response) => {
+            let usage = call_database_canister_with_arg::<DatabaseUsage, _>(
+                context.canister_id,
+                "database_usage_internal",
+                context.database_id.to_string(),
+            )
+            .await;
+            match usage {
+                Ok(usage) => {
+                    let completion = with_service(|service| {
+                        service.complete_routed_write(
+                            caller,
+                            context.database_id,
+                            context.operation_id,
+                            context.billing_units,
+                            usage.logical_size_bytes,
+                            context.now,
+                        )
+                    });
+                    if let Err(error) = completion {
+                        mark_routed_write_completion_failed(
+                            context.operation_id,
+                            &error,
+                            context.now,
+                        );
+                        record_principal_usage(
+                            caller,
+                            &context,
+                            false,
+                            cycles_delta,
+                            0,
+                            0,
+                            Some(&error),
+                        );
+                        return Err(error);
+                    }
+                    let (rows_returned, rows_affected) = metrics(&response);
+                    record_principal_usage(
+                        caller,
+                        &context,
+                        true,
+                        cycles_delta,
+                        rows_returned,
+                        rows_affected,
+                        None,
+                    );
+                    Ok(response)
+                }
+                Err(error) => {
+                    let _ = with_service(|service| {
+                        service.update_routed_operation_status(
+                            context.operation_id,
+                            RoutedOperationStatus::Unknown,
+                            Some(&error),
+                            context.now,
+                        )
+                    });
+                    record_principal_usage(
+                        caller,
+                        &context,
+                        false,
+                        cycles_delta,
+                        0,
+                        0,
+                        Some(&error),
+                    );
+                    Err(error)
+                }
+            }
+        }
+        Err(error) => {
+            let _ = with_service(|service| {
+                service.update_routed_operation_status(
+                    context.operation_id,
+                    RoutedOperationStatus::Failed,
+                    Some(&error),
+                    context.now,
+                )
+            });
+            record_principal_usage(caller, &context, false, cycles_delta, 0, 0, Some(&error));
             Err(error)
         }
     }
@@ -2896,6 +3618,72 @@ fn record_token_usage(
             now: context.now,
         })
     });
+}
+
+fn record_principal_usage(
+    caller: &str,
+    context: &RemotePrincipalWriteContext<'_>,
+    success: bool,
+    cycles_delta: u128,
+    rows_returned: u64,
+    rows_affected: u64,
+    error: Option<&str>,
+) {
+    let _ = with_service(|service| {
+        service.record_usage_event(UsageEvent {
+            method: context.method,
+            operation: context.operation,
+            database_id: Some(context.database_id),
+            caller,
+            success,
+            cycles_delta,
+            rows_returned,
+            rows_affected,
+            error,
+            now: context.now,
+        })
+    });
+}
+
+fn next_candid_routed_operation_id<T>(method: &str, request: &T) -> Result<String, String>
+where
+    T: serde::Serialize,
+{
+    let mut hash = routed_request_hash(method, request)?;
+    hash.extend_from_slice(caller_text().as_bytes());
+    hash.extend_from_slice(&now_nanos().to_be_bytes());
+    let suffix = base32_lower(&hash);
+    Ok(format!(
+        "icpdb-candid-{method}-{}-{}",
+        now_nanos(),
+        &suffix[..suffix.len().min(26)]
+    ))
+}
+
+fn candid_routed_operation_id<T>(method: &str, request: &T) -> Result<String, String>
+where
+    T: serde::Serialize + CandidSqlIdempotencyKey,
+{
+    match request.candid_idempotency_key() {
+        Some(key) => Ok(key.to_string()),
+        None => next_candid_routed_operation_id(method, request),
+    }
+}
+
+trait CandidSqlIdempotencyKey {
+    fn candid_idempotency_key(&self) -> Option<&str>;
+}
+
+impl CandidSqlIdempotencyKey for SqlExecuteRequest {
+    fn candid_idempotency_key(&self) -> Option<&str> {
+        self.idempotency_key.as_deref()
+    }
+}
+
+impl CandidSqlIdempotencyKey for SqlBatchRequest {
+    fn candid_idempotency_key(&self) -> Option<&str> {
+        self.idempotency_key.as_deref()
+    }
 }
 
 fn routed_request_hash<T>(method: &str, request: &T) -> Result<Vec<u8>, String>
@@ -3070,6 +3858,41 @@ fn sql_batch_usage_metrics(responses: &[SqlExecuteResponse]) -> (u64, u64) {
             let next_affected = affected.saturating_add(response.rows_affected);
             (next_rows, next_affected)
         })
+}
+
+fn applied_replay_sql_response() -> SqlExecuteResponse {
+    SqlExecuteResponse {
+        columns: Vec::new(),
+        rows: Vec::new(),
+        rows_affected: 0,
+        last_insert_rowid: 0,
+        truncated: false,
+        routed_operation_id: None,
+    }
+}
+
+fn applied_replay_sql_batch_response(statement_count: usize) -> Vec<SqlExecuteResponse> {
+    (0..statement_count)
+        .map(|_| applied_replay_sql_response())
+        .collect()
+}
+
+fn sql_response_with_routed_operation_id(
+    mut response: SqlExecuteResponse,
+    operation_id: &str,
+) -> SqlExecuteResponse {
+    response.routed_operation_id = Some(operation_id.to_string());
+    response
+}
+
+fn sql_batch_response_with_routed_operation_id(
+    mut responses: Vec<SqlExecuteResponse>,
+    operation_id: &str,
+) -> Vec<SqlExecuteResponse> {
+    for response in &mut responses {
+        response.routed_operation_id = Some(operation_id.to_string());
+    }
+    responses
 }
 
 fn sql_operation(sql: &str) -> Option<String> {

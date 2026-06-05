@@ -17,7 +17,7 @@ import type {
   TableDescription,
   TablePreviewRequest,
   TablePreviewResponse
-} from "@/lib/types";
+} from "./types.js";
 import type {
   RawDatabaseColumn,
   RawDatabaseForeignKey,
@@ -34,7 +34,7 @@ import type {
   RawTableDescription,
   RawTablePreviewRequest,
   RawTablePreviewResponse
-} from "@/lib/icpdb-raw-types";
+} from "./icpdb-raw-types.js";
 
 export function normalizeDatabaseTable(raw: RawDatabaseTable): DatabaseTable {
   return {
@@ -84,7 +84,8 @@ export function rawSqlRequest(request: SqlExecuteRequest): RawSqlExecuteRequest 
     database_id: request.databaseId,
     sql: request.sql,
     params: request.params.map(rawSqlValue),
-    max_rows: request.maxRows === null ? [] : [request.maxRows]
+    max_rows: request.maxRows === null ? [] : [request.maxRows],
+    idempotency_key: request.idempotencyKey === null || request.idempotencyKey === undefined ? [] : [request.idempotencyKey]
   };
 }
 
@@ -92,7 +93,8 @@ export function rawSqlBatchRequest(request: SqlBatchRequest): RawSqlBatchRequest
   return {
     database_id: request.databaseId,
     statements: request.statements.map(rawSqlStatement),
-    max_rows: request.maxRows === null ? [] : [request.maxRows]
+    max_rows: request.maxRows === null ? [] : [request.maxRows],
+    idempotency_key: request.idempotencyKey === null || request.idempotencyKey === undefined ? [] : [request.idempotencyKey]
   };
 }
 
@@ -102,7 +104,8 @@ export function normalizeSqlResponse(raw: RawSqlExecuteResponse): SqlExecuteResp
     rows: raw.rows.map((row) => row.map(normalizeSqlValue)),
     rowsAffected: raw.rows_affected.toString(),
     lastInsertRowId: raw.last_insert_rowid.toString(),
-    truncated: raw.truncated
+    truncated: raw.truncated,
+    routedOperationId: raw.routed_operation_id[0] ?? null
   };
 }
 

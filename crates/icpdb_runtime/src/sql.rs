@@ -132,6 +132,7 @@ fn execute_prepared(
             rows_affected: rows_affected as u64,
             last_insert_rowid: conn.last_insert_rowid(),
             truncated: false,
+            routed_operation_id: None,
         });
     }
     query_rows(statement, &values, max_rows, conn.last_insert_rowid())
@@ -172,6 +173,7 @@ fn query_rows(
                     rows_affected: 0,
                     last_insert_rowid,
                     truncated,
+                    routed_operation_id: None,
                 });
             }
             response_row.push(value);
@@ -184,6 +186,7 @@ fn query_rows(
         rows_affected: 0,
         last_insert_rowid,
         truncated,
+        routed_operation_id: None,
     })
 }
 

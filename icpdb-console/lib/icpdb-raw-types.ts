@@ -27,6 +27,63 @@ export type RawDatabaseShardPlacement = {
   updated_at_ms: bigint;
 };
 
+export type RawDatabaseShardInfo = {
+  shard_id: string;
+  canister_id: string;
+  status: string;
+  max_databases: number;
+  assigned_databases: bigint;
+  created_at_ms: bigint;
+  updated_at_ms: bigint;
+};
+
+export type RawDatabaseShardStatus = {
+  shard: RawDatabaseShardInfo;
+  canister_status: string;
+  cycles_balance: bigint;
+  memory_size_bytes: bigint;
+  idle_cycles_burned_per_day: bigint;
+  module_hash: [] | [number[]];
+};
+
+export type RawCreateDatabaseShardRequest = {
+  initial_cycles: bigint;
+  max_databases: number;
+};
+
+export type RawRegisterDatabaseShardRequest = {
+  database_canister_id: string;
+  max_databases: number;
+};
+
+export type RawCreateRemoteDatabaseRequest = {
+  database_id: string;
+  database_canister_id: string;
+};
+
+export type RawDatabaseShardMaintenanceAction = {
+  action: string;
+  database_canister_id: [] | [string];
+  shard_id: [] | [string];
+  cycles: bigint;
+  reason: string;
+};
+
+export type RawDatabaseShardMaintenanceReport = {
+  available_slots: bigint;
+  inspected_shards: RawDatabaseShardStatus[];
+  actions: RawDatabaseShardMaintenanceAction[];
+};
+
+export type RawMaintainDatabaseShardsRequest = {
+  min_available_slots: bigint;
+  min_cycles_balance: bigint;
+  top_up_cycles: bigint;
+  max_new_shards: number;
+  new_shard_max_databases: number;
+  new_shard_initial_cycles: bigint;
+};
+
 export type RawShardOperationInfo = {
   operation_id: string;
   operation_kind: string;
@@ -80,6 +137,17 @@ export type RawDatabaseUsageEventSummary = {
   total_rows_returned: bigint;
   total_rows_affected: bigint;
   last_created_at_ms: bigint;
+};
+
+export type RawDatabaseInfo = {
+  database_id: string;
+  status: Variant;
+  logical_size_bytes: bigint;
+  schema_version: string;
+  mount_id: [] | [number];
+  snapshot_hash: [] | [number[]];
+  archived_at_ms: [] | [bigint];
+  deleted_at_ms: [] | [bigint];
 };
 
 export type RawDatabaseBilling = {
@@ -242,6 +310,7 @@ export type RawSqlExecuteRequest = {
   sql: string;
   params: RawSqlValue[];
   max_rows: [] | [number];
+  idempotency_key: [] | [string];
 };
 
 export type RawSqlStatement = {
@@ -253,6 +322,7 @@ export type RawSqlBatchRequest = {
   database_id: string;
   statements: RawSqlStatement[];
   max_rows: [] | [number];
+  idempotency_key: [] | [string];
 };
 
 export type RawSqlExecuteResponse = {
@@ -261,4 +331,5 @@ export type RawSqlExecuteResponse = {
   rows_affected: bigint;
   last_insert_rowid: bigint;
   truncated: boolean;
+  routed_operation_id: [] | [string];
 };

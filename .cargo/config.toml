@@ -1,0 +1,7 @@
+# Where: .cargo/config.toml
+# What: Stabilize Rust test execution for the local SQLite VFS.
+# Why: ic-sqlite-vfs registers process-global SQLite VFS state; parallel Rust
+# tests can race registration/connection cleanup and fail with "no such vfs".
+
+[env]
+RUST_TEST_THREADS = "1"

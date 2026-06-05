@@ -3,11 +3,17 @@
 // icpdb-console/components/icpdb-schema-viewers.tsx
 // Table schema viewers for indexes, triggers, and foreign keys in the ICPDB table editor.
 
-import { Search } from "lucide-react";
+import { Code2, Search } from "lucide-react";
 import { useMemo, useState } from "react";
 import type { DatabaseForeignKey, DatabaseIndex, DatabaseTrigger } from "@/lib/types";
 
-export function IndexViewer({ indexes }: { indexes: DatabaseIndex[] }) {
+export function IndexViewer({
+  indexes,
+  onOpenSchemaSql
+}: {
+  indexes: DatabaseIndex[];
+  onOpenSchemaSql?: (sql: string) => void;
+}) {
   const [indexSearch, setIndexSearch] = useState("");
   const visibleIndexes = useMemo(() => filterIndexes(indexes, indexSearch), [indexSearch, indexes]);
   const indexCountLabel = indexSearch.trim() ? `${visibleIndexes.length}/${indexes.length}` : String(indexes.length);
@@ -39,13 +45,14 @@ export function IndexViewer({ indexes }: { indexes: DatabaseIndex[] }) {
                 <th className="border-b border-[#eef1f5] py-2 pr-3 font-medium">Columns</th>
                 <th className="border-b border-[#eef1f5] py-2 pr-3 font-medium">Unique</th>
                 <th className="border-b border-[#eef1f5] py-2 pr-3 font-medium">Origin</th>
-                <th className="border-b border-[#eef1f5] py-2 font-medium">Partial</th>
+                <th className="border-b border-[#eef1f5] py-2 pr-3 font-medium">Partial</th>
+                <th className="border-b border-[#eef1f5] py-2 font-medium">SQL</th>
               </tr>
             </thead>
             <tbody>
               {visibleIndexes.length === 0 ? (
                 <tr>
-                  <td className="border-b border-[#f2f4f7] py-3 text-center text-[#667085]" colSpan={5}>
+                  <td className="border-b border-[#f2f4f7] py-3 text-center text-[#667085]" colSpan={6}>
                     No matching indexes
                   </td>
                 </tr>
@@ -60,7 +67,21 @@ export function IndexViewer({ indexes }: { indexes: DatabaseIndex[] }) {
                   </td>
                   <td className="border-b border-[#f2f4f7] py-2 pr-3">{index.unique ? "yes" : "no"}</td>
                   <td className="border-b border-[#f2f4f7] py-2 pr-3 font-mono">{index.origin}</td>
-                  <td className="border-b border-[#f2f4f7] py-2">{index.partial ? "yes" : "no"}</td>
+                  <td className="border-b border-[#f2f4f7] py-2 pr-3">{index.partial ? "yes" : "no"}</td>
+                  <td className="border-b border-[#f2f4f7] py-2">
+                    <button
+                      aria-label={`Open index SQL for ${index.name}`}
+                      className="inline-flex h-7 w-7 items-center justify-center rounded border border-[#c9ced8] bg-white text-[#344054] hover:bg-[#f7f8fb] disabled:opacity-50"
+                      disabled={!index.schemaSql || !onOpenSchemaSql}
+                      title="Open index SQL"
+                      type="button"
+                      onClick={() => {
+                        if (index.schemaSql) onOpenSchemaSql?.(ensureSqlSemicolon(index.schemaSql));
+                      }}
+                    >
+                      <Code2 aria-hidden size={14} />
+                    </button>
+                  </td>
                 </tr>
               ))}
             </tbody>
@@ -71,7 +92,13 @@ export function IndexViewer({ indexes }: { indexes: DatabaseIndex[] }) {
   );
 }
 
-export function TriggerViewer({ triggers }: { triggers: DatabaseTrigger[] }) {
+export function TriggerViewer({
+  triggers,
+  onOpenSchemaSql
+}: {
+  triggers: DatabaseTrigger[];
+  onOpenSchemaSql?: (sql: string) => void;
+}) {
   const [triggerSearch, setTriggerSearch] = useState("");
   const visibleTriggers = useMemo(() => filterTriggers(triggers, triggerSearch), [triggerSearch, triggers]);
   const triggerCountLabel = triggerSearch.trim() ? `${visibleTriggers.length}/${triggers.length}` : String(triggers.length);
@@ -103,7 +130,21 @@ export function TriggerViewer({ triggers }: { triggers: DatabaseTrigger[] }) {
             <div key={trigger.name}>
               <div className="flex items-center justify-between gap-3 text-xs">
                 <span className="truncate font-mono" title={trigger.name}>{trigger.name}</span>
-                <span className="font-mono text-[#667085]">{trigger.tableName}</span>
+                <span className="flex shrink-0 items-center gap-2">
+                  <span className="font-mono text-[#667085]">{trigger.tableName}</span>
+                  <button
+                    aria-label={`Open trigger SQL for ${trigger.name}`}
+                    className="inline-flex h-7 w-7 items-center justify-center rounded border border-[#c9ced8] bg-white text-[#344054] hover:bg-[#f7f8fb] disabled:opacity-50"
+                    disabled={!trigger.schemaSql || !onOpenSchemaSql}
+                    title="Open trigger SQL"
+                    type="button"
+                    onClick={() => {
+                      if (trigger.schemaSql) onOpenSchemaSql?.(ensureSqlSemicolon(trigger.schemaSql));
+                    }}
+                  >
+                    <Code2 aria-hidden size={14} />
+                  </button>
+                </span>
               </div>
               <pre className="mt-2 max-h-28 overflow-auto rounded-md bg-[#0d1117] p-3 font-mono text-xs leading-5 text-[#d6e2ff]">
                 {trigger.schemaSql ?? "No trigger SQL"}
@@ -116,7 +157,15 @@ export function TriggerViewer({ triggers }: { triggers: DatabaseTrigger[] }) {
   );
 }
 
-export function ForeignKeyViewer({ foreignKeys }: { foreignKeys: DatabaseForeignKey[] }) {
+export function ForeignKeyViewer({
+  foreignKeys,
+  tableName,
+  onOpenForeignKeySql
+}: {
+  foreignKeys: DatabaseForeignKey[];
+  tableName: string | null;
+  onOpenForeignKeySql?: (tableName: string) => void;
+}) {
   const [foreignKeySearch, setForeignKeySearch] = useState("");
   const visibleForeignKeys = useMemo(() => filterForeignKeys(foreignKeys, foreignKeySearch), [foreignKeySearch, foreignKeys]);
   const foreignKeyCountLabel = foreignKeySearch.trim() ? `${visibleForeignKeys.length}/${foreignKeys.length}` : String(foreignKeys.length);
@@ -124,19 +173,33 @@ export function ForeignKeyViewer({ foreignKeys }: { foreignKeys: DatabaseForeign
     <div className="rounded-md border border-[#d5d9e2] bg-white p-3">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <h3 className="text-sm font-semibold">Foreign keys</h3>
-        {foreignKeys.length > 0 ? (
-          <label className="flex h-8 min-w-40 items-center gap-2 rounded-md border border-[#c9ced8] bg-white px-2 text-xs text-[#5f6c7b]">
-            <Search aria-hidden size={14} />
-            <input
-              aria-label="Search foreign keys"
-              className="min-w-0 flex-1 bg-transparent font-mono text-[#182230] outline-none"
-              placeholder="Search foreign keys"
-              value={foreignKeySearch}
-              onChange={(event) => setForeignKeySearch(event.target.value)}
-            />
-            <span className="font-mono text-[#667085]">{foreignKeyCountLabel}</span>
-          </label>
-        ) : null}
+        <div className="flex flex-wrap items-center gap-2">
+          {foreignKeys.length > 0 ? (
+            <label className="flex h-8 min-w-40 items-center gap-2 rounded-md border border-[#c9ced8] bg-white px-2 text-xs text-[#5f6c7b]">
+              <Search aria-hidden size={14} />
+              <input
+                aria-label="Search foreign keys"
+                className="min-w-0 flex-1 bg-transparent font-mono text-[#182230] outline-none"
+                placeholder="Search foreign keys"
+                value={foreignKeySearch}
+                onChange={(event) => setForeignKeySearch(event.target.value)}
+              />
+              <span className="font-mono text-[#667085]">{foreignKeyCountLabel}</span>
+            </label>
+          ) : null}
+          <button
+            className="inline-flex h-8 items-center gap-1 rounded-md border border-[#c9ced8] bg-white px-2 text-xs font-medium text-[#344054] disabled:opacity-50"
+            disabled={!tableName || !onOpenForeignKeySql}
+            title="Open foreign key SQL"
+            type="button"
+            onClick={() => {
+              if (tableName) onOpenForeignKeySql?.(tableName);
+            }}
+          >
+            <Code2 aria-hidden size={14} />
+            <span>Open foreign key SQL</span>
+          </button>
+        </div>
       </div>
       {foreignKeys.length === 0 ? <p className="mt-3 text-xs text-[#667085]">None</p> : null}
       {foreignKeys.length > 0 ? (
@@ -230,4 +293,9 @@ function filterForeignKeys(foreignKeys: DatabaseForeignKey[], foreignKeySearch: 
     key.onDelete,
     key.matchClause
   ].some((value) => value.toLowerCase().includes(query)));
+}
+
+function ensureSqlSemicolon(sql: string): string {
+  const trimmed = sql.trim();
+  return trimmed.endsWith(";") ? trimmed : `${trimmed};`;
 }

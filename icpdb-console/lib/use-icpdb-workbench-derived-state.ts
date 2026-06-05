@@ -10,12 +10,17 @@ import {
 } from "@/lib/row-mutations";
 import {
   canWriteDatabaseRole,
+  isValidPrincipalText,
+  isSafeQuotaBytes,
+  normalizeMemberPrincipalInput,
   parseIcpToE8s
 } from "@/lib/workbench-state";
 import type { ArchiveSnapshot } from "@/lib/use-icpdb-backup-actions";
 import type { ApprovedDeposit, WalletStatus } from "@/lib/use-icpdb-billing-actions";
 import type {
   DatabaseColumn,
+  DatabaseMember,
+  DatabaseRole,
   DatabaseSummary,
   DatabaseTable,
   DepositQuote,
@@ -23,6 +28,8 @@ import type {
   TableDescription,
   TablePreviewResponse
 } from "@/lib/types";
+
+const ANONYMOUS_PRINCIPAL = "2vxsx-fae";
 
 type DerivedStateOptions = {
   archiveSnapshot: ArchiveSnapshot | null;
@@ -37,6 +44,8 @@ type DerivedStateOptions = {
   depositQuote: DepositQuote | null;
   loadState: "idle" | "loading" | "ready" | "error";
   memberPrincipal: string;
+  memberRole: DatabaseRole;
+  members: DatabaseMember[];
   principal: string | null;
   quotaBytes: string;
   selectedCellColumnName: string;
@@ -94,6 +103,8 @@ export function useIcpdbWorkbenchDerivedState(options: DerivedStateOptions): Wor
     depositQuote,
     loadState,
     memberPrincipal,
+    memberRole,
+    members,
     principal,
     quotaBytes,
     selectedCellColumnName,
@@ -148,10 +159,15 @@ export function useIcpdbWorkbenchDerivedState(options: DerivedStateOptions): Wor
   const canRestore =
     canManageDatabase && canDownloadArchive && (selectedDatabase?.status === "archived" || selectedDatabase?.status === "deleted");
   const canMutateMembers = canManageDatabase && selectedDatabase?.status === "hot";
-  const canGrantMember = canMutateMembers && memberPrincipal.trim().length > 0;
+  const canGrantMember =
+    canMutateMembers &&
+    isGrantableMemberPrincipal(memberPrincipal) &&
+    !isCallerSelfDowngrade(memberPrincipal, memberRole, principal) &&
+    !isLastOwnerDowngrade(memberPrincipal, memberRole, members) &&
+    !hasSameMemberRole(memberPrincipal, memberRole, members);
   const canDeleteDatabase =
     canManageDatabase && (selectedDatabase?.status === "hot" || selectedDatabase?.status === "archived");
-  const canSetQuota = canManageDatabase && /^\d+$/.test(quotaBytes.trim());
+  const canSetQuota = canManageDatabase && isSafeQuotaBytes(quotaBytes);
 
   return {
     approvedDepositMatches,
@@ -193,4 +209,25 @@ function depositQuoteAmountMatches(quote: DepositQuote | null, depositAmount: st
   } catch {
     return false;
   }
+}
+
+function isGrantableMemberPrincipal(principal: string): boolean {
+  const value = normalizeMemberPrincipalInput(principal);
+  return value.length > 0 && value !== ANONYMOUS_PRINCIPAL && isValidPrincipalText(value);
+}
+
+function isCallerSelfDowngrade(memberPrincipal: string, memberRole: DatabaseRole, principal: string | null): boolean {
+  return Boolean(principal && normalizeMemberPrincipalInput(memberPrincipal) === principal && memberRole !== "owner");
+}
+
+function isLastOwnerDowngrade(memberPrincipal: string, memberRole: DatabaseRole, members: DatabaseMember[]): boolean {
+  if (memberRole === "owner") return false;
+  const principal = normalizeMemberPrincipalInput(memberPrincipal);
+  const ownerCount = members.filter((member) => member.role === "owner").length;
+  return ownerCount <= 1 && members.some((member) => member.principal === principal && member.role === "owner");
+}
+
+function hasSameMemberRole(memberPrincipal: string, memberRole: DatabaseRole, members: DatabaseMember[]): boolean {
+  const principal = normalizeMemberPrincipalInput(memberPrincipal);
+  return members.some((member) => member.principal === principal && member.role === memberRole);
 }

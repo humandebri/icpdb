@@ -1,6 +1,6 @@
 // Where: crates/icpdb_types/src/sql.rs
-// What: SQL hosting request and response contracts.
-// Why: Raw SQLite execution needs a transport-safe value model shared by canister and clients.
+// What: SQLite Admin Protocol request and response contracts.
+// Why: Protocol-compatible canisters need one transport-safe SQL value model shared with clients.
 use candid::CandidType;
 use serde::{Deserialize, Serialize};
 
@@ -25,6 +25,8 @@ pub struct SqlExecuteRequest {
     pub sql: String,
     pub params: Vec<SqlValue>,
     pub max_rows: Option<u32>,
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, CandidType)]
@@ -38,6 +40,8 @@ pub struct SqlBatchRequest {
     pub database_id: String,
     pub statements: Vec<SqlStatement>,
     pub max_rows: Option<u32>,
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, CandidType)]
@@ -59,6 +63,7 @@ pub struct SqlExecuteResponse {
     pub rows_affected: u64,
     pub last_insert_rowid: i64,
     pub truncated: bool,
+    pub routed_operation_id: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, CandidType)]

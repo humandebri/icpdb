@@ -13,6 +13,23 @@ export const expectedTypes = {
       deleted_at_ms: "opt int64"
     }
   },
+  DatabaseInfo: {
+    kind: "record",
+    fields: {
+      status: "DatabaseStatus",
+      logical_size_bytes: "nat64",
+      schema_version: "text",
+      database_id: "text",
+      archived_at_ms: "opt int64",
+      mount_id: "opt nat16",
+      snapshot_hash: "opt blob",
+      deleted_at_ms: "opt int64"
+    }
+  },
+  DatabaseBalanceTopUpRequest: {
+    kind: "record",
+    fields: { database_id: "text", units: "nat64" }
+  },
   DatabaseShardPlacement: {
     kind: "record",
     fields: {
@@ -25,6 +42,84 @@ export const expectedTypes = {
       canister_id: "opt text",
       mount_id: "opt nat16"
     }
+  },
+  DatabaseShardInfo: {
+    kind: "record",
+    fields: {
+      status: "text",
+      shard_id: "text",
+      canister_id: "text",
+      updated_at_ms: "int64",
+      created_at_ms: "int64",
+      assigned_databases: "nat64",
+      max_databases: "nat16"
+    }
+  },
+  DatabaseShardStatus: {
+    kind: "record",
+    fields: {
+      cycles_balance: "nat",
+      memory_size_bytes: "nat",
+      shard: "DatabaseShardInfo",
+      canister_status: "text",
+      idle_cycles_burned_per_day: "nat",
+      module_hash: "opt blob"
+    }
+  },
+  DatabaseShardMaintenanceAction: {
+    kind: "record",
+    fields: {
+      action: "text",
+      database_canister_id: "opt text",
+      shard_id: "opt text",
+      cycles: "nat",
+      reason: "text"
+    }
+  },
+  DatabaseShardMaintenanceReport: {
+    kind: "record",
+    fields: {
+      actions: "vec DatabaseShardMaintenanceAction",
+      available_slots: "nat64",
+      inspected_shards: "vec DatabaseShardStatus"
+    }
+  },
+  CreateDatabaseShardRequest: {
+    kind: "record",
+    fields: {
+      initial_cycles: "nat",
+      max_databases: "nat16"
+    }
+  },
+  RegisterDatabaseShardRequest: {
+    kind: "record",
+    fields: {
+      database_canister_id: "text",
+      max_databases: "nat16"
+    }
+  },
+  DatabaseShardStatusRequest: {
+    kind: "record",
+    fields: { database_canister_id: "text" }
+  },
+  TopUpDatabaseShardRequest: {
+    kind: "record",
+    fields: { database_canister_id: "text", cycles: "nat" }
+  },
+  MaintainDatabaseShardsRequest: {
+    kind: "record",
+    fields: {
+      top_up_cycles: "nat",
+      new_shard_initial_cycles: "nat",
+      new_shard_max_databases: "nat16",
+      min_cycles_balance: "nat",
+      min_available_slots: "nat64",
+      max_new_shards: "nat16"
+    }
+  },
+  CreateRemoteDatabaseRequest: {
+    kind: "record",
+    fields: { database_canister_id: "text", database_id: "text" }
   },
   RoutedOperationStatus: { kind: "variant", cases: { Applied: "null", Failed: "null", Unknown: "null", Pending: "null" } },
   RoutedOperationInfo: {
@@ -258,7 +353,8 @@ export const expectedTypes = {
     fields: {
       max_rows: "opt nat32",
       database_id: "text",
-      statements: "vec SqlStatement"
+      statements: "vec SqlStatement",
+      idempotency_key: "opt text"
     }
   },
   SqlExecuteRequest: {
@@ -267,13 +363,15 @@ export const expectedTypes = {
       sql: "text",
       max_rows: "opt nat32",
       database_id: "text",
-      params: "vec SqlValue"
+      params: "vec SqlValue",
+      idempotency_key: "opt text"
     }
   },
   SqlExecuteResponse: {
     kind: "record",
     fields: {
       truncated: "bool",
+      routed_operation_id: "opt text",
       rows: "vec vec SqlValue",
       rows_affected: "nat64",
       last_insert_rowid: "int64",
@@ -321,6 +419,7 @@ export const expectedTypes = {
   ResultArchiveChunk: { kind: "variant", cases: { Ok: "DatabaseArchiveChunk", Err: "text" } },
   ResultSqlBatch: { kind: "variant", cases: { Ok: "vec SqlExecuteResponse", Err: "text" } },
   ResultCreateDatabase: { kind: "variant", cases: { Ok: "text", Err: "text" } },
+  ResultDatabaseInfo: { kind: "variant", cases: { Ok: "DatabaseInfo", Err: "text" } },
   ResultDatabases: { kind: "variant", cases: { Ok: "vec DatabaseSummary", Err: "text" } },
   ResultUsage: { kind: "variant", cases: { Ok: "DatabaseUsage", Err: "text" } },
   ResultUsageEvents: { kind: "variant", cases: { Ok: "vec DatabaseUsageEventSummary", Err: "text" } },
@@ -330,6 +429,11 @@ export const expectedTypes = {
   ResultPayments: { kind: "variant", cases: { Ok: "vec PaymentRecord", Err: "text" } },
   ResultTokens: { kind: "variant", cases: { Ok: "vec DatabaseTokenInfo", Err: "text" } },
   ResultShardPlacements: { kind: "variant", cases: { Ok: "vec DatabaseShardPlacement", Err: "text" } },
+  ResultShardPlacement: { kind: "variant", cases: { Ok: "DatabaseShardPlacement", Err: "text" } },
+  ResultDatabaseShards: { kind: "variant", cases: { Ok: "vec DatabaseShardInfo", Err: "text" } },
+  ResultDatabaseShardInfo: { kind: "variant", cases: { Ok: "DatabaseShardInfo", Err: "text" } },
+  ResultDatabaseShardStatus: { kind: "variant", cases: { Ok: "DatabaseShardStatus", Err: "text" } },
+  ResultDatabaseShardMaintenanceReport: { kind: "variant", cases: { Ok: "DatabaseShardMaintenanceReport", Err: "text" } },
   ResultShardOperations: { kind: "variant", cases: { Ok: "vec ShardOperationInfo", Err: "text" } },
   ResultShardOperation: { kind: "variant", cases: { Ok: "ShardOperationInfo", Err: "text" } },
   ResultCreateToken: { kind: "variant", cases: { Ok: "CreateDatabaseTokenResponse", Err: "text" } },
@@ -344,23 +448,26 @@ export const didTypeAliases = {
   ResultArchiveInfo: "Result",
   ResultUnit: "Result_1",
   ResultCreateDatabase: "Result_2",
+  ResultDatabaseShardInfo: "Result_3",
   ResultCreateToken: "Result_4",
+  ResultDatabaseInfo: "Result_5",
   ResultDeposit: "Result_6",
   ResultTableDescription: "Result_7",
   ResultBilling: "Result_8",
+  ResultDatabaseShardStatus: "Result_9",
   ResultDepositQuote: "Result_10",
   ResultRoutedOperation: "Result_11",
   ResultUsage: "Result_12",
   ResultUsageEvents: "Result_13",
   ResultShardPlacements: "Result_14",
   ResultMembers: "Result_15",
-  ResultShardInfos: "Result_16",
+  ResultDatabaseShards: "Result_16",
   ResultTokens: "Result_17",
   ResultDatabases: "Result_18",
   ResultPayments: "Result_19",
   ResultShardOperations: "Result_20",
   ResultTables: "Result_21",
-  ResultMaintenance: "Result_22",
+  ResultDatabaseShardMaintenanceReport: "Result_22",
   ResultShardPlacement: "Result_23",
   ResultTablePreview: "Result_24",
   ResultArchiveChunk: "Result_25",
@@ -376,13 +483,16 @@ export const expectedMethods = {
   cancel_database_archive: { input: ["text"], output: "ResultUnit", mode: "update" },
   canister_health: { input: [], output: "CanisterHealth", mode: "query" },
   create_database: { input: [], output: "ResultCreateDatabase", mode: "update" },
+  create_database_shard: { input: ["CreateDatabaseShardRequest"], output: "ResultDatabaseShardInfo", mode: "update" },
+  create_remote_database: { input: ["CreateRemoteDatabaseRequest"], output: "ResultDatabaseInfo", mode: "update" },
   create_database_token: { input: ["CreateDatabaseTokenRequest"], output: "ResultCreateToken", mode: "update" },
   delete_database: { input: ["text"], output: "ResultUnit", mode: "update" },
   deposit_with_approval: { input: ["text", "nat64"], output: "ResultDeposit", mode: "update" },
-  describe_table: { input: ["text", "text"], output: "ResultTableDescription", mode: "query" },
+  describe_table: { input: ["text", "text"], output: "ResultTableDescription", mode: "update" },
   finalize_database_archive: { input: ["text", "blob"], output: "ResultUnit", mode: "update" },
   finalize_database_restore: { input: ["text"], output: "ResultUnit", mode: "update" },
   get_billing: { input: ["text"], output: "ResultBilling", mode: "query" },
+  get_database_shard_status: { input: ["DatabaseShardStatusRequest"], output: "ResultDatabaseShardStatus", mode: "update" },
   get_deposit_quote: { input: ["text", "nat64"], output: "ResultDepositQuote", mode: "update" },
   get_routed_operation: { input: ["RoutedOperationRequest"], output: "ResultRoutedOperation", mode: "query" },
   get_usage: { input: ["text"], output: "ResultUsage", mode: "query" },
@@ -391,20 +501,26 @@ export const expectedMethods = {
   list_database_members: { input: ["text"], output: "ResultMembers", mode: "query" },
   list_all_database_placements: { input: [], output: "ResultShardPlacements", mode: "query" },
   list_database_placements: { input: [], output: "ResultShardPlacements", mode: "query" },
+  list_database_shards: { input: [], output: "ResultDatabaseShards", mode: "query" },
   list_databases: { input: [], output: "ResultDatabases", mode: "query" },
   list_database_tokens: { input: ["text"], output: "ResultTokens", mode: "query" },
   list_payments: { input: ["text"], output: "ResultPayments", mode: "query" },
   list_shard_operations: { input: [], output: "ResultShardOperations", mode: "query" },
-  list_tables: { input: ["text"], output: "ResultTables", mode: "query" },
-  preview_table: { input: ["TablePreviewRequest"], output: "ResultTablePreview", mode: "query" },
-  read_database_archive_chunk: { input: ["text", "nat64", "nat32"], output: "ResultArchiveChunk", mode: "query" },
+  list_tables: { input: ["text"], output: "ResultTables", mode: "update" },
+  maintain_database_shards: { input: ["MaintainDatabaseShardsRequest"], output: "ResultDatabaseShardMaintenanceReport", mode: "update" },
+  migrate_database_to_shard: { input: ["CreateRemoteDatabaseRequest"], output: "ResultShardPlacement", mode: "update" },
+  preview_table: { input: ["TablePreviewRequest"], output: "ResultTablePreview", mode: "update" },
+  read_database_archive_chunk: { input: ["text", "nat64", "nat32"], output: "ResultArchiveChunk", mode: "update" },
   reconcile_routed_operation: { input: ["RoutedOperationRequest"], output: "ResultRoutedOperation", mode: "update" },
   reconcile_shard_operation: { input: ["ShardOperationReconcileRequest"], output: "ResultShardOperation", mode: "update" },
+  register_database_shard: { input: ["RegisterDatabaseShardRequest"], output: "ResultDatabaseShardInfo", mode: "update" },
   revoke_database_access: { input: ["text", "text"], output: "ResultUnit", mode: "update" },
   revoke_database_token: { input: ["text", "text"], output: "ResultRevokedToken", mode: "update" },
   set_database_quota: { input: ["DatabaseQuotaRequest"], output: "ResultUsage", mode: "update" },
   sql_batch: { input: ["SqlBatchRequest"], output: "ResultSqlBatch", mode: "update" },
   sql_execute: { input: ["SqlExecuteRequest"], output: "ResultSql", mode: "update" },
-  sql_query: { input: ["SqlExecuteRequest"], output: "ResultSql", mode: "query" },
+  sql_query: { input: ["SqlExecuteRequest"], output: "ResultSql", mode: "update" },
+  top_up_database_balance: { input: ["DatabaseBalanceTopUpRequest"], output: "ResultBilling", mode: "update" },
+  top_up_database_shard: { input: ["TopUpDatabaseShardRequest"], output: "ResultDatabaseShardInfo", mode: "update" },
   write_database_restore_chunk: { input: ["DatabaseRestoreChunkRequest"], output: "ResultUnit", mode: "update" }
 };

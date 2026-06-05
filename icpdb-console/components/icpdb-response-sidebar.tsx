@@ -1,16 +1,14 @@
 "use client";
 
 // icpdb-console/components/icpdb-response-sidebar.tsx
-// Right-side console sidebar: response metrics, usage, shard status, access, backup, and billing groups.
+// Right-side console sidebar: response metrics, usage, shard status, access, and lifecycle groups.
 
 import { ShardOperationJournalPanel, ShardPlacementPanel, UsageEventSummaryPanel } from "@/components/icpdb-display-panels";
 import { RoutedOperationPanel } from "@/components/icpdb-operation-panel";
 import { ResponseAccessPanel, ResponseLifecyclePanel } from "@/components/icpdb-response-admin-panels";
 import { ResponseMetricsPanel } from "@/components/icpdb-response-metrics-panel";
 import type { ArchiveSnapshot } from "@/lib/use-icpdb-backup-actions";
-import type { WalletStatus } from "@/lib/use-icpdb-billing-actions";
 import type {
-  DatabaseBilling,
   DatabaseMember,
   DatabaseRole,
   DatabaseShardPlacement,
@@ -20,25 +18,21 @@ import type {
   DatabaseTokenScope,
   DatabaseUsage,
   DatabaseUsageEventSummary,
-  DepositQuote,
-  PaymentRecord,
   RoutedOperationInfo,
   ShardOperationInfo,
   ShardOperationReconcileStatus,
   SqlExecuteResponse
 } from "@/lib/types";
 
-type ResponseSidebarProps = {
+export type ResponseSidebarProps = {
   archiveSnapshot: ArchiveSnapshot | null;
   archiveSnapshotName: string | null;
   archiveStatus: string;
   batchResponses: SqlExecuteResponse[];
-  billing: DatabaseBilling | null;
-  canApproveDeposit: boolean;
   canArchive: boolean;
   canCancelArchive: boolean;
+  canisterId: string;
   canDeleteDatabase: boolean;
-  canDeposit: boolean;
   canDownloadArchive: boolean;
   canDownloadSqlDump: boolean;
   canGrantMember: boolean;
@@ -46,19 +40,15 @@ type ResponseSidebarProps = {
   canLoadRoutedOperation: boolean;
   canManageDatabase: boolean;
   canMutateMembers: boolean;
-  canQuoteDeposit: boolean;
   canRestore: boolean;
   canRun: boolean;
   canSetQuota: boolean;
-  depositAmount: string;
-  depositQuote: DepositQuote | null;
   issuedToken: string | null;
   memberPrincipal: string;
   memberRole: DatabaseRole;
   operationId: string;
   operationStatus: string;
   members: DatabaseMember[];
-  payments: PaymentRecord[];
   principal: string | null;
   quotaBytes: string;
   response: SqlExecuteResponse | null;
@@ -76,15 +66,10 @@ type ResponseSidebarProps = {
   tokens: DatabaseTokenInfo[];
   usage: DatabaseUsage | null;
   usageEvents: DatabaseUsageEventSummary[];
-  walletOwner: string | null;
-  walletStatus: WalletStatus;
-  onApproveDeposit: () => void;
   onArchiveDatabase: () => void;
   onCancelArchive: () => void;
   onCreateToken: () => void;
   onDeleteDatabase: () => void;
-  onDepositAmountChange: (value: string) => void;
-  onDepositApproved: () => void;
   onDownloadArchiveSnapshot: () => void;
   onDownloadSqlDump: () => void;
   onGrantMember: () => void;
@@ -95,7 +80,6 @@ type ResponseSidebarProps = {
   onLoadRoutedOperation: () => void;
   onOperationIdChange: (value: string) => void;
   onQuotaBytesChange: (value: string) => void;
-  onQuoteDeposit: () => void;
   onRefreshAllShardPlacements: () => void;
   onRefreshShardOperations: () => void;
   onReconcileShardOperation: (operation: ShardOperationInfo, status: ShardOperationReconcileStatus) => void;
@@ -114,7 +98,7 @@ export function ResponseSidebar(props: ResponseSidebarProps) {
       <h3 className="text-sm font-semibold">Response</h3>
       <ResponseMetricsPanel
         batchResponses={props.batchResponses}
-        billing={props.billing}
+        canisterId={props.canisterId}
         issuedToken={props.issuedToken}
         response={props.response}
         selectedDatabase={props.selectedDatabase}
@@ -174,33 +158,21 @@ export function ResponseSidebar(props: ResponseSidebarProps) {
         archiveSnapshot={props.archiveSnapshot}
         archiveSnapshotName={props.archiveSnapshotName}
         archiveStatus={props.archiveStatus}
-        canApproveDeposit={props.canApproveDeposit}
         canArchive={props.canArchive}
         canCancelArchive={props.canCancelArchive}
-        canDeposit={props.canDeposit}
         canDownloadArchive={props.canDownloadArchive}
         canDownloadSqlDump={props.canDownloadSqlDump}
         canLoadSqlDump={props.canLoadSqlDump}
-        canQuoteDeposit={props.canQuoteDeposit}
         canRestore={props.canRestore}
         canRun={props.canRun}
-        depositAmount={props.depositAmount}
-        depositQuote={props.depositQuote}
-        payments={props.payments}
         selectedDatabaseStatus={props.selectedDatabase?.status ?? null}
         sqlDumpStatus={props.sqlDumpStatus}
-        walletOwner={props.walletOwner}
-        walletStatus={props.walletStatus}
-        onApproveDeposit={props.onApproveDeposit}
         onArchiveDatabase={props.onArchiveDatabase}
         onCancelArchive={props.onCancelArchive}
-        onDepositAmountChange={props.onDepositAmountChange}
-        onDepositApproved={props.onDepositApproved}
         onDownloadArchiveSnapshot={props.onDownloadArchiveSnapshot}
         onDownloadSqlDump={props.onDownloadSqlDump}
         onLoadArchiveFile={props.onLoadArchiveFile}
         onLoadSqlDumpFile={props.onLoadSqlDumpFile}
-        onQuoteDeposit={props.onQuoteDeposit}
         onRestoreArchive={props.onRestoreArchive}
       />
     </aside>

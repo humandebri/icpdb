@@ -33,6 +33,14 @@ type TableEditorPanelProps = {
   onChangeTableLimit: (value: string) => void;
   onLoadTablePage: (offset: number) => void;
   onMutateRow: (mutation: RowMutation) => void;
+  onOpenCountSql: (tableName: string) => void;
+  onOpenColumnSql: (tableName: string) => void;
+  onOpenForeignKeySql: (tableName: string) => void;
+  onOpenInsertSql: (tableDescription: TableDescription) => void;
+  onOpenPageSql: (tableName: string, limit: number, offset: number) => void;
+  onOpenSchemaLookupSql: (tableName: string) => void;
+  onOpenSchemaSql: (sql: string) => void;
+  onOpenTableSql: (tableName: string) => void;
   onRowJsonChange: (value: string) => void;
   onSelectPreviewCell: (rowIndex: number, columnName: string) => void;
   onSelectPreviewRow: (rowIndex: number) => void;
@@ -58,6 +66,7 @@ export function TableEditorPanel(props: TableEditorPanelProps) {
         onCellValueChange={props.onCellValueChange}
         onChangeTableLimit={props.onChangeTableLimit}
         onLoadTablePage={props.onLoadTablePage}
+        onOpenPageSql={props.onOpenPageSql}
         onSelectPreviewCell={props.onSelectPreviewCell}
         onSelectPreviewRow={props.onSelectPreviewRow}
         onUpdateCell={props.onUpdateCell}
@@ -67,8 +76,18 @@ export function TableEditorPanel(props: TableEditorPanelProps) {
         selectedRowIndex={props.selectedRowIndex}
         tableDescription={props.tableDescription}
         tablePreview={props.tablePreview}
+        onOpenCountSql={props.onOpenCountSql}
+        onOpenInsertSql={props.onOpenInsertSql}
+        onOpenSchemaLookupSql={props.onOpenSchemaLookupSql}
+        onOpenTableSql={props.onOpenTableSql}
       />
-      <TableSchemaPanel tableDescription={props.tableDescription} />
+      <TableSchemaPanel
+        tableDescription={props.tableDescription}
+        onOpenColumnSql={props.onOpenColumnSql}
+        onOpenForeignKeySql={props.onOpenForeignKeySql}
+        onOpenSchemaLookupSql={props.onOpenSchemaLookupSql}
+        onOpenSchemaSql={props.onOpenSchemaSql}
+      />
       <RowEditorPanel
         canEditRows={props.canEditRows}
         canMutateSelectedRow={props.canMutateSelectedRow}

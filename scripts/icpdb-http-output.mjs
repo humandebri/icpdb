@@ -4,6 +4,7 @@
 
 import {
   formatCreatedDatabase,
+  formatCreatedDatabaseEnv,
   formatCreatedToken,
   formatDatabaseAccess,
   formatMemberList,
@@ -19,7 +20,7 @@ import {
   formatTableIndexesResult,
   formatTableTriggersResult
 } from "./icpdb-http-schema-output.mjs";
-import { formatRecordTable, formatTable, sqlValueToDisplay } from "./icpdb-http-table-format.mjs";
+import { formatRecordTable, formatTable, sqlScalarRecord, sqlValueToDisplay } from "./icpdb-http-table-format.mjs";
 
 export function formatCliOutput(value, command = {}, defaultFormat = "json") {
   const outputFormat = command.outputFormat ?? defaultFormat;
@@ -28,6 +29,11 @@ export function formatCliOutput(value, command = {}, defaultFormat = "json") {
   }
   if (outputFormat === "csv") {
     return formatCsvOutput(value, outputShapes);
+  }
+  if (outputFormat === "env") {
+    if (command.createDatabase && isCreatedDatabase(value)) return formatCreatedDatabaseEnv(value, command);
+    if (command.archive || command.snapshotInfo) return formatSnapshotInfoEnv(value);
+    throw new Error("format env is only available for create-db, archive, or snapshot-info output");
   }
   if (command.createDatabase && isCreatedDatabase(value)) {
     return formatCreatedDatabase(value);
@@ -45,6 +51,19 @@ export function formatCliOutput(value, command = {}, defaultFormat = "json") {
     return formatPaymentList(value);
   }
   return formatHumanOutput(value);
+}
+
+function formatSnapshotInfoEnv(value) {
+  const entries = {
+    ICPDB_SNAPSHOT_DATABASE_ID: value.database_id,
+    ICPDB_SNAPSHOT_FILE: value.file,
+    ICPDB_SNAPSHOT_SIZE_BYTES: value.size_bytes,
+    ICPDB_SNAPSHOT_HASH: value.snapshot_hash
+  };
+  return Object.entries(entries)
+    .filter(([_key, entryValue]) => entryValue !== undefined && entryValue !== "")
+    .map(([key, entryValue]) => `${key}=${JSON.stringify(String(entryValue))}`)
+    .join("\n");
 }
 
 export function schemaEntry(description) {
@@ -67,6 +86,7 @@ function formatHumanOutput(value) {
     return isUsageEventSummaries(value) ? formatUsageEventSummaries(value) : formatRecordTable(value);
   }
   if (isTablePreview(value)) return formatTablePreview(value);
+  if (isSqlScalarResult(value)) return formatSqlScalarResult(value);
   if (isSqlResponse(value)) return formatSqlResponse(value);
   if (isTableColumnsResult(value)) return formatTableColumnsResult(value);
   if (isTableDescription(value)) return formatTableDescription(value);
@@ -87,6 +107,7 @@ function formatHumanOutput(value) {
         : [];
       return [`database ${value.database_id}`, ...placement, ...account, ...usageEvents, ...access, ...summary, ...value.tables.map(formatTableDescription)].join("\n\n");
     }
+    if (isStatusResult(value)) return formatStatusResult(value);
     if (value.stats && Array.isArray(value.table_summaries)) return formatStatsResult(value);
     if (value.table && value.preview) {
       return [formatTableDescription(value.table), "preview", formatTablePreview(value.preview)].join("\n\n");
@@ -98,6 +119,10 @@ function formatHumanOutput(value) {
 
 function isSqlResponse(value) {
   return Boolean(value && typeof value === "object" && Array.isArray(value.columns) && Array.isArray(value.rows));
+}
+
+function isSqlScalarResult(value) {
+  return Boolean(value && typeof value === "object" && value.scalar === true && Object.hasOwn(value, "value"));
 }
 
 function isTablePreview(value) {
@@ -125,6 +150,7 @@ function isTableForeignKeysResult(value) {
 }
 
 const outputShapes = {
+  isSqlScalarResult,
   isSqlResponse,
   isTableColumnsResult,
   isTableDescription,
@@ -133,6 +159,22 @@ const outputShapes = {
   isTablePreview,
   isTableTriggersResult
 };
+
+export function sqlScalarResult(response) {
+  const columns = response.columns ?? [];
+  const rows = response.rows ?? [];
+  const row = Array.isArray(rows[0]) ? rows[0] : [];
+  const rowFound = rows.length > 0;
+  const columnFound = columns.length > 0;
+  return {
+    scalar: true,
+    column: columnFound ? String(columns[0]) : "",
+    value: rowFound && columnFound ? row[0] ?? null : null,
+    row_found: rowFound,
+    rows_returned: rows.length,
+    truncated: Boolean(response.truncated)
+  };
+}
 
 function isSchemaResult(value) {
   return Boolean(value && typeof value === "object" && Array.isArray(value.schemas));
@@ -179,15 +221,20 @@ function formatSqlResponse(response) {
   return `${table}\n${footer}${response.truncated ? " (truncated)" : ""}`;
 }
 
+function formatSqlScalarResult(result) {
+  return formatRecordTable([sqlScalarRecord(result)]);
+}
+
+
 function formatTablePreview(preview) {
-  const total = preview.total_count ?? preview.rows?.length ?? 0;
+  const total = requiredNonNegativeCount(preview.total_count, "preview total_count");
   return `${preview.table_name} (${total} rows; ${formatTablePreviewPage(preview)})\n${formatSqlResponse(preview)}`;
 }
 
 function formatTablePreviewPage(preview) {
   const rows = preview.rows ?? [];
-  const offset = nonNegativeNumber(preview.offset, 0);
-  const limit = nonNegativeNumber(preview.limit, rows.length);
+  const offset = requiredNonNegativeNumber(preview.offset, "preview offset");
+  const limit = requiredNonNegativeNumber(preview.limit, "preview limit");
   const range = rows.length === 0 ? "showing 0" : `showing ${offset + 1}-${offset + rows.length}`;
   return `${range}; limit ${limit}; offset ${offset}; next ${formatTablePreviewNextOffset(preview, offset, rows.length)}`;
 }
@@ -199,13 +246,48 @@ function formatTablePreviewNextOffset(preview, offset, shown) {
   return BigInt(nextOffset) < BigInt(String(total)) ? String(nextOffset) : "-";
 }
 
-function nonNegativeNumber(value, fallback) {
-  return Number.isInteger(value) && value >= 0 ? value : fallback;
+function requiredNonNegativeNumber(value, label) {
+  if (Number.isInteger(value) && value >= 0) return value;
+  throw new Error(`${label} must be a non-negative integer`);
+}
+
+function requiredNonNegativeCount(value, label) {
+  if (Number.isInteger(value) && value >= 0) return String(value);
+  if (typeof value === "string" && /^\d+$/.test(value)) return value;
+  throw new Error(`${label} must be a non-negative integer`);
 }
 
 function formatStatsResult(value) {
   return [
     `database ${value.database_id}`,
+    "summary",
+    formatRecordTable([value.stats]),
+    "table summary",
+    formatRecordTable(value.table_summaries.map(tableSummaryRecord))
+  ].join("\n\n");
+}
+
+function isStatusResult(value) {
+  return Boolean(
+    value &&
+    typeof value === "object" &&
+    typeof value.connection_url === "string" &&
+    Object.hasOwn(value, "placement") &&
+    Object.hasOwn(value, "usage") &&
+    value.stats &&
+    Array.isArray(value.table_summaries)
+  );
+}
+
+function formatStatusResult(value) {
+  return [
+    `database ${value.database_id}`,
+    "connection",
+    formatRecordTable([{ url: value.connection_url, caller_principal: value.caller_principal ?? "", caller_role: value.caller_role ?? "" }]),
+    "placement",
+    value.placement ? formatRecordTable([value.placement]) : "(no placement)",
+    "usage",
+    value.usage ? formatRecordTable([value.usage]) : "(no usage)",
     "summary",
     formatRecordTable([value.stats]),
     "table summary",

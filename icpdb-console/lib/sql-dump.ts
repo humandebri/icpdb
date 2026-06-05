@@ -5,22 +5,30 @@ import type { Identity } from "@icp-sdk/core/agent";
 import {
   describeTableAuthenticated,
   listTablesAuthenticated,
-  previewTableAuthenticated
+  previewTableAuthenticated,
+  sqlQueryAuthenticated
 } from "@/lib/icpdb-client";
 import {
   describeTableWithToken,
   listTablesWithToken,
   previewTableWithToken,
+  sqlQueryWithToken,
   type IcpdbTokenSession
 } from "@/lib/icpdb-http-client";
 import type {
   DatabaseTable,
   SqlBatchRequest,
+  SqlExecuteResponse,
   SqlStatement,
   SqlValue,
   TableDescription,
   TablePreviewResponse
 } from "@/lib/types";
+import {
+  splitSqlDumpStatements,
+  splitSqlStatements,
+  trimSqlSemicolon
+} from "./icpdb-sql-script";
 
 const sqlDumpPageSize = 250;
 
@@ -28,6 +36,7 @@ type SqlDumpReader = {
   listTables: () => Promise<DatabaseTable[]>;
   describeTable: (tableName: string) => Promise<TableDescription>;
   previewTable: (tableName: string, limit: number, offset: number) => Promise<TablePreviewResponse>;
+  query: (sql: string, params: SqlValue[], maxRows?: number | null) => Promise<SqlExecuteResponse>;
 };
 
 export async function buildSqlDump(canisterId: string, identity: Identity, databaseId: string): Promise<string> {
@@ -39,6 +48,12 @@ export async function buildSqlDump(canisterId: string, identity: Identity, datab
       tableName,
       limit,
       offset
+    }),
+    query: (sql, params, maxRows = null) => sqlQueryAuthenticated(canisterId, identity, {
+      databaseId,
+      sql,
+      params,
+      maxRows
     })
   });
 }
@@ -52,11 +67,17 @@ export async function buildSqlDumpWithToken(session: IcpdbTokenSession): Promise
       tableName,
       limit,
       offset
+    }),
+    query: (sql, params, maxRows = null) => sqlQueryWithToken(session, {
+      databaseId: session.databaseId,
+      sql,
+      params,
+      maxRows
     })
   });
 }
 
-async function buildSqlDumpWithReader(reader: SqlDumpReader): Promise<string> {
+export async function buildSqlDumpWithReader(reader: SqlDumpReader): Promise<string> {
   const tables = await reader.listTables();
   const descriptions = await Promise.all(tables.map((table) => reader.describeTable(table.name)));
   const lines = ["PRAGMA foreign_keys=OFF;", "BEGIN TRANSACTION;"];
@@ -71,7 +92,7 @@ async function buildSqlDumpWithReader(reader: SqlDumpReader): Promise<string> {
     while (true) {
       const preview = await reader.previewTable(description.tableName, sqlDumpPageSize, offset);
       for (const row of preview.rows) {
-        lines.push(formatInsertStatement(description.tableName, preview.columns, row));
+        lines.push(formatDumpInsertStatement(description, preview.columns, row));
       }
       offset += preview.rows.length;
       if (preview.rows.length === 0 || BigInt(offset) >= BigInt(preview.totalCount)) {
@@ -79,6 +100,7 @@ async function buildSqlDumpWithReader(reader: SqlDumpReader): Promise<string> {
       }
     }
   }
+  lines.push(...await sqliteSequenceDumpStatements(reader, descriptions.filter((description) => description.objectType === "table").map((description) => description.tableName)));
   for (const description of descriptions) {
     for (const index of description.indexes) {
       if (index.schemaSql) lines.push(`${trimSqlSemicolon(index.schemaSql)};`);
@@ -89,6 +111,35 @@ async function buildSqlDumpWithReader(reader: SqlDumpReader): Promise<string> {
   }
   lines.push("COMMIT;");
   return `${lines.join("\n")}\n`;
+}
+
+async function sqliteSequenceDumpStatements(reader: SqlDumpReader, tableNames: readonly string[]): Promise<string[]> {
+  const sqliteSequence = await reader.query(
+    "SELECT name FROM sqlite_master WHERE type = ?1 AND name = ?2",
+    [{ kind: "text", value: "table" }, { kind: "text", value: "sqlite_sequence" }],
+    1
+  );
+  if (sqliteSequence.rows.length === 0) return [];
+  const includedTables = new Set(tableNames);
+  const statements: string[] = [];
+  let lastName = "";
+  while (true) {
+    const response = await reader.query(
+      "SELECT name, seq FROM sqlite_sequence WHERE name > ?1 ORDER BY name",
+      [{ kind: "text", value: lastName }],
+      sqlDumpPageSize
+    );
+    if (response.rows.length === 0) break;
+    for (const row of response.rows) {
+      const name = sqlValueText(row[0]);
+      lastName = name;
+      if (!includedTables.has(name)) continue;
+      statements.push(`DELETE FROM sqlite_sequence WHERE name = ${quoteSqlText(name)};`);
+      statements.push(`INSERT INTO sqlite_sequence(name, seq) VALUES (${quoteSqlText(name)}, ${sqliteSequenceValue(sqlValueText(row[1]))});`);
+    }
+    if (response.rows.length < sqlDumpPageSize && !response.truncated) break;
+  }
+  return statements;
 }
 
 export function buildSqlBatchRequest(databaseId: string, source: string): SqlBatchRequest {
@@ -102,16 +153,7 @@ export function buildSqlBatchRequest(databaseId: string, source: string): SqlBat
   return { databaseId, statements, maxRows: 100 };
 }
 
-export function splitSqlDumpStatements(source: string): string[] {
-  return splitSqlScript(source)
-    .map(trimSqlSemicolon)
-    .map((statement) => statement.trim())
-    .filter((statement) => statement.length > 0 && !/^(PRAGMA|BEGIN|COMMIT|ROLLBACK)\b/i.test(statement));
-}
-
-export function splitSqlStatements(source: string): string[] {
-  return splitSqlScript(source).map(trimSqlSemicolon).map((statement) => statement.trim()).filter(Boolean);
-}
+export { splitSqlDumpStatements, splitSqlStatements };
 
 export function quoteSqlIdentifier(identifier: string): string {
   if (!identifier || identifier.includes("\0")) {
@@ -143,10 +185,34 @@ function sortDescriptionsForInsert(descriptions: TableDescription[]): TableDescr
   return sorted;
 }
 
-function formatInsertStatement(tableName: string, columns: string[], row: SqlValue[]): string {
+function formatDumpInsertStatement(description: TableDescription, previewColumns: readonly string[], row: readonly SqlValue[]): string {
+  const insertableColumns = new Set(description.columns.filter((column) => column.hidden === 0).map((column) => column.name));
+  const columns: string[] = [];
+  const values: SqlValue[] = [];
+  for (let index = 0; index < previewColumns.length; index += 1) {
+    const column = previewColumns[index] ?? "";
+    if (!insertableColumns.has(column)) continue;
+    columns.push(column);
+    values.push(row[index] ?? { kind: "null" });
+  }
+  return formatInsertStatement(description.tableName, columns, values);
+}
+
+function formatInsertStatement(tableName: string, columns: readonly string[], row: readonly SqlValue[]): string {
+  if (columns.length === 0) return `INSERT INTO ${quoteSqlIdentifier(tableName)} DEFAULT VALUES;`;
   const columnSql = columns.map(quoteSqlIdentifier).join(", ");
   const valueSql = row.map(sqlValueToLiteral).join(", ");
   return `INSERT INTO ${quoteSqlIdentifier(tableName)} (${columnSql}) VALUES (${valueSql});`;
+}
+
+function sqlValueText(value: SqlValue | undefined): string {
+  if (!value || value.kind === "null") return "";
+  if (value.kind === "blob") return JSON.stringify(value.value);
+  return String(value.value);
+}
+
+function sqliteSequenceValue(value: string): string {
+  return /^[+-]?\d+$/.test(value) ? value : quoteSqlText(value);
 }
 
 function sqlValueToLiteral(value: SqlValue): string {
@@ -154,83 +220,9 @@ function sqlValueToLiteral(value: SqlValue): string {
   if (value.kind === "integer") return value.value;
   if (value.kind === "real") return String(value.value);
   if (value.kind === "blob") return `X'${value.value.map((byte) => byte.toString(16).padStart(2, "0")).join("")}'`;
-  return `'${value.value.replaceAll("'", "''")}'`;
+  return quoteSqlText(value.value);
 }
 
-function trimSqlSemicolon(sql: string): string {
-  return sql.trim().replace(/;+$/, "");
-}
-
-function splitSqlScript(source: string): string[] {
-  type SplitMode = "normal" | "single" | "double" | "line_comment" | "block_comment";
-  const statements: string[] = [];
-  let current = "";
-  let mode: SplitMode = "normal";
-  for (let index = 0; index < source.length; index += 1) {
-    const char = source[index] ?? "";
-    const next = source[index + 1] ?? "";
-    current += char;
-    if (mode === "line_comment") {
-      if (char === "\n") mode = "normal";
-      continue;
-    }
-    if (mode === "block_comment") {
-      if (char === "*" && next === "/") {
-        current += next;
-        index += 1;
-        mode = "normal";
-      }
-      continue;
-    }
-    if (mode === "single") {
-      if (char === "'" && next === "'") {
-        current += next;
-        index += 1;
-      } else if (char === "'") {
-        mode = "normal";
-      }
-      continue;
-    }
-    if (mode === "double") {
-      if (char === "\"" && next === "\"") {
-        current += next;
-        index += 1;
-      } else if (char === "\"") {
-        mode = "normal";
-      }
-      continue;
-    }
-    if (char === "-" && next === "-") {
-      current += next;
-      index += 1;
-      mode = "line_comment";
-      continue;
-    }
-    if (char === "/" && next === "*") {
-      current += next;
-      index += 1;
-      mode = "block_comment";
-      continue;
-    }
-    if (char === "'") {
-      mode = "single";
-      continue;
-    }
-    if (char === "\"") {
-      mode = "double";
-      continue;
-    }
-    if (char === ";" && canSplitSqlStatement(current)) {
-      if (current.trim()) statements.push(current);
-      current = "";
-    }
-  }
-  const trailing = current.trim();
-  if (trailing) statements.push(trailing);
-  return statements;
-}
-
-function canSplitSqlStatement(statement: string): boolean {
-  if (!/^\s*CREATE\s+TRIGGER\b/i.test(statement)) return true;
-  return /\bEND\s*;\s*$/i.test(statement);
+function quoteSqlText(value: string): string {
+  return `'${value.replaceAll("'", "''")}'`;
 }

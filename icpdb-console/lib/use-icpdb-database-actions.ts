@@ -10,6 +10,7 @@ import {
   createDatabaseAuthenticated,
   deleteDatabaseAuthenticated
 } from "@/lib/icpdb-client";
+import type { SqlMode, WorkbenchView } from "@/lib/use-icpdb-sql-actions";
 import type {
   DatabaseBilling,
   DatabaseMember,
@@ -19,6 +20,11 @@ import type {
 } from "@/lib/types";
 
 type LoadState = "idle" | "loading" | "ready" | "error";
+
+export const newDatabaseStarterSql = `CREATE TABLE notes(id INTEGER PRIMARY KEY, body TEXT NOT NULL);
+INSERT INTO notes(body) VALUES ('hello from ICPDB');
+SELECT name, type, sql FROM sqlite_schema WHERE name = 'notes';
+SELECT id, body FROM notes ORDER BY id DESC;`;
 
 type DatabaseActionOptions = {
   authClient: AuthClient | null;
@@ -38,8 +44,12 @@ type DatabaseActionOptions = {
   setLoadState: Dispatch<SetStateAction<LoadState>>;
   setMembers: Dispatch<SetStateAction<DatabaseMember[]>>;
   setPayments: Dispatch<SetStateAction<PaymentRecord[]>>;
+  setMode: Dispatch<SetStateAction<SqlMode>>;
+  setParamsJson: Dispatch<SetStateAction<string>>;
+  setSql: Dispatch<SetStateAction<string>>;
   setTokens: Dispatch<SetStateAction<DatabaseTokenInfo[]>>;
   setUsage: Dispatch<SetStateAction<DatabaseUsage | null>>;
+  setView: Dispatch<SetStateAction<WorkbenchView>>;
 };
 
 export function useIcpdbDatabaseActions(options: DatabaseActionOptions) {
@@ -60,9 +70,13 @@ export function useIcpdbDatabaseActions(options: DatabaseActionOptions) {
     setError,
     setLoadState,
     setMembers,
+    setMode,
+    setParamsJson,
     setPayments,
+    setSql,
     setTokens,
-    setUsage
+    setUsage,
+    setView
   } = options;
 
   async function createDatabase() {
@@ -75,6 +89,10 @@ export function useIcpdbDatabaseActions(options: DatabaseActionOptions) {
       setDatabaseId(nextDatabaseId);
       clearTableState();
       await refreshDatabaseDetails(authClient, nextDatabaseId, "");
+      setMode("batch");
+      setParamsJson("[]");
+      setSql(newDatabaseStarterSql);
+      setView("sql");
       resetDepositApproval();
       setLoadState("ready");
     } catch (cause) {

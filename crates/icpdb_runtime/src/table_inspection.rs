@@ -48,10 +48,14 @@ pub fn describe_database_table(
         table_name: table.name.clone(),
         object_type: table.object_type,
         schema_sql: table.schema_sql,
-        columns: load_table_columns(&conn, &table.name)?,
-        indexes: load_table_indexes(&conn, &table.name)?,
-        triggers: load_table_triggers(&conn, &table.name)?,
-        foreign_keys: load_table_foreign_keys(&conn, &table.name)?,
+        columns: load_table_columns(&conn, &table.name)
+            .map_err(|error| format!("load table columns failed: {error}"))?,
+        indexes: load_table_indexes(&conn, &table.name)
+            .map_err(|error| format!("load table indexes failed: {error}"))?,
+        triggers: load_table_triggers(&conn, &table.name)
+            .map_err(|error| format!("load table triggers failed: {error}"))?,
+        foreign_keys: load_table_foreign_keys(&conn, &table.name)
+            .map_err(|error| format!("load table foreign keys failed: {error}"))?,
     })
 }
 
@@ -79,6 +83,7 @@ pub fn preview_database_table(
                 SqlValue::Integer(i64::from(offset)),
             ],
             max_rows: Some(limit),
+            idempotency_key: None,
         },
     )?;
     Ok(TablePreviewResponse {
@@ -173,9 +178,9 @@ fn load_table_indexes(conn: &Connection, table_name: &str) -> Result<Vec<Databas
     let mut statement = conn.prepare(&sql).map_err(|error| error.to_string())?;
     statement
         .query_map(params![], |row| {
-            let unique: i64 = row.get(2)?;
+            let unique = row.get::<_, Option<i64>>(2)?.unwrap_or(0);
             let name: String = row.get(1)?;
-            let partial: i64 = row.get(4)?;
+            let partial = row.get::<_, Option<i64>>(4)?.unwrap_or(0);
             let schema_sql = load_index_schema_sql(conn, &name)?;
             let columns = load_index_columns(conn, &name)?;
             Ok(DatabaseIndex {
@@ -200,9 +205,10 @@ fn load_index_schema_sql(
     conn.query_row(
         "SELECT sql FROM sqlite_schema WHERE type = 'index' AND name = ?1",
         params![index_name],
-        |row| row.get(0),
+        |row| row.get::<_, Option<String>>(0),
     )
     .optional()
+    .map(Option::flatten)
 }
 
 fn load_index_columns(
@@ -217,15 +223,15 @@ fn load_index_columns(
     statement
         .query_map(params![], |row| {
             let seqno: i64 = row.get(0)?;
-            let desc: i64 = row.get(3)?;
-            let key: i64 = row.get(5)?;
+            let desc = row.get::<_, Option<i64>>(3)?.unwrap_or(0);
+            let key = row.get::<_, Option<i64>>(5)?.unwrap_or(0);
             Ok(DatabaseIndexColumn {
                 seqno: u32::try_from(seqno)
                     .map_err(|_| crate::sqlite_facade::Error::InvalidQuery)?,
                 cid: row.get(1)?,
                 name: row.get(2)?,
                 descending: desc != 0,
-                collation: row.get(4)?,
+                collation: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
                 key: key != 0,
             })
         })?

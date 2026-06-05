@@ -1,0 +1,36 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": [
+      "dom",
+      "es2022"
+    ],
+    "module": "ES2022",
+    "moduleResolution": "Bundler",
+    "strict": true,
+    "skipLibCheck": true,
+    "declaration": true,
+    "emitDeclarationOnly": false,
+    "outDir": "dist-sdk",
+    "rootDir": "lib",
+    "esModuleInterop": true,
+    "verbatimModuleSyntax": true
+  },
+  "include": [
+    "lib/api-errors.ts",
+    "lib/icpdb-actor.ts",
+    "lib/icpdb-cli.ts",
+    "lib/icpdb-database-codec.ts",
+    "lib/icpdb-idl.ts",
+    "lib/icpdb-libsql.ts",
+    "lib/icpdb-sqlite.ts",
+    "lib/icpdb-raw-types.ts",
+    "lib/icpdb-node.ts",
+    "lib/icpdb-server.ts",
+    "lib/icpdb-sdk.ts",
+    "lib/icpdb-service-identity.ts",
+    "lib/icpdb-sql-script.ts",
+    "lib/icpdb-table-codec.ts",
+    "lib/types.ts"
+  ]
+}

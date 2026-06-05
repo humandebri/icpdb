@@ -215,6 +215,7 @@ export function useIcpdbTokenActions(options: TokenActionOptions) {
         params: [],
         maxRows: null
       }, { onIdempotencyKey: recordIdempotencyKey });
+      recordSqlResponseOperation(response);
       setResponse(response);
       setCreateTableName("");
       await refreshTokenDetails(tokenSession, nextTableName);
@@ -229,11 +230,14 @@ export function useIcpdbTokenActions(options: TokenActionOptions) {
       setBatchResponses([]);
       if (mode === "batch") {
         const responses = await sqlBatchWithToken(tokenSession, buildSqlBatchRequest(databaseId, sql), { onIdempotencyKey: recordIdempotencyKey });
+        recordSqlResponseOperation(responses.find((response) => response.routedOperationId) ?? null);
         setBatchResponses(responses);
         setResponse(responses.at(-1) ?? null);
       } else {
-        const request = { databaseId, sql, params: parseParams(paramsJson), maxRows: parseSqlMaxRows(sqlMaxRows) };
-        setResponse(mode === "query" ? await sqlQueryWithToken(tokenSession, request) : await sqlExecuteWithToken(tokenSession, request, { onIdempotencyKey: recordIdempotencyKey }));
+        const request = { databaseId, sql, params: parseParams(paramsJson, sql), maxRows: parseSqlMaxRows(sqlMaxRows) };
+        const response = mode === "query" ? await sqlQueryWithToken(tokenSession, request) : await sqlExecuteWithToken(tokenSession, request, { onIdempotencyKey: recordIdempotencyKey });
+        if (mode === "update") recordSqlResponseOperation(response);
+        setResponse(response);
       }
       await refreshTokenDetails(tokenSession, tableName);
     });
@@ -253,7 +257,9 @@ export function useIcpdbTokenActions(options: TokenActionOptions) {
       const request = mutation === "insert"
         ? buildInsertRequest(databaseId, tableDescription, rowJson)
         : buildSelectedRowMutationRequest(databaseId, tableDescription, tablePreview, selectedRowIndex, rowJson, mutation);
-      setResponse(await sqlExecuteWithToken(tokenSession, request, { onIdempotencyKey: recordIdempotencyKey }));
+      const response = await sqlExecuteWithToken(tokenSession, request, { onIdempotencyKey: recordIdempotencyKey });
+      recordSqlResponseOperation(response);
+      setResponse(response);
       await refreshTokenDetails(tokenSession, tableName);
       resetRowEditor();
     });
@@ -264,7 +270,9 @@ export function useIcpdbTokenActions(options: TokenActionOptions) {
     if (!tokenSession || !canUpdateCell || !tableDescription || !tablePreview || !column) return;
     await runTokenAction(async () => {
       const request = buildSelectedCellMutationRequest(databaseId, tableDescription, tablePreview, selectedRowIndex, column, cellValue);
-      setResponse(await sqlExecuteWithToken(tokenSession, request, { onIdempotencyKey: recordIdempotencyKey }));
+      const response = await sqlExecuteWithToken(tokenSession, request, { onIdempotencyKey: recordIdempotencyKey });
+      recordSqlResponseOperation(response);
+      setResponse(response);
       await refreshTokenDetails(tokenSession, tableName);
       resetRowEditor();
     });
@@ -304,5 +312,11 @@ export function useIcpdbTokenActions(options: TokenActionOptions) {
   function recordIdempotencyKey(idempotencyKey: string) {
     setOperationId(idempotencyKey); setOperationStatus("Last write operation"); setRoutedOperation(null);
   }
+
+  function recordSqlResponseOperation(response: SqlExecuteResponse | null) {
+    if (!response?.routedOperationId) return;
+    setOperationId(response.routedOperationId); setOperationStatus("Last write operation"); setRoutedOperation(null);
+  }
+
   return { changeTableLimit, connectTokenSession, createTable, deleteDatabase, disconnectTokenSession, loadTablePage, mutateRow, refreshTokenDetails, runSql, selectTable, updateCell };
 }

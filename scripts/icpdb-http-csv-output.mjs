@@ -2,12 +2,14 @@
 // What: CSV output formatting for SQL, inspect, schema, and account records.
 // Why: CSV export behavior should be isolated from interactive shell/table display rendering.
 
-import { escapeCsvField, formatCsvRecords, formatCsvRows, sqlValueToDisplay } from "./icpdb-http-table-format.mjs";
+import { escapeCsvField, formatCsvRecords, formatCsvRows, sqlScalarRecord, sqlValueToDisplay } from "./icpdb-http-table-format.mjs";
 
 export function formatCsvOutput(value, shapes) {
   if (value === null) return "";
+  if (shapes.isSqlScalarResult(value)) return formatCsvRecords([sqlScalarRecord(value)]);
   if (shapes.isTablePreview(value) || shapes.isSqlResponse(value)) return formatSqlCsv(value);
   if (value && typeof value === "object" && value.table && value.preview) return formatSqlCsv(value.preview);
+  if (value && typeof value === "object" && Array.isArray(value.schemas)) return formatSchemaCsv(value);
   if (value && typeof value === "object" && value.stats && Array.isArray(value.table_summaries)) return formatStatsCsv(value);
   if (shapes.isTableDescription(value)) return formatCsvRecords((value.columns ?? []).map(columnCsvRecord));
   if (shapes.isTableColumnsResult(value)) return formatCsvRecords(value.columns ?? []);
@@ -18,6 +20,29 @@ export function formatCsvOutput(value, shapes) {
   if (Array.isArray(value)) return formatCsvRecords(value);
   if (value && typeof value === "object") return formatCsvRecords([value]);
   return escapeCsvField(String(value));
+}
+
+function formatSchemaCsv(value) {
+  const rows = [];
+  for (const schema of value.schemas ?? []) {
+    if (schema.schema_sql) rows.push(schemaCsvRecord(schema, "table", schema.schema_sql));
+    for (const schemaSql of schema.index_schemas ?? []) {
+      rows.push(schemaCsvRecord(schema, "index", schemaSql));
+    }
+    for (const schemaSql of schema.trigger_schemas ?? []) {
+      rows.push(schemaCsvRecord(schema, "trigger", schemaSql));
+    }
+  }
+  return formatCsvRecords(rows);
+}
+
+function schemaCsvRecord(schema, kind, schemaSql) {
+  return {
+    table_name: schema.table_name,
+    object_type: schema.object_type ?? "table",
+    schema_sql_kind: kind,
+    schema_sql: schemaSql
+  };
 }
 
 function formatStatsCsv(value) {

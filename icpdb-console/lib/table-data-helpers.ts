@@ -1,5 +1,5 @@
 // icpdb-console/lib/table-data-helpers.ts
-// Current-page table preview search, current-page column sort, selection, and CSV filename helpers.
+// Current-page table preview search, current-page column sort, selection, SQL, and CSV helpers.
 
 import { formatSqlValue, type GridColumnSort, type GridColumnSortDirection } from "@/lib/result-grid-helpers";
 import type { SqlValue } from "@/lib/types";
@@ -49,6 +49,10 @@ export function tableCsvFileName(tableName: string): string {
   const trimmed = tableName.trim();
   const filePart = sanitizeCsvFilePart(trimmed.length > 0 ? trimmed : "table");
   return `icpdb-table-${filePart}.csv`;
+}
+
+export function tablePageSelectSql(tableName: string, limit: number, offset: number): string {
+  return `SELECT * FROM ${quoteSqlIdentifier(tableName)} LIMIT ${limit} OFFSET ${offset};`;
 }
 
 function sortDirectionMultiplier(direction: GridColumnSortDirection): number {
@@ -106,6 +110,11 @@ function rowMatchesPreviewSearch(columns: string[], entry: PreviewRowEntry, quer
     fields.push(formatSqlValue(value));
   });
   return fields.some((field) => field.toLowerCase().includes(query));
+}
+
+function quoteSqlIdentifier(identifier: string): string {
+  if (!identifier || identifier.includes("\0")) throw new Error("invalid SQL identifier");
+  return `"${identifier.replaceAll("\"", "\"\"")}"`;
 }
 
 function sanitizeCsvFilePart(value: string): string {

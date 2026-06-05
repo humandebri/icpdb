@@ -21,12 +21,18 @@ import type {
   DatabaseUsage
 } from "@/lib/types";
 import type { IcpdbTokenSession } from "@/lib/icpdb-http-client";
+import { normalizeMemberPrincipalInput } from "@/lib/workbench-state";
 
 type LoadState = "idle" | "loading" | "ready" | "error";
 
 type TokenAdminActionOptions = {
+  canGrantMember: boolean;
+  canManageDatabase: boolean;
+  canMutateMembers: boolean;
+  canSetQuota: boolean;
   memberPrincipal: string;
   memberRole: DatabaseRole;
+  members: DatabaseMember[];
   quotaBytes: string;
   tableName: string;
   tokenName: string;
@@ -45,13 +51,14 @@ type TokenAdminActionOptions = {
 
 export function useIcpdbTokenAdminActions(options: TokenAdminActionOptions) {
   const {
-    memberPrincipal, memberRole, quotaBytes, tableName, tokenName, tokenScope, tokenSession,
+    canGrantMember, canManageDatabase, canMutateMembers, canSetQuota,
+    memberPrincipal, memberRole, members, quotaBytes, tableName, tokenName, tokenScope, tokenSession,
     refreshTokenDetails, setError, setIssuedToken, setLoadState, setMemberPrincipal, setMembers,
     setQuotaBytes, setTokens, setUsage
   } = options;
 
   async function createToken() {
-    if (!tokenSession) return;
+    if (!tokenSession || !canManageDatabase) return;
     await runTokenAdminAction(async () => {
       const name = tokenName.trim() || `web-${tokenScope}-${Date.now()}`;
       const nextToken = await createTokenWithToken(tokenSession, name, tokenScope);
@@ -61,7 +68,7 @@ export function useIcpdbTokenAdminActions(options: TokenAdminActionOptions) {
   }
 
   async function revokeToken(tokenId: string) {
-    if (!tokenSession) return;
+    if (!tokenSession || !canManageDatabase) return;
     await runTokenAdminAction(async () => {
       await revokeTokenWithToken(tokenSession, tokenId);
       setTokens(await listTokensWithToken(tokenSession));
@@ -69,16 +76,17 @@ export function useIcpdbTokenAdminActions(options: TokenAdminActionOptions) {
   }
 
   async function grantMember() {
-    if (!tokenSession) return;
+    if (!tokenSession || !canGrantMember) return;
     await runTokenAdminAction(async () => {
-      await grantMemberWithToken(tokenSession, memberPrincipal.trim(), memberRole);
+      await grantMemberWithToken(tokenSession, normalizeMemberPrincipalInput(memberPrincipal), memberRole);
       setMembers(await listMembersWithToken(tokenSession));
       setMemberPrincipal("");
     });
   }
 
   async function revokeMember(member: DatabaseMember) {
-    if (!tokenSession) return;
+    if (!tokenSession || !canMutateMembers) return;
+    if (isLastOwnerMember(member, members)) return;
     await runTokenAdminAction(async () => {
       await revokeMemberWithToken(tokenSession, member.principal);
       setMembers(await listMembersWithToken(tokenSession));
@@ -86,7 +94,7 @@ export function useIcpdbTokenAdminActions(options: TokenAdminActionOptions) {
   }
 
   async function setQuota() {
-    if (!tokenSession) return;
+    if (!tokenSession || !canSetQuota) return;
     await runTokenAdminAction(async () => {
       const nextUsage = await setQuotaWithToken(tokenSession, quotaBytes.trim());
       setUsage(nextUsage);
@@ -108,4 +116,8 @@ export function useIcpdbTokenAdminActions(options: TokenAdminActionOptions) {
   }
 
   return { createToken, grantMember, revokeMember, revokeToken, setQuota };
+}
+
+function isLastOwnerMember(member: DatabaseMember, members: DatabaseMember[]): boolean {
+  return member.role === "owner" && members.filter((item) => item.role === "owner").length <= 1;
 }

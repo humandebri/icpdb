@@ -17,7 +17,7 @@ const compiled = ts.transpileModule(source, {
     strict: true
   }
 }).outputText;
-const session = { baseUrl: "https://db.example/", token: "secret", databaseId: "db_alpha" };
+const session = { baseUrl: " https://db.example/// ", token: " secret ", databaseId: " db_alpha " };
 const calls = [];
 let randomId = 0;
 const mockFetch = async (url, request) => {
@@ -61,10 +61,10 @@ const mockFetch = async (url, request) => {
     return json({ columns: ["body"], rows: [[{ Text: "hello" }]], rows_affected: 0, last_insert_rowid: 0, truncated: false });
   }
   if (url.endsWith("/v1/sql/execute")) {
-    return json({ columns: [], rows: [], rows_affected: 1, last_insert_rowid: 7, truncated: false });
+    return json({ columns: [], rows: [], rows_affected: 1, last_insert_rowid: 7, truncated: false, routed_operation_id: "op_execute" });
   }
   if (url.endsWith("/v1/sql/batch")) {
-    return json([{ columns: [], rows: [], rows_affected: 1, last_insert_rowid: 8, truncated: false }]);
+    return json([{ columns: [], rows: [], rows_affected: 1, last_insert_rowid: 8, truncated: false, routed_operation_id: "op_batch" }]);
   }
   return json({ error: "unknown endpoint" }, 404);
 };
@@ -98,14 +98,41 @@ assert.equal((await describeTableWithToken(session, "notes")).indexes[0].columns
 assert.equal((await previewTableWithToken(session, { databaseId: "db_alpha", tableName: "notes", limit: 25, offset: 0 })).rows[0][0].value, "7");
 assert.equal((await sqlQueryWithToken(session, sqlRequest("select body from notes"))).rows[0][0].value, "hello");
 const capturedIdempotencyKeys = [];
-assert.equal((await sqlExecuteWithToken(session, sqlRequest("insert into notes(body) values (?1)"), { onIdempotencyKey: (value) => capturedIdempotencyKeys.push(value) })).rowsAffected, "1");
-assert.equal((await sqlBatchWithToken(session, { databaseId: "db_alpha", statements: [sqlRequest("insert into notes(body) values (?1)")], maxRows: 100 }, { onIdempotencyKey: (value) => capturedIdempotencyKeys.push(value) }))[0].rowsAffected, "1");
+const executeResponse = await sqlExecuteWithToken(session, sqlRequest("insert into notes(body) values (?1)"), { onIdempotencyKey: (value) => capturedIdempotencyKeys.push(value) });
+assert.equal(executeResponse.rowsAffected, "1");
+assert.equal(executeResponse.routedOperationId, "op_execute");
+const batchResponse = await sqlBatchWithToken(session, { databaseId: "db_alpha", statements: [sqlRequest("insert into notes(body) values (?1)")], maxRows: 100 }, { onIdempotencyKey: (value) => capturedIdempotencyKeys.push(value) });
+assert.equal(batchResponse[0].rowsAffected, "1");
+assert.equal(batchResponse[0].routedOperationId, "op_batch");
 assert.equal(calls[0].request.headers.authorization, "Bearer secret");
 assert.equal(calls[0].url, "https://db.example/v1/session");
+assert.equal(calls[0].body.database_id, "db_alpha");
+assert.equal(calls[2].body.database_id, "db_alpha");
 assert.deepEqual(calls[7].body.params, []);
 assert.equal(calls[8].request.headers["idempotency-key"], "icpdb-web-sql_execute-db_alpha-uuid-1");
 assert.equal(calls[9].request.headers["idempotency-key"], "icpdb-web-sql_batch-db_alpha-uuid-2");
 assert.deepEqual(capturedIdempotencyKeys, ["icpdb-web-sql_execute-db_alpha-uuid-1", "icpdb-web-sql_batch-db_alpha-uuid-2"]);
+await sqlExecuteWithToken(session, { ...sqlRequest("insert into notes(body) values (?1)"), idempotencyKey: " browser_retry_execute " }, { onIdempotencyKey: (value) => capturedIdempotencyKeys.push(value) });
+await sqlBatchWithToken(session, { databaseId: "db_alpha", statements: [sqlRequest("insert into notes(body) values (?1)")], maxRows: 100, idempotencyKey: " browser_retry_batch " }, { onIdempotencyKey: (value) => capturedIdempotencyKeys.push(value) });
+assert.equal(calls[10].request.headers["idempotency-key"], "browser_retry_execute");
+assert.equal(calls[11].request.headers["idempotency-key"], "browser_retry_batch");
+assert.equal(randomId, 2);
+assert.deepEqual(capturedIdempotencyKeys, ["icpdb-web-sql_execute-db_alpha-uuid-1", "icpdb-web-sql_batch-db_alpha-uuid-2", "browser_retry_execute", "browser_retry_batch"]);
+const callCount = calls.length;
+await assert.rejects(() => getRoutedOperationWithToken(session, "   "), /operation_id must be a non-empty string/);
+await assert.rejects(() => describeTableWithToken(session, "   "), /table_name must be a non-empty string/);
+await assert.rejects(() => previewTableWithToken(session, { databaseId: "db_alpha", tableName: "   ", limit: 25, offset: 0 }), /table_name must be a non-empty string/);
+await assert.rejects(() => previewTableWithToken(session, { databaseId: "other", tableName: "notes", limit: 25, offset: 0 }), /request database_id must match token session database_id/);
+await assert.rejects(() => sqlQueryWithToken(session, sqlRequest("   ")), /SQL text must be a non-empty string/);
+await assert.rejects(() => sqlExecuteWithToken(session, { ...sqlRequest("insert"), databaseId: "other" }), /request database_id must match token session database_id/);
+await assert.rejects(() => sqlExecuteWithToken(session, { ...sqlRequest("insert"), idempotencyKey: "   " }), /idempotencyKey must be a non-empty string/);
+await assert.rejects(() => sqlBatchWithToken(session, { databaseId: "other", statements: [sqlRequest("insert")], maxRows: 100 }), /request database_id must match token session database_id/);
+await assert.rejects(() => sqlBatchWithToken(session, { databaseId: "db_alpha", statements: [sqlRequest("insert")], maxRows: 100, idempotencyKey: "   " }), /idempotencyKey must be a non-empty string/);
+await assert.rejects(() => sqlBatchWithToken(session, { databaseId: "db_alpha", statements: [{ sql: "   ", params: [] }], maxRows: 100 }), /SQL text must be a non-empty string/);
+await assert.rejects(() => getSessionInfoWithToken({ ...session, baseUrl: "   " }), /HTTP base URL must be a non-empty string/);
+await assert.rejects(() => getSessionInfoWithToken({ ...session, token: "   " }), /api token must be a non-empty string/);
+await assert.rejects(() => getSessionInfoWithToken({ ...session, databaseId: "   " }), /token session database_id must be a non-empty string/);
+assert.equal(calls.length, callCount);
 
 console.log("ICPDB HTTP client checks OK");
 

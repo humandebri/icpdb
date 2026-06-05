@@ -9,15 +9,114 @@ import type {
   SqlValue,
   TablePreviewResponse
 } from "@/lib/types";
+import { Principal } from "@icp-sdk/core/principal";
 
 export const tableLimitOptions = [25, 50, 100, 250];
 
-export function parseParams(source: string): SqlValue[] {
+export function parseParams(source: string, sql = ""): SqlValue[] {
   const parsed: unknown = JSON.parse(source);
   if (!Array.isArray(parsed)) {
-    throw new Error("params must be a JSON array");
+    if (!isRecord(parsed)) throw new Error("params must be a JSON array or object");
+    return namedSqlParameters(sql).map((token) => jsonToSqlValue(namedSqlParamValue(parsed, token)));
   }
   return parsed.map(jsonToSqlValue);
+}
+
+function namedSqlParameters(sql: string): string[] {
+  const tokens: string[] = [];
+  const seenTokens = new Set<string>();
+  let index = 0;
+  while (index < sql.length) {
+    const char = sql[index];
+    const nextChar = sql[index + 1] ?? "";
+    if (char === "'" || char === "\"" || char === "`") {
+      index = skipQuotedSql(sql, index, char);
+      continue;
+    }
+    if (char === "[") {
+      index = skipBracketedSql(sql, index);
+      continue;
+    }
+    if (char === "-" && nextChar === "-") {
+      index = skipLineComment(sql, index);
+      continue;
+    }
+    if (char === "/" && nextChar === "*") {
+      index = skipBlockComment(sql, index);
+      continue;
+    }
+    if ((char === ":" || char === "@" || char === "$") && isSqlIdentifierStart(nextChar)) {
+      const end = sqlTokenEnd(sql, index + 2);
+      const token = sql.slice(index, end);
+      if (!seenTokens.has(token)) {
+        seenTokens.add(token);
+        tokens.push(token);
+      }
+      index = end;
+      continue;
+    }
+    index += 1;
+  }
+  if (tokens.length === 0) throw new Error("named SQL params require named placeholders");
+  return tokens;
+}
+
+function namedSqlParamValue(params: Record<string, unknown>, token: string): unknown {
+  if (Object.prototype.hasOwnProperty.call(params, token)) return params[token];
+  const name = token.slice(1);
+  if (Object.prototype.hasOwnProperty.call(params, name)) return params[name];
+  throw new Error(`missing SQL named param: ${name}`);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function skipQuotedSql(sql: string, start: number, quote: string): number {
+  let index = start + 1;
+  while (index < sql.length) {
+    if (sql[index] !== quote) {
+      index += 1;
+      continue;
+    }
+    if (sql[index + 1] === quote) {
+      index += 2;
+      continue;
+    }
+    return index + 1;
+  }
+  return sql.length;
+}
+
+function skipBracketedSql(sql: string, start: number): number {
+  const end = sql.indexOf("]", start + 1);
+  return end < 0 ? sql.length : end + 1;
+}
+
+function skipLineComment(sql: string, start: number): number {
+  const end = sql.indexOf("\n", start + 2);
+  return end < 0 ? sql.length : end + 1;
+}
+
+function skipBlockComment(sql: string, start: number): number {
+  const end = sql.indexOf("*/", start + 2);
+  return end < 0 ? sql.length : end + 2;
+}
+
+function sqlTokenEnd(sql: string, start: number): number {
+  let index = start;
+  while (index < sql.length && isSqlIdentifierPart(sql[index])) {
+    index += 1;
+  }
+  return index;
+}
+
+function isSqlIdentifierStart(char: string): boolean {
+  return /^[A-Za-z_]$/.test(char);
+}
+
+function isSqlIdentifierPart(char: string): boolean {
+  return /^[A-Za-z0-9_]$/.test(char);
 }
 
 export function tablePageLabel(preview: TablePreviewResponse): string {
@@ -78,6 +177,12 @@ export function quotaUsagePercent(logicalSizeBytes: string, maxLogicalSizeBytes:
   }
 }
 
+export function isSafeQuotaBytes(source: string): boolean {
+  const trimmed = source.trim();
+  if (!/^\d+$/.test(trimmed)) return false;
+  return BigInt(trimmed) <= BigInt(Number.MAX_SAFE_INTEGER);
+}
+
 export function parseIcpToE8s(source: string): string {
   const trimmed = source.trim();
   if (!/^\d+(\.\d{0,8})?$/.test(trimmed)) {
@@ -109,8 +214,34 @@ export function parseDatabaseRole(value: string): DatabaseRole {
   return "reader";
 }
 
+export function normalizeMemberPrincipalInput(source: string): string {
+  const value = source.trim();
+  if (!value) return "";
+  const assignment = /^\s*export\s+ICPDB_SERVICE_PRINCIPAL=(.*)$|^\s*ICPDB_SERVICE_PRINCIPAL=(.*)$/m.exec(value);
+  return unquoteMemberPrincipal((assignment?.[1] ?? assignment?.[2] ?? value).trim());
+}
+
+export function isValidPrincipalText(source: string): boolean {
+  try {
+    Principal.fromText(source);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function canWriteDatabaseRole(role: DatabaseRole): boolean {
   return role === "owner" || role === "writer";
+}
+
+function unquoteMemberPrincipal(source: string): string {
+  if (
+    (source.startsWith("\"") && source.endsWith("\"")) ||
+    (source.startsWith("'") && source.endsWith("'"))
+  ) {
+    return source.slice(1, -1).trim();
+  }
+  return source;
 }
 
 export function normalizeCreateTableName(source: string): string {
@@ -149,6 +280,7 @@ export function appendBytes(target: number[], source: number[]) {
 
 function jsonToSqlValue(value: unknown): SqlValue {
   if (value === null) return { kind: "null" };
+  if (typeof value === "boolean") return { kind: "integer", value: value ? "1" : "0" };
   if (typeof value === "string") return { kind: "text", value };
   if (typeof value === "number" && Number.isFinite(value)) {
     if (!Number.isInteger(value)) return { kind: "real", value };
@@ -157,5 +289,22 @@ function jsonToSqlValue(value: unknown): SqlValue {
     }
     return { kind: "integer", value: String(value) };
   }
-  throw new Error("params may contain only null, string, or number values");
+  if (Array.isArray(value) && value.every(isByteValue)) return { kind: "blob", value };
+  if (isRecord(value)) return structuredSqlValue(value);
+  throw new Error("params may contain only null, string, number, boolean, byte array, or SqlValue objects");
+}
+
+function structuredSqlValue(value: Record<string, unknown>): SqlValue {
+  const kind = Reflect.get(value, "kind");
+  if (kind === "null") return { kind: "null" };
+  const rawValue = Reflect.get(value, "value");
+  if (kind === "integer" && typeof rawValue === "string" && /^-?\d+$/.test(rawValue)) return { kind: "integer", value: rawValue };
+  if (kind === "real" && typeof rawValue === "number" && Number.isFinite(rawValue)) return { kind: "real", value: rawValue };
+  if (kind === "text" && typeof rawValue === "string") return { kind: "text", value: rawValue };
+  if (kind === "blob" && Array.isArray(rawValue) && rawValue.every(isByteValue)) return { kind: "blob", value: rawValue };
+  throw new Error("SqlValue object params must be null, integer, real, text, or blob");
+}
+
+function isByteValue(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 255;
 }

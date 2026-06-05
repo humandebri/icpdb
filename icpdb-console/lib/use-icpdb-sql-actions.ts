@@ -20,7 +20,7 @@ import {
   parseParams,
   parseSqlMaxRows
 } from "@/lib/workbench-state";
-import type { SqlExecuteResponse } from "@/lib/types";
+import type { RoutedOperationInfo, SqlExecuteResponse } from "@/lib/types";
 
 export type SqlMode = "query" | "update" | "batch";
 export type WorkbenchView = "table" | "sql";
@@ -45,7 +45,10 @@ type SqlActionOptions = {
   setCreateTableName: Dispatch<SetStateAction<string>>;
   setError: Dispatch<SetStateAction<string | null>>;
   setLoadState: Dispatch<SetStateAction<LoadState>>;
+  setOperationId: Dispatch<SetStateAction<string>>;
+  setOperationStatus: Dispatch<SetStateAction<string>>;
   setResponse: Dispatch<SetStateAction<SqlExecuteResponse | null>>;
+  setRoutedOperation: Dispatch<SetStateAction<RoutedOperationInfo | null>>;
   setView: Dispatch<SetStateAction<WorkbenchView>>;
 };
 
@@ -68,7 +71,10 @@ export function useIcpdbSqlActions(options: SqlActionOptions) {
     setCreateTableName,
     setError,
     setLoadState,
+    setOperationId,
+    setOperationStatus,
     setResponse,
+    setRoutedOperation,
     setView
   } = options;
 
@@ -86,6 +92,7 @@ export function useIcpdbSqlActions(options: SqlActionOptions) {
         maxRows: null
       });
       setResponse(nextResponse);
+      recordSqlResponseOperation(nextResponse);
       setCreateTableName("");
       await refreshDatabaseDetails(authClient, databaseId, nextTableName);
       setView("table");
@@ -108,14 +115,16 @@ export function useIcpdbSqlActions(options: SqlActionOptions) {
         const nextResponses = await sqlBatchAuthenticated(canisterId, authClient.getIdentity(), request);
         setBatchResponses(nextResponses);
         setResponse(nextResponses.at(-1) ?? null);
+        recordSqlResponseOperation(nextResponses.find((response) => response.routedOperationId) ?? null);
       } else {
-        const params = parseParams(paramsJson);
+        const params = parseParams(paramsJson, sql);
         const request = { databaseId, sql, params, maxRows: parseSqlMaxRows(sqlMaxRows) };
         const nextResponse =
           mode === "query"
             ? await sqlQueryAuthenticated(canisterId, authClient.getIdentity(), request)
             : await sqlExecuteAuthenticated(canisterId, authClient.getIdentity(), request);
         setResponse(nextResponse);
+        recordSqlResponseOperation(nextResponse);
       }
       await refreshDatabaseDetails(authClient, databaseId, tableName);
       setLoadState("ready");
@@ -126,6 +135,13 @@ export function useIcpdbSqlActions(options: SqlActionOptions) {
   }
 
   return { createTable, runSql };
+
+  function recordSqlResponseOperation(response: SqlExecuteResponse | null) {
+    if (!response?.routedOperationId) return;
+    setOperationId(response.routedOperationId);
+    setOperationStatus("Last write operation");
+    setRoutedOperation(null);
+  }
 }
 
 function errorMessage(cause: unknown): string {

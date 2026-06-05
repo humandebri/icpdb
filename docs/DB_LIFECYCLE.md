@@ -13,7 +13,10 @@ Principals are attached through `database_members`:
 - `reader`: SQL reads
 
 One database can have multiple principals. One principal can belong to multiple databases.
-Grant anonymous reader access with principal `2vxsx-fae` only when public SQL reads are intended.
+The anonymous principal cannot be granted database access; use read tokens for public
+read-only sharing. Membership updates must keep at least one owner principal on every
+database. Owner tokens can manage members, but they cannot downgrade or revoke the last
+owner principal.
 
 ## Memory Layout
 
@@ -58,7 +61,7 @@ SQL text is not stored in usage events.
 The cycle delta is an operational observation from canister balance before and after the call, not a guaranteed one-to-one IC billing statement.
 Only the latest 100,000 events are retained.
 
-Read-only `sql_query` calls are free Candid query calls. They do not change billing balance or usage event state.
+Read-only `sql_query` calls are free Candid update calls so remote shard databases can be routed through the control canister. They do not change billing balance or usage event state.
 
 ## Delete
 

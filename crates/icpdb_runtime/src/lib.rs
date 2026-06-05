@@ -1,6 +1,6 @@
 // Where: crates/icpdb_runtime/src/lib.rs
-// What: Service orchestration for multiple hosted SQLite databases.
-// Why: One canister can host isolated SQL databases with shared lifecycle, quota, and billing.
+// What: Service orchestration for the hosted SQLite Admin Protocol reference canister.
+// Why: ICPDB demonstrates isolated SQL databases with shared lifecycle, quota, and access control.
 mod database_executor;
 mod sql;
 mod sql_guard;
@@ -557,6 +557,25 @@ impl IcpdbService {
         })
     }
 
+    pub fn begin_routed_write(
+        &self,
+        caller: &str,
+        database_id: &str,
+        request: RoutedWriteBegin<'_>,
+    ) -> Result<RoutedOperationInfo, String> {
+        self.require_role(database_id, caller, RequiredRole::Writer)?;
+        self.ensure_database_has_units(database_id, request.billing_units)?;
+        self.begin_routed_operation_with_billing(RoutedOperationBegin {
+            operation_id: request.operation_id,
+            database_id,
+            database_canister_id: request.database_canister_id,
+            method: request.method,
+            request_hash: request.request_hash,
+            billing_units: request.billing_units,
+            now: request.now,
+        })
+    }
+
     pub fn complete_routed_write_with_token(
         &self,
         auth: &AuthenticatedDatabaseToken,
@@ -570,6 +589,21 @@ impl IcpdbService {
         }
         self.charge_database_units(&auth.database_id, billing_units)?;
         self.set_logical_size(&auth.database_id, logical_size_bytes)?;
+        self.update_routed_operation_status(operation_id, RoutedOperationStatus::Applied, None, now)
+    }
+
+    pub fn complete_routed_write(
+        &self,
+        caller: &str,
+        database_id: &str,
+        operation_id: &str,
+        billing_units: u64,
+        logical_size_bytes: u64,
+        now: i64,
+    ) -> Result<RoutedOperationInfo, String> {
+        self.require_role(database_id, caller, RequiredRole::Writer)?;
+        self.charge_database_units(database_id, billing_units)?;
+        self.set_logical_size(database_id, logical_size_bytes)?;
         self.update_routed_operation_status(operation_id, RoutedOperationStatus::Applied, None, now)
     }
 
@@ -723,6 +757,29 @@ impl IcpdbService {
             RequiredRole::Owner,
             &[DatabaseStatus::Hot],
         )?;
+        self.mark_remote_database_archiving_unchecked(database_id, now)
+    }
+
+    pub fn mark_remote_database_archiving(
+        &self,
+        caller: &str,
+        database_id: &str,
+        now: i64,
+    ) -> Result<(), String> {
+        self.remote_database_route(
+            database_id,
+            caller,
+            RequiredRole::Owner,
+            &[DatabaseStatus::Hot],
+        )?;
+        self.mark_remote_database_archiving_unchecked(database_id, now)
+    }
+
+    fn mark_remote_database_archiving_unchecked(
+        &self,
+        database_id: &str,
+        now: i64,
+    ) -> Result<(), String> {
         let conn = self.open_index()?;
         conn.execute(
             "UPDATE databases
@@ -749,6 +806,32 @@ impl IcpdbService {
             RequiredRole::Owner,
             &[DatabaseStatus::Archiving],
         )?;
+        self.mark_remote_database_archived_unchecked(database_id, snapshot_hash, now)
+    }
+
+    pub fn mark_remote_database_archived(
+        &self,
+        caller: &str,
+        database_id: &str,
+        snapshot_hash: Vec<u8>,
+        now: i64,
+    ) -> Result<(), String> {
+        validate_snapshot_hash(&snapshot_hash)?;
+        self.remote_database_route(
+            database_id,
+            caller,
+            RequiredRole::Owner,
+            &[DatabaseStatus::Archiving],
+        )?;
+        self.mark_remote_database_archived_unchecked(database_id, snapshot_hash, now)
+    }
+
+    fn mark_remote_database_archived_unchecked(
+        &self,
+        database_id: &str,
+        snapshot_hash: Vec<u8>,
+        now: i64,
+    ) -> Result<(), String> {
         let conn = self.open_index()?;
         conn.execute(
             "UPDATE databases
@@ -785,6 +868,39 @@ impl IcpdbService {
             RequiredRole::Owner,
             &[DatabaseStatus::Archived, DatabaseStatus::Deleted],
         )?;
+        self.mark_remote_database_restoring_unchecked(database_id, snapshot_hash, size_bytes, now)
+    }
+
+    pub fn mark_remote_database_restoring(
+        &self,
+        caller: &str,
+        database_id: &str,
+        snapshot_hash: Vec<u8>,
+        size_bytes: u64,
+        now: i64,
+    ) -> Result<(), String> {
+        validate_snapshot_hash(&snapshot_hash)?;
+        if size_bytes > MAX_DATABASE_SIZE_BYTES {
+            return Err(format!(
+                "database size exceeds limit: {size_bytes} > {MAX_DATABASE_SIZE_BYTES}"
+            ));
+        }
+        self.remote_database_route(
+            database_id,
+            caller,
+            RequiredRole::Owner,
+            &[DatabaseStatus::Archived, DatabaseStatus::Deleted],
+        )?;
+        self.mark_remote_database_restoring_unchecked(database_id, snapshot_hash, size_bytes, now)
+    }
+
+    fn mark_remote_database_restoring_unchecked(
+        &self,
+        database_id: &str,
+        snapshot_hash: Vec<u8>,
+        size_bytes: u64,
+        now: i64,
+    ) -> Result<(), String> {
         let conn = self.open_index()?;
         conn.execute(
             "UPDATE databases
@@ -820,6 +936,31 @@ impl IcpdbService {
             RequiredRole::Owner,
             &[DatabaseStatus::Archiving, DatabaseStatus::Restoring],
         )?;
+        self.mark_remote_database_hot_unchecked(database_id, logical_size_bytes, now)
+    }
+
+    pub fn mark_remote_database_hot(
+        &self,
+        caller: &str,
+        database_id: &str,
+        logical_size_bytes: u64,
+        now: i64,
+    ) -> Result<(), String> {
+        self.remote_database_route(
+            database_id,
+            caller,
+            RequiredRole::Owner,
+            &[DatabaseStatus::Archiving, DatabaseStatus::Restoring],
+        )?;
+        self.mark_remote_database_hot_unchecked(database_id, logical_size_bytes, now)
+    }
+
+    fn mark_remote_database_hot_unchecked(
+        &self,
+        database_id: &str,
+        logical_size_bytes: u64,
+        now: i64,
+    ) -> Result<(), String> {
         let conn = self.open_index()?;
         conn.execute(
             "UPDATE databases
@@ -850,6 +991,29 @@ impl IcpdbService {
             RequiredRole::Owner,
             &[DatabaseStatus::Hot, DatabaseStatus::Archived],
         )?;
+        self.mark_remote_database_deleted_unchecked(database_id, now)
+    }
+
+    pub fn mark_remote_database_deleted(
+        &self,
+        caller: &str,
+        database_id: &str,
+        now: i64,
+    ) -> Result<(), String> {
+        self.remote_database_route(
+            database_id,
+            caller,
+            RequiredRole::Owner,
+            &[DatabaseStatus::Hot, DatabaseStatus::Archived],
+        )?;
+        self.mark_remote_database_deleted_unchecked(database_id, now)
+    }
+
+    fn mark_remote_database_deleted_unchecked(
+        &self,
+        database_id: &str,
+        now: i64,
+    ) -> Result<(), String> {
         let mut conn = self.open_index()?;
         let tx = conn.transaction().map_err(|error| error.to_string())?;
         tx.execute(
@@ -2364,13 +2528,16 @@ impl IcpdbService {
         caller: Option<&str>,
     ) -> Result<(), String> {
         self.hot_database_route_unchecked(database_id)?;
+        if principal == ANONYMOUS_PRINCIPAL_TEXT {
+            return Err("anonymous principal cannot be granted database access".to_string());
+        }
         if caller == Some(principal) && role != DatabaseRole::Owner {
             return Err("owner cannot downgrade own access".to_string());
         }
-        if principal == ANONYMOUS_PRINCIPAL_TEXT && role != DatabaseRole::Reader {
-            return Err("anonymous principal can only be granted reader access".to_string());
-        }
         let conn = self.open_index()?;
+        if role != DatabaseRole::Owner {
+            reject_last_owner_removal(&conn, database_id, principal)?;
+        }
         conn.execute(
             "INSERT INTO database_members (database_id, principal, role, created_at_ms)
              VALUES (?1, ?2, ?3, ?4)
@@ -2413,6 +2580,7 @@ impl IcpdbService {
             return Err("owner cannot revoke own access".to_string());
         }
         let conn = self.open_index()?;
+        reject_last_owner_removal(&conn, database_id, principal)?;
         conn.execute(
             "DELETE FROM database_members WHERE database_id = ?1 AND principal = ?2",
             params![database_id, principal],
@@ -2704,6 +2872,32 @@ impl IcpdbService {
     ) -> Result<DatabaseShardPlacement, String> {
         self.require_role(database_id, caller, required_role)?;
         self.hot_database_route_unchecked(database_id)
+    }
+
+    pub fn database_route(
+        &self,
+        database_id: &str,
+        caller: &str,
+        required_role: RequiredRole,
+        allowed_statuses: &[DatabaseStatus],
+    ) -> Result<DatabaseShardPlacement, String> {
+        self.require_role(database_id, caller, required_role)?;
+        self.database_route_unchecked(database_id, allowed_statuses)
+    }
+
+    pub fn remote_database_route(
+        &self,
+        database_id: &str,
+        caller: &str,
+        required_role: RequiredRole,
+        allowed_statuses: &[DatabaseStatus],
+    ) -> Result<DatabaseShardPlacement, String> {
+        let placement =
+            self.database_route(database_id, caller, required_role, allowed_statuses)?;
+        if placement.canister_id.is_none() {
+            return Err(format!("database is not remote: {database_id}"));
+        }
+        Ok(placement)
     }
 
     pub fn hot_database_route_with_token(
@@ -3162,13 +3356,7 @@ impl IcpdbService {
 }
 
 fn run_index_migrations(conn: &mut Connection) -> Result<(), String> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS schema_migrations (
-           version TEXT PRIMARY KEY,
-           applied_at INTEGER NOT NULL
-         );",
-    )
-    .map_err(|error| error.to_string())?;
+    ensure_schema_migrations_table(conn)?;
     if !migration_applied(conn, INDEX_SCHEMA_VERSION_INITIAL)? {
         let tx = conn.transaction().map_err(|error| error.to_string())?;
         tx.execute_batch(
@@ -3201,7 +3389,7 @@ fn run_index_migrations(conn: &mut Connection) -> Result<(), String> {
     if !migration_applied(conn, INDEX_SCHEMA_VERSION_LIFECYCLE)? {
         let tx = conn.transaction().map_err(|error| error.to_string())?;
         tx.execute_batch(
-            "DROP INDEX IF EXISTS databases_mount_id_idx;
+            "DROP INDEX databases_mount_id_idx;
              ALTER TABLE databases ADD COLUMN active_mount_id INTEGER;
              ALTER TABLE databases ADD COLUMN status TEXT NOT NULL DEFAULT 'hot';
              ALTER TABLE databases ADD COLUMN logical_size_bytes INTEGER NOT NULL DEFAULT 0;
@@ -3589,6 +3777,28 @@ fn run_index_migrations(conn: &mut Connection) -> Result<(), String> {
         tx.commit().map_err(|error| error.to_string())?;
     }
     Ok(())
+}
+
+fn ensure_schema_migrations_table(conn: &Connection) -> Result<(), String> {
+    let exists = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'",
+            params![],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?
+        .is_some();
+    if exists {
+        return Ok(());
+    }
+    conn.execute_batch(
+        "CREATE TABLE schema_migrations (
+           version TEXT PRIMARY KEY,
+           applied_at INTEGER NOT NULL
+         );",
+    )
+    .map_err(|error| error.to_string())
 }
 
 fn migration_applied(conn: &Connection, version: &str) -> Result<bool, String> {
@@ -4812,6 +5022,29 @@ fn load_member_role(
     )
     .optional()
     .map_err(|error| error.to_string())
+}
+
+fn reject_last_owner_removal(
+    conn: &Connection,
+    database_id: &str,
+    principal: &str,
+) -> Result<(), String> {
+    if load_member_role(conn, database_id, principal)? != Some(DatabaseRole::Owner) {
+        return Ok(());
+    }
+    let owner_count = conn
+        .query_row(
+            "SELECT COUNT(*) FROM database_members WHERE database_id = ?1 AND role = 'owner'",
+            params![database_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if owner_count <= 1 {
+        return Err(format!(
+            "database must keep at least one owner principal: {database_id}"
+        ));
+    }
+    Ok(())
 }
 
 fn load_database_tokens(

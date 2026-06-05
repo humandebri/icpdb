@@ -18,6 +18,17 @@
 *.sqlite-shm
 *.sqlite-wal
 
+# ICPDB secret env handoff files
+/.env
+/.env.local
+/.env.*.local
+/service.env
+/controller.env
+/database.env
+/service-*.env
+/controller-*.env
+/database-*.env
+
 # Temp files
 /tmp/
 .pnpm-store/

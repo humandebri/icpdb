@@ -2,12 +2,55 @@
   "name": "icpdb-console",
   "version": "0.1.0",
   "private": true,
+  "type": "module",
+  "files": [
+    "dist-sdk"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist-sdk/icpdb-sdk.d.ts",
+      "import": "./dist-sdk/icpdb-sdk.js"
+    },
+    "./sdk": {
+      "types": "./dist-sdk/icpdb-sdk.d.ts",
+      "import": "./dist-sdk/icpdb-sdk.js"
+    },
+    "./web": {
+      "types": "./dist-sdk/icpdb-sdk.d.ts",
+      "import": "./dist-sdk/icpdb-sdk.js"
+    },
+    "./browser": {
+      "types": "./dist-sdk/icpdb-sdk.d.ts",
+      "import": "./dist-sdk/icpdb-sdk.js"
+    },
+    "./node": {
+      "types": "./dist-sdk/icpdb-node.d.ts",
+      "import": "./dist-sdk/icpdb-node.js"
+    },
+    "./libsql": {
+      "types": "./dist-sdk/icpdb-libsql.d.ts",
+      "import": "./dist-sdk/icpdb-libsql.js"
+    },
+    "./sqlite": {
+      "types": "./dist-sdk/icpdb-sqlite.d.ts",
+      "import": "./dist-sdk/icpdb-sqlite.js"
+    },
+    "./server": {
+      "types": "./dist-sdk/icpdb-server.d.ts",
+      "import": "./dist-sdk/icpdb-server.js"
+    },
+    "./service-identity": {
+      "types": "./dist-sdk/icpdb-service-identity.d.ts",
+      "import": "./dist-sdk/icpdb-service-identity.js"
+    }
+  },
   "scripts": {
     "dev": "next dev",
     "build": "next build",
     "lint": "eslint .",
-    "test": "node scripts/check-candid-drift.mjs && node scripts/check-api-errors.mjs && node scripts/check-icpdb.mjs && node scripts/check-row-mutations.mjs && node scripts/check-http-client.mjs && node scripts/check-http-admin-client.mjs",
-    "typecheck": "next typegen && tsc --noEmit",
+    "test": "pnpm run build:sdk && node scripts/check-candid-drift.mjs && node scripts/check-api-errors.mjs && node scripts/check-icpdb.mjs && node scripts/check-sql-dump.mjs && node scripts/check-sdk-package-artifact.mjs && node scripts/check-sdk-client.mjs && node scripts/check-row-mutations.mjs && node scripts/check-http-client.mjs && node scripts/check-http-admin-client.mjs",
+    "typecheck": "pnpm run build:sdk && next typegen && tsc --noEmit",
+    "build:sdk": "tsc -p tsconfig.sdk.json && node scripts/write-sdk-package-manifest.mjs",
     "build:worker": "opennextjs-cloudflare build",
     "preview": "opennextjs-cloudflare build && opennextjs-cloudflare preview",
     "deploy": "opennextjs-cloudflare build && opennextjs-cloudflare deploy",

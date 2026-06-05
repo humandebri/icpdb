@@ -3,11 +3,17 @@
 
 import type {
   CanisterHealth,
+  CreateDatabaseShardRequest,
+  CreateRemoteDatabaseRequest,
   DatabaseArchiveInfo,
   DatabaseBilling,
+  DatabaseInfo,
   DatabaseMember,
   DatabaseRole,
+  DatabaseShardInfo,
+  DatabaseShardMaintenanceReport,
   DatabaseShardPlacement,
+  DatabaseShardStatus,
   DatabaseStatus,
   DatabaseSummary,
   DatabaseTokenInfo,
@@ -16,29 +22,41 @@ import type {
   DatabaseUsageEventSummary,
   DepositQuote,
   DepositResult,
+  MaintainDatabaseShardsRequest,
   PaymentRecord,
+  RegisterDatabaseShardRequest,
+  RoutedOperationInfo,
   RoutedOperationStatus,
   ShardOperationInfo,
   ShardOperationReconcileRequest,
   ShardOperationReconcileStatus
-} from "@/lib/types";
+} from "./types.js";
 import type {
   RawCanisterHealth,
+  RawCreateDatabaseShardRequest,
+  RawCreateRemoteDatabaseRequest,
   RawDatabaseArchiveInfo,
   RawDatabaseBilling,
+  RawDatabaseInfo,
   RawDatabaseMember,
+  RawDatabaseShardInfo,
+  RawDatabaseShardMaintenanceReport,
   RawDatabaseShardPlacement,
+  RawDatabaseShardStatus,
   RawDatabaseSummary,
   RawDatabaseTokenInfo,
   RawDatabaseUsage,
   RawDatabaseUsageEventSummary,
   RawDepositQuote,
   RawDepositResult,
+  RawMaintainDatabaseShardsRequest,
   RawPaymentRecord,
+  RawRegisterDatabaseShardRequest,
+  RawRoutedOperationInfo,
   RawShardOperationInfo,
   RawShardOperationReconcileRequest,
   Variant
-} from "@/lib/icpdb-raw-types";
+} from "./icpdb-raw-types.js";
 
 export function normalizeCanisterHealth(raw: RawCanisterHealth): CanisterHealth {
   return { cyclesBalance: raw.cycles_balance };
@@ -50,6 +68,19 @@ export function normalizeDatabaseSummary(raw: RawDatabaseSummary): DatabaseSumma
     role: normalizeDatabaseRole(raw.role),
     status: normalizeDatabaseStatus(raw.status),
     logicalSizeBytes: raw.logical_size_bytes.toString(),
+    archivedAtMs: raw.archived_at_ms[0]?.toString() ?? null,
+    deletedAtMs: raw.deleted_at_ms[0]?.toString() ?? null
+  };
+}
+
+export function normalizeDatabaseInfo(raw: RawDatabaseInfo): DatabaseInfo {
+  return {
+    databaseId: raw.database_id,
+    status: normalizeDatabaseStatus(raw.status),
+    logicalSizeBytes: raw.logical_size_bytes.toString(),
+    schemaVersion: raw.schema_version,
+    mountId: raw.mount_id[0] ?? null,
+    snapshotHash: raw.snapshot_hash[0] ?? null,
     archivedAtMs: raw.archived_at_ms[0]?.toString() ?? null,
     deletedAtMs: raw.deleted_at_ms[0]?.toString() ?? null
   };
@@ -68,6 +99,43 @@ export function normalizeDatabaseShardPlacement(raw: RawDatabaseShardPlacement):
   };
 }
 
+export function normalizeDatabaseShardInfo(raw: RawDatabaseShardInfo): DatabaseShardInfo {
+  return {
+    shardId: raw.shard_id,
+    canisterId: raw.canister_id,
+    status: raw.status,
+    maxDatabases: raw.max_databases,
+    assignedDatabases: raw.assigned_databases.toString(),
+    createdAtMs: raw.created_at_ms.toString(),
+    updatedAtMs: raw.updated_at_ms.toString()
+  };
+}
+
+export function normalizeDatabaseShardStatus(raw: RawDatabaseShardStatus): DatabaseShardStatus {
+  return {
+    shard: normalizeDatabaseShardInfo(raw.shard),
+    canisterStatus: raw.canister_status,
+    cyclesBalance: raw.cycles_balance.toString(),
+    memorySizeBytes: raw.memory_size_bytes.toString(),
+    idleCyclesBurnedPerDay: raw.idle_cycles_burned_per_day.toString(),
+    moduleHash: raw.module_hash[0] ?? null
+  };
+}
+
+export function normalizeDatabaseShardMaintenanceReport(raw: RawDatabaseShardMaintenanceReport): DatabaseShardMaintenanceReport {
+  return {
+    availableSlots: raw.available_slots.toString(),
+    inspectedShards: raw.inspected_shards.map(normalizeDatabaseShardStatus),
+    actions: raw.actions.map((action) => ({
+      action: action.action,
+      databaseCanisterId: action.database_canister_id[0] ?? null,
+      shardId: action.shard_id[0] ?? null,
+      cycles: action.cycles.toString(),
+      reason: action.reason
+    }))
+  };
+}
+
 export function normalizeShardOperationInfo(raw: RawShardOperationInfo): ShardOperationInfo {
   return {
     operationId: raw.operation_id,
@@ -81,11 +149,99 @@ export function normalizeShardOperationInfo(raw: RawShardOperationInfo): ShardOp
   };
 }
 
-export function rawShardOperationReconcileRequest(request: ShardOperationReconcileRequest): RawShardOperationReconcileRequest {
+export function normalizeRoutedOperationInfo(raw: RawRoutedOperationInfo): RoutedOperationInfo {
   return {
-    operation_id: request.operationId,
-    status: routedOperationStatusVariant(request.status),
-    error: request.error ? [request.error] : []
+    operationId: raw.operation_id,
+    databaseId: raw.database_id,
+    databaseCanisterId: raw.database_canister_id,
+    method: raw.method,
+    requestHash: raw.request_hash,
+    status: normalizeRoutedOperationStatus(raw.status),
+    error: raw.error[0] ?? null,
+    createdAtMs: raw.created_at_ms.toString(),
+    updatedAtMs: raw.updated_at_ms.toString()
+  };
+}
+
+export function rawShardOperationReconcileRequest(request: ShardOperationReconcileRequest): RawShardOperationReconcileRequest {
+  const operationId = nonEmptyText(request.operationId, "operationId");
+  const status = reconcileStatus(request.status);
+  const error = reconcileError(status, request.error);
+  return {
+    operation_id: operationId,
+    status: routedOperationStatusVariant(status),
+    error: error === null ? [] : [error]
+  };
+}
+
+export function rawMaintainDatabaseShardsRequest(request: MaintainDatabaseShardsRequest): RawMaintainDatabaseShardsRequest {
+  return {
+    min_available_slots: natInput(request.minAvailableSlots, "minAvailableSlots"),
+    min_cycles_balance: natInput(request.minCyclesBalance, "minCyclesBalance"),
+    top_up_cycles: natInput(request.topUpCycles, "topUpCycles"),
+    max_new_shards: nat16Input(request.maxNewShards, "maxNewShards"),
+    new_shard_max_databases: nat16Input(request.newShardMaxDatabases, "newShardMaxDatabases"),
+    new_shard_initial_cycles: natInput(request.newShardInitialCycles, "newShardInitialCycles")
+  };
+}
+
+export function rawCreateDatabaseShardRequest(request: CreateDatabaseShardRequest): RawCreateDatabaseShardRequest {
+  return {
+    initial_cycles: natInput(request.initialCycles, "initialCycles"),
+    max_databases: nat16Input(request.maxDatabases, "maxDatabases")
+  };
+}
+
+function natInput(value: string | number | bigint, label: string): bigint {
+  if (typeof value === "bigint") {
+    if (value < 0n) throw new Error(`${label} must be a non-negative integer`);
+    return value;
+  }
+  if (typeof value === "number") {
+    if (!Number.isSafeInteger(value) || value < 0) throw new Error(`${label} must be a non-negative integer`);
+    return BigInt(value);
+  }
+  const trimmed = value.trim();
+  if (!/^\d+$/.test(trimmed)) throw new Error(`${label} must be a non-negative integer`);
+  return BigInt(trimmed);
+}
+
+function nat16Input(value: number, label: string): number {
+  if (!Number.isSafeInteger(value) || value < 0 || value > 65535) {
+    throw new Error(`${label} must be an integer from 0 to 65535`);
+  }
+  return value;
+}
+
+function nonEmptyText(value: string, label: string): string {
+  if (typeof value !== "string" || value.trim().length === 0) throw new Error(`${label} must be a non-empty string`);
+  return value.trim();
+}
+
+function reconcileStatus(status: ShardOperationReconcileStatus): ShardOperationReconcileStatus {
+  if (status === "applied" || status === "failed") return status;
+  throw new Error("status must be applied or failed");
+}
+
+function reconcileError(status: ShardOperationReconcileStatus, error: string | null): string | null {
+  if (status === "applied") {
+    if (error !== null) throw new Error("error is only valid when shard reconcile status is failed");
+    return null;
+  }
+  return nonEmptyText(error ?? "", "error");
+}
+
+export function rawRegisterDatabaseShardRequest(request: RegisterDatabaseShardRequest): RawRegisterDatabaseShardRequest {
+  return {
+    database_canister_id: request.databaseCanisterId,
+    max_databases: nat16Input(request.maxDatabases, "maxDatabases")
+  };
+}
+
+export function rawCreateRemoteDatabaseRequest(request: CreateRemoteDatabaseRequest): RawCreateRemoteDatabaseRequest {
+  return {
+    database_id: request.databaseId,
+    database_canister_id: request.databaseCanisterId
   };
 }
 
@@ -185,20 +341,24 @@ export function normalizeDatabaseTokenInfo(raw: RawDatabaseTokenInfo): DatabaseT
 
 export function databaseTokenScopeVariant(scope: DatabaseTokenScope): Variant {
   if (scope === "owner") return { Owner: null };
-  return scope === "write" ? { Write: null } : { Read: null };
+  if (scope === "write") return { Write: null };
+  if (scope === "read") return { Read: null };
+  throw new Error("database token scope must be read, write, or owner");
 }
 
 export function databaseRoleVariant(role: DatabaseRole): Variant {
   if (role === "owner") return { Owner: null };
   if (role === "writer") return { Writer: null };
-  return { Reader: null };
+  if (role === "reader") return { Reader: null };
+  throw new Error("database role must be reader, writer, or owner");
 }
 
 function normalizeRoutedOperationStatus(status: Variant): RoutedOperationStatus {
   if ("Applied" in status) return "applied";
   if ("Failed" in status) return "failed";
   if ("Unknown" in status) return "unknown";
-  return "pending";
+  if ("Pending" in status) return "pending";
+  throw new Error(`unknown routed operation status variant: ${variantKeys(status)}`);
 }
 
 function routedOperationStatusVariant(status: ShardOperationReconcileStatus): Variant {
@@ -209,13 +369,15 @@ function routedOperationStatusVariant(status: ShardOperationReconcileStatus): Va
 function normalizeDatabaseTokenScope(scope: Variant): DatabaseTokenScope {
   if ("Owner" in scope) return "owner";
   if ("Write" in scope) return "write";
-  return "read";
+  if ("Read" in scope) return "read";
+  throw new Error(`unknown database token scope variant: ${variantKeys(scope)}`);
 }
 
 function normalizeDatabaseRole(role: Variant): DatabaseRole {
   if ("Owner" in role) return "owner";
   if ("Writer" in role) return "writer";
-  return "reader";
+  if ("Reader" in role) return "reader";
+  throw new Error(`unknown database role variant: ${variantKeys(role)}`);
 }
 
 function normalizeDatabaseStatus(status: Variant): DatabaseStatus {
@@ -223,5 +385,10 @@ function normalizeDatabaseStatus(status: Variant): DatabaseStatus {
   if ("Archiving" in status) return "archiving";
   if ("Archived" in status) return "archived";
   if ("Deleted" in status) return "deleted";
-  return "hot";
+  if ("Hot" in status) return "hot";
+  throw new Error(`unknown database status variant: ${variantKeys(status)}`);
+}
+
+function variantKeys(variant: Variant): string {
+  return Object.keys(variant).join("|") || "empty";
 }

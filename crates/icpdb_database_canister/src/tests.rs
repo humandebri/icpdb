@@ -34,6 +34,7 @@ fn control_can_create_and_query_database_slot() {
             sql: "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL)".to_string(),
             params: Vec::new(),
             max_rows: None,
+            idempotency_key: None,
         },
     })
     .expect("table should create");
@@ -44,6 +45,7 @@ fn control_can_create_and_query_database_slot() {
             sql: "INSERT INTO notes (body) VALUES ('from-shard')".to_string(),
             params: Vec::new(),
             max_rows: None,
+            idempotency_key: None,
         },
     })
     .expect("row should insert");
@@ -62,6 +64,7 @@ fn control_can_create_and_query_database_slot() {
             sql: "INSERT INTO notes (body) VALUES ('from-shard')".to_string(),
             params: Vec::new(),
             max_rows: None,
+            idempotency_key: None,
         },
     })
     .expect_err("duplicate applied operation should not re-run");
@@ -79,6 +82,7 @@ fn control_can_create_and_query_database_slot() {
         sql: "SELECT body FROM notes".to_string(),
         params: Vec::new(),
         max_rows: None,
+        idempotency_key: None,
     })
     .expect("control should query rows");
     assert_eq!(result.rows[0][0], SqlValue::Text("from-shard".to_string()));
@@ -91,6 +95,7 @@ fn control_can_create_and_query_database_slot() {
         sql: "SELECT body FROM notes".to_string(),
         params: Vec::new(),
         max_rows: None,
+        idempotency_key: None,
     })
     .expect("control should query restored rows");
     assert_eq!(

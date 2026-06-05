@@ -7,13 +7,15 @@ use std::sync::Arc;
 use std::task::{Context, Poll, Wake, Waker};
 
 use candid::Nat;
-use icpdb_runtime::{IcpdbService, hash_api_token};
+use icpdb_runtime::{IcpdbService, RoutedWriteBegin, SQL_EXECUTE_BILLING_UNITS, hash_api_token};
 use icpdb_types::{
-    CreateDatabaseShardRequest, CreateDatabaseTokenRequest, DatabaseBalanceTopUpRequest,
-    DatabaseBillingStatus, DatabaseRestoreChunkRequest, DatabaseRole, DatabaseShardStatusRequest,
-    DatabaseStatus, DatabaseTokenScope, MaintainDatabaseShardsRequest,
+    CreateDatabaseShardRequest, CreateDatabaseTokenRequest, DataPlaneSqlExecuteRequest,
+    DatabaseArchiveChunk, DatabaseArchiveInfo, DatabaseBalanceTopUpRequest, DatabaseBillingStatus,
+    DatabaseRestoreChunkRequest, DatabaseRole, DatabaseShardStatusRequest, DatabaseStatus,
+    DatabaseTable, DatabaseTokenScope, MaintainDatabaseShardsRequest,
     MigrateDatabaseToShardRequest, RoutedOperationRequest, RoutedOperationStatus,
-    ShardOperationReconcileRequest, SqlExecuteRequest, SqlValue, TablePreviewRequest,
+    ShardOperationReconcileRequest, SqlBatchRequest, SqlExecuteRequest, SqlExecuteResponse,
+    SqlStatement, SqlValue, TableDescription, TablePreviewRequest, TablePreviewResponse,
     TopUpDatabaseShardRequest,
 };
 use icrc_ledger_types::icrc2::transfer_from::TransferFromError;
@@ -21,18 +23,19 @@ use sha2::{Digest, Sha256};
 use tempfile::tempdir;
 
 use super::{
-    HeaderField, HttpRequest, PENDING_DEPOSITS, SERVICE, acquire_deposit_guard_for_test,
-    bearer_token, begin_database_archive, begin_database_restore, cancel_database_archive,
+    HeaderField, HttpRequest, PENDING_DEPOSITS, RemotePrincipalWriteContext, SERVICE,
+    acquire_deposit_guard_for_test, bearer_token, candid_routed_operation_id,
     clear_test_icp_transfer_from, create_database, create_database_shard, create_database_token,
-    deposit_with_approval, describe_table, describe_transfer_from_error,
-    fail_next_mount_database_file_for_test, finalize_database_archive, finalize_database_restore,
-    get_billing, get_database_shard_status, get_deposit_quote, get_routed_operation,
-    get_usage_event_summaries, grant_database_access, http_error_status, http_request,
-    idempotency_key, list_all_database_placements, list_database_placements, list_databases,
-    list_payments, list_tables, maintain_database_shards, migrate_database_to_shard, preview_table,
-    read_database_archive_chunk, reconcile_shard_operation, revoke_database_access,
-    set_test_caller_is_controller, set_test_caller_text, set_test_icp_transfer_from, sql_execute,
-    sql_query, top_up_database_balance, top_up_database_shard, write_database_restore_chunk,
+    deposit_with_approval, describe_transfer_from_error, fail_next_mount_database_file_for_test,
+    finish_remote_lifecycle_operation_journal, get_billing, get_database_shard_status,
+    get_deposit_quote, get_routed_operation, get_usage_event_summaries, grant_database_access,
+    http_error_status, http_request, idempotency_key, list_all_database_placements,
+    list_database_placements, list_databases, list_payments, maintain_database_shards,
+    mark_routed_write_completion_failed, migrate_database_to_shard, reconcile_shard_operation,
+    remote_lifecycle_operation_status, remote_sql_write_for_caller, revoke_database_access,
+    routed_request_hash, set_test_caller_is_controller, set_test_caller_text,
+    set_test_icp_transfer_from, sql_batch_response_with_routed_operation_id,
+    sql_response_with_routed_operation_id, top_up_database_balance, top_up_database_shard,
 };
 
 struct NoopWaker;
@@ -49,6 +52,70 @@ fn block_on_ready<T>(future: impl Future<Output = T>) -> T {
         Poll::Ready(value) => value,
         Poll::Pending => panic!("test future unexpectedly pending"),
     }
+}
+
+fn sql_query(request: SqlExecuteRequest) -> Result<SqlExecuteResponse, String> {
+    block_on_ready(super::sql_query(request))
+}
+
+fn sql_execute(request: SqlExecuteRequest) -> Result<SqlExecuteResponse, String> {
+    block_on_ready(super::sql_execute(request))
+}
+
+fn list_tables(database_id: String) -> Result<Vec<DatabaseTable>, String> {
+    block_on_ready(super::list_tables(database_id))
+}
+
+fn describe_table(database_id: String, table_name: String) -> Result<TableDescription, String> {
+    block_on_ready(super::describe_table(database_id, table_name))
+}
+
+fn preview_table(request: TablePreviewRequest) -> Result<TablePreviewResponse, String> {
+    block_on_ready(super::preview_table(request))
+}
+
+fn begin_database_archive(database_id: String) -> Result<DatabaseArchiveInfo, String> {
+    block_on_ready(super::begin_database_archive(database_id))
+}
+
+fn read_database_archive_chunk(
+    database_id: String,
+    offset: u64,
+    max_bytes: u32,
+) -> Result<DatabaseArchiveChunk, String> {
+    block_on_ready(super::read_database_archive_chunk(
+        database_id,
+        offset,
+        max_bytes,
+    ))
+}
+
+fn finalize_database_archive(database_id: String, snapshot_hash: Vec<u8>) -> Result<(), String> {
+    block_on_ready(super::finalize_database_archive(database_id, snapshot_hash))
+}
+
+fn cancel_database_archive(database_id: String) -> Result<(), String> {
+    block_on_ready(super::cancel_database_archive(database_id))
+}
+
+fn begin_database_restore(
+    database_id: String,
+    snapshot_hash: Vec<u8>,
+    size_bytes: u64,
+) -> Result<(), String> {
+    block_on_ready(super::begin_database_restore(
+        database_id,
+        snapshot_hash,
+        size_bytes,
+    ))
+}
+
+fn write_database_restore_chunk(request: DatabaseRestoreChunkRequest) -> Result<(), String> {
+    block_on_ready(super::write_database_restore_chunk(request))
+}
+
+fn finalize_database_restore(database_id: String) -> Result<(), String> {
+    block_on_ready(super::finalize_database_restore(database_id))
 }
 
 fn install_test_service() {
@@ -113,6 +180,7 @@ fn sql_request(database_id: &str, sql: &str) -> SqlExecuteRequest {
         sql: sql.to_string(),
         params: Vec::new(),
         max_rows: None,
+        idempotency_key: None,
     }
 }
 
@@ -240,6 +308,7 @@ fn table_editor_queries_use_caller_role() {
         sql: "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL)".to_string(),
         params: Vec::new(),
         max_rows: None,
+        idempotency_key: None,
     })
     .expect("table should create");
     sql_execute(SqlExecuteRequest {
@@ -247,6 +316,7 @@ fn table_editor_queries_use_caller_role() {
         sql: "INSERT INTO notes (body) VALUES ('hello')".to_string(),
         params: Vec::new(),
         max_rows: None,
+        idempotency_key: None,
     })
     .expect("row should insert");
 
@@ -548,6 +618,115 @@ fn reconcile_shard_operation_requires_controller_and_unknown_status() {
 }
 
 #[test]
+fn remote_lifecycle_operation_status_classifies_remote_and_local_outcomes() {
+    let ok: Result<(), String> = Ok(());
+    let err: Result<(), String> = Err("controller update failed".to_string());
+
+    assert_eq!(
+        remote_lifecycle_operation_status(false, &err),
+        RoutedOperationStatus::Failed
+    );
+    assert_eq!(
+        remote_lifecycle_operation_status(true, &ok),
+        RoutedOperationStatus::Applied
+    );
+    assert_eq!(
+        remote_lifecycle_operation_status(true, &err),
+        RoutedOperationStatus::Unknown
+    );
+}
+
+#[test]
+fn remote_lifecycle_journal_records_unknown_after_remote_success_local_failure() {
+    install_empty_test_service();
+    let request_hash = sha256_bytes(b"remote lifecycle");
+
+    SERVICE.with(|slot| {
+        let service = slot.borrow();
+        let service = service.as_ref().expect("service should be installed");
+        for operation_id in ["op_remote_failed", "op_remote_applied", "op_remote_unknown"] {
+            service
+                .begin_shard_operation(
+                    operation_id,
+                    "begin_remote_database_archive",
+                    Some("default"),
+                    request_hash.clone(),
+                    1,
+                )
+                .expect("operation should begin");
+        }
+    });
+
+    let remote_error: Result<(), String> = Err("remote call failed".to_string());
+    finish_remote_lifecycle_operation_journal("op_remote_failed", false, &remote_error, 2);
+    let applied: Result<(), String> = Ok(());
+    finish_remote_lifecycle_operation_journal("op_remote_applied", true, &applied, 3);
+    let local_error: Result<(), String> = Err("controller update failed".to_string());
+    finish_remote_lifecycle_operation_journal("op_remote_unknown", true, &local_error, 4);
+
+    SERVICE.with(|slot| {
+        let service = slot.borrow();
+        let service = service.as_ref().expect("service should be installed");
+        let failed = service
+            .shard_operation("op_remote_failed")
+            .expect("operation should load")
+            .expect("operation should exist");
+        assert_eq!(failed.status, RoutedOperationStatus::Failed);
+        assert_eq!(failed.error.as_deref(), Some("remote call failed"));
+
+        let applied = service
+            .shard_operation("op_remote_applied")
+            .expect("operation should load")
+            .expect("operation should exist");
+        assert_eq!(applied.status, RoutedOperationStatus::Applied);
+        assert_eq!(applied.error, None);
+
+        let unknown = service
+            .shard_operation("op_remote_unknown")
+            .expect("operation should load")
+            .expect("operation should exist");
+        assert_eq!(unknown.status, RoutedOperationStatus::Unknown);
+        assert_eq!(unknown.error.as_deref(), Some("controller update failed"));
+    });
+}
+
+#[test]
+fn routed_write_completion_failure_marks_operation_unknown() {
+    install_test_service();
+    SERVICE.with(|slot| {
+        let service = slot.borrow();
+        let service = service.as_ref().expect("service should be installed");
+        service
+            .begin_routed_write(
+                "2vxsx-fae",
+                "default",
+                RoutedWriteBegin {
+                    operation_id: "op_completion_failed",
+                    database_canister_id: "aaaaa-aa",
+                    method: "sql_execute_internal",
+                    request_hash: sha256_bytes(b"principal routed write"),
+                    billing_units: SQL_EXECUTE_BILLING_UNITS,
+                    now: 1,
+                },
+            )
+            .expect("routed write should begin");
+    });
+
+    mark_routed_write_completion_failed("op_completion_failed", "unit charge failed", 2);
+
+    SERVICE.with(|slot| {
+        let service = slot.borrow();
+        let service = service.as_ref().expect("service should be installed");
+        let operation = service
+            .routed_operation("op_completion_failed")
+            .expect("operation should load")
+            .expect("operation should exist");
+        assert_eq!(operation.status, RoutedOperationStatus::Unknown);
+        assert_eq!(operation.error.as_deref(), Some("unit charge failed"));
+    });
+}
+
+#[test]
 fn maintain_database_shards_validates_capacity_policy_before_management_calls() {
     install_empty_test_service();
     set_test_caller_text(Some("aaaaa-aa"));
@@ -745,6 +924,142 @@ fn http_token_can_get_routed_operation_status() {
 }
 
 #[test]
+fn remote_sql_response_includes_routed_operation_id() {
+    let response = SqlExecuteResponse {
+        columns: Vec::new(),
+        rows: Vec::new(),
+        rows_affected: 1,
+        last_insert_rowid: 7,
+        truncated: false,
+        routed_operation_id: None,
+    };
+    let tagged = sql_response_with_routed_operation_id(response, "op_remote_result");
+    assert_eq!(
+        tagged.routed_operation_id.as_deref(),
+        Some("op_remote_result")
+    );
+
+    let batch = sql_batch_response_with_routed_operation_id(vec![tagged], "op_remote_batch");
+    assert_eq!(
+        batch[0].routed_operation_id.as_deref(),
+        Some("op_remote_batch")
+    );
+}
+
+#[test]
+fn remote_sql_applied_retry_returns_success_without_duplicate_write() {
+    install_test_service();
+    let request = sql_request("default", "INSERT INTO notes(id) VALUES (1)");
+    let request_hash =
+        routed_request_hash("sql_execute_internal", &request).expect("request hash should build");
+    SERVICE.with(|slot| {
+        let service = slot.borrow();
+        let service = service.as_ref().expect("service should be installed");
+        service
+            .begin_routed_write(
+                "2vxsx-fae",
+                "default",
+                RoutedWriteBegin {
+                    operation_id: "op_remote_applied_retry",
+                    database_canister_id: "aaaaa-aa",
+                    method: "sql_execute_internal",
+                    request_hash,
+                    billing_units: SQL_EXECUTE_BILLING_UNITS,
+                    now: 10,
+                },
+            )
+            .expect("operation should begin");
+        service
+            .update_routed_operation_status(
+                "op_remote_applied_retry",
+                RoutedOperationStatus::Applied,
+                None,
+                11,
+            )
+            .expect("operation should mark applied");
+    });
+
+    let response = block_on_ready(remote_sql_write_for_caller(
+        "2vxsx-fae",
+        &request,
+        DataPlaneSqlExecuteRequest {
+            operation_id: "op_remote_applied_retry".to_string(),
+            request: request.clone(),
+        },
+        RemotePrincipalWriteContext {
+            canister_id: "aaaaa-aa",
+            internal_method: "sql_execute_internal",
+            operation_id: "op_remote_applied_retry",
+            billing_units: SQL_EXECUTE_BILLING_UNITS,
+            now: 12,
+            method: "sql_execute",
+            operation: Some("insert"),
+            database_id: "default",
+        },
+        |_| (0, 0),
+        super::applied_replay_sql_response,
+    ))
+    .expect("applied retry should return success");
+    assert_eq!(response.rows_affected, 0);
+
+    let mismatch = SqlExecuteRequest {
+        sql: "INSERT INTO notes(id) VALUES (2)".to_string(),
+        ..request
+    };
+    let error = block_on_ready(remote_sql_write_for_caller(
+        "2vxsx-fae",
+        &mismatch,
+        DataPlaneSqlExecuteRequest {
+            operation_id: "op_remote_applied_retry".to_string(),
+            request: mismatch.clone(),
+        },
+        RemotePrincipalWriteContext {
+            canister_id: "aaaaa-aa",
+            internal_method: "sql_execute_internal",
+            operation_id: "op_remote_applied_retry",
+            billing_units: SQL_EXECUTE_BILLING_UNITS,
+            now: 13,
+            method: "sql_execute",
+            operation: Some("insert"),
+            database_id: "default",
+        },
+        |_| (0, 0),
+        super::applied_replay_sql_response,
+    ))
+    .expect_err("different retry request should stay rejected");
+    assert!(error.contains("routed operation request mismatch"));
+}
+
+#[test]
+fn candid_sql_requests_can_supply_routed_operation_id() {
+    let execute = SqlExecuteRequest {
+        database_id: "default".to_string(),
+        sql: "INSERT INTO notes (body) VALUES ('hello')".to_string(),
+        params: Vec::new(),
+        max_rows: None,
+        idempotency_key: Some("sdk_retry_insert_1".to_string()),
+    };
+    assert_eq!(
+        candid_routed_operation_id("sql_execute", &execute).expect("key should load"),
+        "sdk_retry_insert_1"
+    );
+
+    let batch = SqlBatchRequest {
+        database_id: "default".to_string(),
+        statements: vec![SqlStatement {
+            sql: "INSERT INTO notes (body) VALUES ('hello')".to_string(),
+            params: Vec::new(),
+        }],
+        max_rows: None,
+        idempotency_key: Some("sdk_retry_batch_1".to_string()),
+    };
+    assert_eq!(
+        candid_routed_operation_id("sql_batch", &batch).expect("key should load"),
+        "sdk_retry_batch_1"
+    );
+}
+
+#[test]
 fn http_token_can_inspect_tables() {
     install_test_service();
     sql_execute(SqlExecuteRequest {
@@ -752,6 +1067,7 @@ fn http_token_can_inspect_tables() {
         sql: "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL)".to_string(),
         params: Vec::new(),
         max_rows: None,
+        idempotency_key: None,
     })
     .expect("table should create");
     sql_execute(SqlExecuteRequest {
@@ -759,6 +1075,7 @@ fn http_token_can_inspect_tables() {
         sql: "INSERT INTO notes (body) VALUES ('hello')".to_string(),
         params: Vec::new(),
         max_rows: None,
+        idempotency_key: None,
     })
     .expect("row should insert");
     SERVICE.with(|slot| {
@@ -1302,6 +1619,67 @@ fn http_owner_token_can_manage_database_members() {
         serde_json::json!({ "database_id": "default", "principal": "aaaaa-aa" }),
     ));
     assert_eq!(revoked.status_code, 200);
+
+    let grant_anonymous_reader = http_request_update(http_update_json(
+        "/v1/members/grant",
+        "secret-owner",
+        serde_json::json!({
+            "database_id": "default",
+            "principal": "2vxsx-fae",
+            "role": "reader"
+        }),
+    ));
+    assert_eq!(grant_anonymous_reader.status_code, 400);
+    assert!(
+        json_body(&grant_anonymous_reader)["error"]
+            .as_str()
+            .expect("error should be text")
+            .contains("anonymous principal")
+    );
+
+    let revoke_last_owner = http_request_update(http_update_json(
+        "/v1/members/revoke",
+        "secret-owner",
+        serde_json::json!({ "database_id": "default", "principal": "2vxsx-fae" }),
+    ));
+    assert_eq!(revoke_last_owner.status_code, 400);
+    assert!(
+        json_body(&revoke_last_owner)["error"]
+            .as_str()
+            .expect("error should be text")
+            .contains("at least one owner principal")
+    );
+
+    let backup_owner = http_request_update(http_update_json(
+        "/v1/members/grant",
+        "secret-owner",
+        serde_json::json!({
+            "database_id": "default",
+            "principal": "aaaaa-aa",
+            "role": "owner"
+        }),
+    ));
+    assert_eq!(backup_owner.status_code, 200);
+
+    let revoke_original_owner = http_request_update(http_update_json(
+        "/v1/members/revoke",
+        "secret-owner",
+        serde_json::json!({ "database_id": "default", "principal": "2vxsx-fae" }),
+    ));
+    assert_eq!(revoke_original_owner.status_code, 200);
+
+    let revoke_remaining_owner = http_request_update(http_update_json(
+        "/v1/members/revoke",
+        "secret-owner",
+        serde_json::json!({ "database_id": "default", "principal": "aaaaa-aa" }),
+    ));
+    assert_eq!(revoke_remaining_owner.status_code, 400);
+    assert!(
+        json_body(&revoke_remaining_owner)["error"]
+            .as_str()
+            .expect("error should be text")
+            .contains("at least one owner principal")
+    );
 }
 
 #[test]
@@ -1422,7 +1800,7 @@ fn revoke_database_access_validates_and_canonicalizes_principal() {
 }
 
 #[test]
-fn anonymous_reader_grant_allows_public_query() {
+fn anonymous_reader_grant_is_rejected() {
     let dir = tempdir().expect("tempdir should create");
     let root = dir.keep();
     let service = test_service_for_root(&root);
@@ -1432,15 +1810,15 @@ fn anonymous_reader_grant_allows_public_query() {
     service
         .create_database("public", "owner", 1)
         .expect("database should create");
-    service
+    let error = service
         .grant_database_access("public", "owner", "2vxsx-fae", DatabaseRole::Reader, 2)
-        .expect("anonymous reader should grant");
+        .expect_err("anonymous reader should fail");
+    assert!(error.contains("anonymous principal"));
     SERVICE.with(|slot| *slot.borrow_mut() = Some(service));
 
-    let response = sql_query(sql_request("public", "SELECT 1"))
-        .expect("anonymous reader query should pass role check");
-
-    assert_eq!(response.rows.len(), 1);
+    let query_error = sql_query(sql_request("public", "SELECT 1"))
+        .expect_err("anonymous query should fail role check");
+    assert!(query_error.contains("no access"));
 }
 
 #[test]

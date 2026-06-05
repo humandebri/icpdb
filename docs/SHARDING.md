@@ -218,9 +218,9 @@ rows. The placement panel can also refresh controller-only global placement inve
 or timestamp before reconciliation.
 The control canister exposes controller-only `list_all_database_placements` for global placement
 inventory. The CLI maps Candid `placements` to that method, and also exposes controller-only
-`shards`, `shard-status`, `shard-top-up`, `shard-maintain`, `shard-ops`, and `shard-reconcile`
-commands for operators that use `icp canister call` identity instead of a browser Internet Identity
-session.
+`shards`, `shard-status`, `shard-top-up`, `shard-maintain`, `shard-migrate`, `shard-ops`, and
+`shard-reconcile` commands for operators that use `icp canister call` identity instead of a browser
+Internet Identity session.
 
 Unknown routed writes use a separate recovery path. `reconcile_routed_operation` is controller-only:
 it loads the control-side `routed_operations` row, checks matching database-canister
@@ -278,6 +278,8 @@ internal chunk methods:
 
 The control catalog updates its remote placement status after each successful remote lifecycle
 transition, so routing rejects normal hot reads/writes while the database is archiving or restoring.
+Identity-signed CLI archive/restore uses the same Candid lifecycle methods, so Server/CI principals
+can snapshot and restore remote placements without database bearer tokens.
 
 ## Shard Allocation
 
@@ -383,7 +385,7 @@ Phase 3: control routing.
 - Control-side `routed_operations` log exists for idempotent mutating calls.
 - Routed write status is inspectable through Candid `get_routed_operation`, HTTP `/v1/operations/get`, CLI `operation`, and shell `.operation`.
 - Control-side `shard_operations` log exists for bounded-wait shard management and migration calls.
-- Controller shard inventory, status, top-up, maintenance, journal, and routed-write recovery operations are available through CLI `shards`, `shard-status`, `shard-top-up`, `shard-maintain`, `shard-ops`, `shard-reconcile`, and `operation-reconcile`.
+- Controller shard inventory, status, top-up, maintenance, migration, journal, and routed-write recovery operations are available through CLI `shards`, `shard-status`, `shard-top-up`, `shard-maintain`, `shard-migrate`, `shard-ops`, `shard-reconcile`, and `operation-reconcile`.
 - Runtime exposes `begin_routed_operation`, `update_routed_operation_status`, and `routed_operation`.
 - Database canister runtime stores `data_plane_operations` through `record_data_plane_operation`
   and exposes applied operation proof through `data_plane_operation`.

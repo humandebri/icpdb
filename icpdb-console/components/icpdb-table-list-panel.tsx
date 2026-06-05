@@ -3,12 +3,13 @@
 // icpdb-console/components/icpdb-table-list-panel.tsx
 // Table/view picker with object-type filtering and create-table controls.
 
-import { Plus, Search, Table2 } from "lucide-react";
+import { Code2, Plus, Search, Table2 } from "lucide-react";
 import { useMemo, useState } from "react";
 import type { DatabaseTable } from "@/lib/types";
 
 export type TableListProps = {
   canCreateTable: boolean;
+  canOpenSetupSql: boolean;
   createTableColumns: string;
   createTableName: string;
   tableName: string;
@@ -16,11 +17,14 @@ export type TableListProps = {
   onCreateTable: () => void;
   onCreateTableColumnsChange: (value: string) => void;
   onCreateTableNameChange: (value: string) => void;
+  onOpenSetupSql: () => void;
+  onOpenTableSql: (tableName: string) => void;
   onSelectTable: (tableName: string) => void;
 };
 
 export function TableList({
   canCreateTable,
+  canOpenSetupSql,
   createTableColumns,
   createTableName,
   tableName,
@@ -28,6 +32,8 @@ export function TableList({
   onCreateTable,
   onCreateTableColumnsChange,
   onCreateTableNameChange,
+  onOpenSetupSql,
+  onOpenTableSql,
   onSelectTable
 }: TableListProps) {
   const [tableSearch, setTableSearch] = useState("");
@@ -64,6 +70,17 @@ export function TableList({
           <Plus aria-hidden size={14} />
           <span>Create table</span>
         </button>
+        <button
+          aria-label="Open setup SQL"
+          className="mt-2 inline-flex w-full items-center justify-center gap-2 rounded-md border border-[#c9ced8] bg-white px-2 py-1.5 text-xs font-medium text-[#344054] disabled:opacity-50"
+          disabled={!canOpenSetupSql}
+          title="Open setup SQL"
+          type="button"
+          onClick={onOpenSetupSql}
+        >
+          <Code2 aria-hidden size={14} />
+          <span>Open setup SQL</span>
+        </button>
       </div>
       <div className="border-b border-[#eef1f5] p-2">
         <div className="mb-2 grid grid-cols-3 overflow-hidden rounded-md border border-[#c9ced8] text-xs">
@@ -96,20 +113,26 @@ export function TableList({
         {tables.length === 0 ? <p className="px-2 py-3 text-sm text-[#5f6c7b]">No tables</p> : null}
         {tables.length > 0 && visibleTables.length === 0 ? <p className="px-2 py-3 text-sm text-[#5f6c7b]">No matching tables</p> : null}
         {visibleTables.map((table) => (
-          <button
-            className={table.name === tableName ? activeTableClass : inactiveTableClass}
-            key={table.name}
-            type="button"
-            onClick={() => onSelectTable(table.name)}
-          >
-            <span className="truncate">{table.name}</span>
+          <div className={table.name === tableName ? activeTableRowClass : inactiveTableRowClass} key={table.name}>
+            <button className="min-w-0 flex-1 text-left" type="button" onClick={() => onSelectTable(table.name)}>
+              <span className="block truncate">{table.name}</span>
+            </button>
             <span className="flex shrink-0 items-center gap-1">
               <span className="text-xs text-[#667085]">{table.objectType}</span>
               <span className={table.name === tableName ? selectedTableBadgeClass : inactiveTableBadgeClass}>
                 {tableSelectionLabel(table.name, tableName)}
               </span>
+              <button
+                aria-label={`Open SELECT SQL for ${table.name}`}
+                className="inline-flex h-7 w-7 items-center justify-center rounded border border-[#c9ced8] bg-white text-[#344054] hover:bg-[#f7f8fb]"
+                title="Open SELECT SQL"
+                type="button"
+                onClick={() => onOpenTableSql(table.name)}
+              >
+                <Search aria-hidden size={14} />
+              </button>
             </span>
-          </button>
+          </div>
         ))}
       </div>
     </div>
@@ -156,10 +179,10 @@ function tableSelectionLabel(nextTableName: string, selectedTableName: string): 
 
 const activeTableFilterClass = "flex h-8 items-center justify-center gap-1 bg-[#182230] px-2 font-medium text-white";
 const inactiveTableFilterClass = "flex h-8 items-center justify-center gap-1 bg-white px-2 text-[#5f6c7b] hover:bg-[#f7f8fb]";
-const activeTableClass =
-  "flex w-full items-center justify-between gap-2 rounded-md bg-[#eaf1ff] px-2 py-2 text-left text-sm font-medium text-[#182230]";
-const inactiveTableClass =
-  "flex w-full items-center justify-between gap-2 rounded-md px-2 py-2 text-left text-sm text-[#344054] hover:bg-[#f7f8fb]";
+const activeTableRowClass =
+  "flex w-full items-center justify-between gap-2 rounded-md bg-[#eaf1ff] px-2 py-2 text-sm font-medium text-[#182230]";
+const inactiveTableRowClass =
+  "flex w-full items-center justify-between gap-2 rounded-md px-2 py-2 text-sm text-[#344054] hover:bg-[#f7f8fb]";
 const selectedTableBadgeClass =
   "rounded border border-[#2f6fed] bg-[#eaf1ff] px-1.5 py-0.5 text-[0.68rem] font-medium text-[#2f6fed]";
 const inactiveTableBadgeClass =

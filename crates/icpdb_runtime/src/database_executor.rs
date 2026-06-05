@@ -1,6 +1,6 @@
 // Where: crates/icpdb_runtime/src/database_executor.rs
-// What: Data-plane execution boundary for hosted SQLite database operations.
-// Why: Sharding needs control-plane code to route execution without owning SQLite paths directly.
+// What: Data-plane execution boundary for SQLite Admin Protocol operations.
+// Why: Hosted and adapter canisters need SQL execution separated from control-plane concerns.
 use crate::sql;
 use crate::sqlite_facade::Connection;
 use crate::table_inspection;

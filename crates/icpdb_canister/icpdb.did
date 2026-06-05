@@ -301,16 +301,19 @@ type SqlBatchRequest = record {
   max_rows : opt nat32;
   database_id : text;
   statements : vec SqlStatement;
+  idempotency_key : opt text;
 };
 type SqlExecuteRequest = record {
   sql : text;
   max_rows : opt nat32;
   database_id : text;
   params : vec SqlValue;
+  idempotency_key : opt text;
 };
 type SqlExecuteResponse = record {
   truncated : bool;
   rows : vec vec SqlValue;
+  routed_operation_id : opt text;
   rows_affected : nat64;
   last_insert_rowid : int64;
   columns : vec text;
@@ -364,7 +367,7 @@ service : () -> {
   create_remote_database : (CreateRemoteDatabaseRequest) -> (Result_5);
   delete_database : (text) -> (Result_1);
   deposit_with_approval : (text, nat64) -> (Result_6);
-  describe_table : (text, text) -> (Result_7) query;
+  describe_table : (text, text) -> (Result_7);
   finalize_database_archive : (text, blob) -> (Result_1);
   finalize_database_restore : (text) -> (Result_1);
   get_billing : (text) -> (Result_8) query;
@@ -384,11 +387,11 @@ service : () -> {
   list_databases : () -> (Result_18) query;
   list_payments : (text) -> (Result_19) query;
   list_shard_operations : () -> (Result_20) query;
-  list_tables : (text) -> (Result_21) query;
+  list_tables : (text) -> (Result_21);
   maintain_database_shards : (MaintainDatabaseShardsRequest) -> (Result_22);
   migrate_database_to_shard : (CreateRemoteDatabaseRequest) -> (Result_23);
-  preview_table : (TablePreviewRequest) -> (Result_24) query;
-  read_database_archive_chunk : (text, nat64, nat32) -> (Result_25) query;
+  preview_table : (TablePreviewRequest) -> (Result_24);
+  read_database_archive_chunk : (text, nat64, nat32) -> (Result_25);
   reconcile_routed_operation : (RoutedOperationRequest) -> (Result_11);
   reconcile_shard_operation : (ShardOperationReconcileRequest) -> (Result_26);
   register_database_shard : (RegisterDatabaseShardRequest) -> (Result_3);
@@ -397,7 +400,7 @@ service : () -> {
   set_database_quota : (DatabaseQuotaRequest) -> (Result_12);
   sql_batch : (SqlBatchRequest) -> (Result_28);
   sql_execute : (SqlExecuteRequest) -> (Result_29);
-  sql_query : (SqlExecuteRequest) -> (Result_29) query;
+  sql_query : (SqlExecuteRequest) -> (Result_29);
   top_up_database_balance : (DatabaseBalanceTopUpRequest) -> (Result_8);
   top_up_database_shard : (TopUpDatabaseShardRequest) -> (Result_3);
   write_database_restore_chunk : (DatabaseRestoreChunkRequest) -> (Result_1);

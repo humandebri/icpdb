@@ -18,6 +18,7 @@ type LoadState = "idle" | "loading" | "ready" | "error";
 
 type DatabaseNavigatorProps = {
   canCreateTable: boolean;
+  canOpenSetupSql: boolean;
   canisterId: string;
   createTableColumns: string;
   createTableName: string;
@@ -31,6 +32,8 @@ type DatabaseNavigatorProps = {
   onCreateTable: () => void;
   onCreateTableColumnsChange: (value: string) => void;
   onCreateTableNameChange: (value: string) => void;
+  onOpenSetupSql: () => void;
+  onOpenTableSql: (tableName: string) => void;
   onSelectDatabase: (databaseId: string) => void;
   onSelectTable: (tableName: string) => void;
 };
@@ -53,6 +56,7 @@ type WorkbenchToolbarProps = {
 export function DatabaseNavigator(props: DatabaseNavigatorProps) {
   const {
     canCreateTable,
+    canOpenSetupSql,
     canisterId,
     createTableColumns,
     createTableName,
@@ -66,6 +70,8 @@ export function DatabaseNavigator(props: DatabaseNavigatorProps) {
     onCreateTable,
     onCreateTableColumnsChange,
     onCreateTableNameChange,
+    onOpenSetupSql,
+    onOpenTableSql,
     onSelectDatabase,
     onSelectTable
   } = props;
@@ -91,6 +97,7 @@ export function DatabaseNavigator(props: DatabaseNavigatorProps) {
       <DatabaseList databases={databases} databaseId={databaseId} loadState={loadState} onSelectDatabase={onSelectDatabase} />
       <TableList
         canCreateTable={canCreateTable}
+        canOpenSetupSql={canOpenSetupSql}
         createTableColumns={createTableColumns}
         createTableName={createTableName}
         tableName={tableName}
@@ -98,6 +105,8 @@ export function DatabaseNavigator(props: DatabaseNavigatorProps) {
         onCreateTable={onCreateTable}
         onCreateTableColumnsChange={onCreateTableColumnsChange}
         onCreateTableNameChange={onCreateTableNameChange}
+        onOpenSetupSql={onOpenSetupSql}
+        onOpenTableSql={onOpenTableSql}
         onSelectTable={onSelectTable}
       />
     </aside>

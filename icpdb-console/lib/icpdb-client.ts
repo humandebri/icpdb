@@ -11,6 +11,7 @@ export { createIcpdbActor, validateCanisterId } from "@/lib/icpdb-actor";
 export {
   createDatabaseAuthenticated,
   deleteDatabaseAuthenticated,
+  getRoutedOperationAuthenticated,
   listAllDatabasePlacementsAuthenticated,
   listDatabasePlacementsAuthenticated,
   listDatabasesAuthenticated,

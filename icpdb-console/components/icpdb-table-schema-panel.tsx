@@ -3,18 +3,37 @@
 // icpdb-console/components/icpdb-table-schema-panel.tsx
 // Column, index, trigger, foreign key, and schema SQL viewer for the ICPDB Table Editor.
 
-import { Download, Search } from "lucide-react";
+import { Check, Code2, Copy, Download, Search } from "lucide-react";
 import { useMemo, useState } from "react";
 import { ForeignKeyViewer, IndexViewer, TriggerViewer, downloadTextFile } from "@/components/icpdb-display-panels";
 import { columnKindLabel } from "@/lib/row-mutations";
 import type { DatabaseColumn, TableDescription } from "@/lib/types";
 
-export function TableSchemaPanel({ tableDescription }: { tableDescription: TableDescription | null }) {
+export function TableSchemaPanel({
+  tableDescription,
+  onOpenColumnSql,
+  onOpenForeignKeySql,
+  onOpenSchemaLookupSql,
+  onOpenSchemaSql
+}: {
+  tableDescription: TableDescription | null;
+  onOpenColumnSql: (tableName: string) => void;
+  onOpenForeignKeySql: (tableName: string) => void;
+  onOpenSchemaLookupSql: (tableName: string) => void;
+  onOpenSchemaSql: (sql: string) => void;
+}) {
   const [columnSearch, setColumnSearch] = useState("");
+  const [copiedSchemaSql, setCopiedSchemaSql] = useState(false);
   const columns = useMemo(() => tableDescription?.columns ?? [], [tableDescription]);
   const visibleColumns = useMemo(() => filterColumns(columns, columnSearch), [columnSearch, columns]);
   const columnCountLabel = columnSearch.trim() ? `${visibleColumns.length}/${columns.length}` : String(columns.length);
   const schemaSql = useMemo(() => buildTableSchemaSql(tableDescription), [tableDescription]);
+  async function copySchemaSql() {
+    if (!schemaSql) return;
+    await navigator.clipboard.writeText(schemaSql);
+    setCopiedSchemaSql(true);
+    window.setTimeout(() => setCopiedSchemaSql(false), 1200);
+  }
 
   return (
     <section className="grid gap-3 xl:grid-cols-[minmax(0,1fr)_18rem]">
@@ -32,6 +51,18 @@ export function TableSchemaPanel({ tableDescription }: { tableDescription: Table
             />
             <span className="font-mono text-[#667085]">{columnCountLabel}</span>
           </label>
+          <button
+            className="inline-flex h-8 items-center gap-1 rounded-md border border-[#c9ced8] bg-white px-2 text-xs font-medium text-[#344054] disabled:opacity-50"
+            disabled={!tableDescription}
+            title="Open column SQL"
+            type="button"
+            onClick={() => {
+              if (tableDescription) onOpenColumnSql(tableDescription.tableName);
+            }}
+          >
+            <Code2 aria-hidden size={14} />
+            <span>Open column SQL</span>
+          </button>
         </div>
         <div className="mt-3 overflow-auto">
           <table className="w-full border-collapse text-left text-xs">
@@ -67,15 +98,49 @@ export function TableSchemaPanel({ tableDescription }: { tableDescription: Table
         <div className="mt-3 border-t border-[#eef1f5] pt-3">
           <div className="flex flex-wrap items-center justify-between gap-2">
             <h4 className="text-xs font-semibold text-[#344054]">Schema SQL</h4>
-            <button
-              className="inline-flex h-8 items-center gap-1 rounded-md border border-[#c9ced8] bg-white px-2 text-xs font-medium text-[#344054] disabled:opacity-50"
-              disabled={!schemaSql}
-              type="button"
-              onClick={() => downloadTextFile(schemaSql, tableSchemaFileName(tableDescription?.tableName ?? "schema"), "application/sql;charset=utf-8")}
-            >
-              <Download aria-hidden size={14} />
-              <span>Download schema SQL</span>
-            </button>
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                className="inline-flex h-8 items-center gap-1 rounded-md border border-[#c9ced8] bg-white px-2 text-xs font-medium text-[#344054] disabled:opacity-50"
+                disabled={!schemaSql}
+                title={copiedSchemaSql ? "Copied" : "Copy schema SQL"}
+                type="button"
+                onClick={() => void copySchemaSql()}
+              >
+                {copiedSchemaSql ? <Check aria-hidden size={14} /> : <Copy aria-hidden size={14} />}
+                <span>Copy schema SQL</span>
+              </button>
+              <button
+                className="inline-flex h-8 items-center gap-1 rounded-md border border-[#c9ced8] bg-white px-2 text-xs font-medium text-[#344054] disabled:opacity-50"
+                disabled={!schemaSql}
+                title="Open schema SQL"
+                type="button"
+                onClick={() => onOpenSchemaSql(schemaSql)}
+              >
+                <Code2 aria-hidden size={14} />
+                <span>Open schema SQL</span>
+              </button>
+              <button
+                className="inline-flex h-8 items-center gap-1 rounded-md border border-[#c9ced8] bg-white px-2 text-xs font-medium text-[#344054] disabled:opacity-50"
+                disabled={!tableDescription}
+                title="Open schema lookup SQL"
+                type="button"
+                onClick={() => {
+                  if (tableDescription) onOpenSchemaLookupSql(tableDescription.tableName);
+                }}
+              >
+                <Search aria-hidden size={14} />
+                <span>Open schema lookup SQL</span>
+              </button>
+              <button
+                className="inline-flex h-8 items-center gap-1 rounded-md border border-[#c9ced8] bg-white px-2 text-xs font-medium text-[#344054] disabled:opacity-50"
+                disabled={!schemaSql}
+                type="button"
+                onClick={() => downloadTextFile(schemaSql, tableSchemaFileName(tableDescription?.tableName ?? "schema"), "application/sql;charset=utf-8")}
+              >
+                <Download aria-hidden size={14} />
+                <span>Download schema SQL</span>
+              </button>
+            </div>
           </div>
           <pre className="mt-2 max-h-32 overflow-auto rounded-md bg-[#0d1117] p-3 font-mono text-xs leading-5 text-[#d6e2ff]">
             {schemaSql || "No schema SQL"}
@@ -83,9 +148,13 @@ export function TableSchemaPanel({ tableDescription }: { tableDescription: Table
         </div>
       </div>
       <div className="space-y-3">
-        <IndexViewer indexes={tableDescription?.indexes ?? []} />
-        <TriggerViewer triggers={tableDescription?.triggers ?? []} />
-        <ForeignKeyViewer foreignKeys={tableDescription?.foreignKeys ?? []} />
+        <IndexViewer indexes={tableDescription?.indexes ?? []} onOpenSchemaSql={onOpenSchemaSql} />
+        <TriggerViewer triggers={tableDescription?.triggers ?? []} onOpenSchemaSql={onOpenSchemaSql} />
+        <ForeignKeyViewer
+          foreignKeys={tableDescription?.foreignKeys ?? []}
+          tableName={tableDescription?.tableName ?? null}
+          onOpenForeignKeySql={onOpenForeignKeySql}
+        />
       </div>
     </section>
   );
